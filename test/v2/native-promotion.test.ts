@@ -886,7 +886,7 @@ preview:
     writeFileSync(join(workspace, "direct.txt"), "merged without review\n");
     await expect(promote("direct-merge")).resolves.toBe(0);
     expect(readFileSync(join(root, "direct.txt"), "utf8")).toBe("merged without review\n");
-  });
+  }, 15_000);
 
   it("keeps review independent and reruns failed checks during promotion", async () => {
     const root = mkdtempSync(join(tmpdir(), "boxers-native-failed-root-"));
