@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, openSync } from "node:fs";
 import { connect, type Socket } from "node:net";
-import { resetTerminalInputModes } from "../core/ansi.ts";
+import { colorEnabled, resetTerminalInputModes } from "../core/ansi.ts";
 import { readVersion } from "../core/version.ts";
 import { daemonLogPath, daemonSocketPath } from "./paths.ts";
 import {
@@ -313,7 +313,7 @@ export async function subscribeDaemonChanges(
   return () => socket.destroy();
 }
 
-function parseIntent(args: string[]): { task: string; intent: TaskIntent } {
+export function parseDaemonIntent(args: string[]): { task: string; intent: TaskIntent } {
   const task = args[0];
   const command = args[1];
   if (!task || !command) throw new Error("A daemon intent requires a task and command.");
@@ -324,10 +324,12 @@ function parseIntent(args: string[]): { task: string; intent: TaskIntent } {
         throw new Error("status --refresh accepts only --json.");
       return { task, intent: { kind: "refresh", json: rest.includes("--json") } };
     case "sync":
-    case "review":
     case "check":
       if (rest.length) throw new Error(`${command} does not accept arguments.`);
       return { task, intent: { kind: command } };
+    case "review":
+      if (rest.length) throw new Error(`${command} does not accept arguments.`);
+      return { task, intent: { kind: command, color: colorEnabled() } };
     case "promote": {
       let message: string | undefined;
       let skipChecks = false;
@@ -411,7 +413,7 @@ export async function runTypedDaemonIntent(task: string, intent: TaskIntent): Pr
 }
 
 export async function runDaemonIntent(args: string[]): Promise<number> {
-  const { task, intent } = parseIntent(args);
+  const { task, intent } = parseDaemonIntent(args);
   return runTypedDaemonIntent(task, intent);
 }
 

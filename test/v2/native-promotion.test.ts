@@ -960,9 +960,11 @@ check:
         "worker",
       );
     }, 20);
-    await expect(review("failed-gate")).resolves.toBe(0);
+    await expect(review("failed-gate", true)).resolves.toBe(0);
     expect(requireTask(project, "failed-gate").lastSnapshot?.setup?.state).toBe("passed");
     const reviewOutput = stdout.mock.calls.map((call) => String(call[0])).join("");
+    expect(reviewOutput).toContain("\x1b[1mfailed-gate\x1b[0m");
+    expect(reviewOutput).toMatch(/\x1b\[3[12]m/);
     expect(reviewOutput).toContain("tracked.txt");
     expect(reviewOutput).toContain("sensitive patch body");
 

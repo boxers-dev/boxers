@@ -1758,7 +1758,7 @@ function checkConfigHash(check: NonNullable<ProjectConfig["check"]>): string {
   return createHash("sha256").update(JSON.stringify(check)).digest("hex");
 }
 
-export async function review(name: string): Promise<number> {
+export async function review(name: string, color = colorEnabled()): Promise<number> {
   let { project, task } = requireRegisteredTask(name);
   await waitForSetup(task);
   ({ project, task } = requireRegisteredTask(name));
@@ -1775,7 +1775,6 @@ export async function review(name: string): Promise<number> {
       writeStdout(`Task ${name} has no changes to review.\n`);
       return 0;
     }
-    const color = colorEnabled();
     const heading = (value: string): string => ansi(1, value, color);
     writeStdout(`${heading(name)}\n`);
     writeStdout(
@@ -2254,7 +2253,7 @@ export function executeTaskIntent(name: string, intent: TaskIntent): Promise<num
     case "sync":
       return sync(name);
     case "review":
-      return review(name);
+      return review(name, intent.color ?? false);
     case "check":
       return check(name);
     case "promote":

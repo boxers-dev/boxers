@@ -23,6 +23,28 @@ describe("daemon wire protocol", () => {
     });
   });
 
+  it("preserves and validates review color capability", () => {
+    const encoded = encodeMessage({
+      type: "run_intent",
+      intentId: "review-1",
+      task: "task-a",
+      intent: { kind: "review", color: true },
+    });
+    expect(parseClientMessage(encoded.trim())).toMatchObject({
+      intent: { kind: "review", color: true },
+    });
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "run_intent",
+          intentId: "review-1",
+          task: "task-a",
+          intent: { kind: "review", color: "yes" },
+        }),
+      ),
+    ).toBeUndefined();
+  });
+
   it("rejects malformed or unrecognized lines instead of throwing", () => {
     expect(parseClientMessage("not json")).toBeUndefined();
     expect(parseClientMessage(JSON.stringify({ type: "unknown" }))).toBeUndefined();

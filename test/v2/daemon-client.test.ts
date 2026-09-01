@@ -3,12 +3,36 @@ import { describe, expect, it } from "vitest";
 import {
   assertDaemonVersion,
   detachKeyIndex,
+  parseDaemonIntent,
   releaseTerminalInput,
   TerminalOutputPump,
 } from "../../src/v2/daemon-client.ts";
 import { readVersion } from "../../src/core/version.ts";
 
 describe("interactive daemon client input", () => {
+  it("includes the invoking terminal's color preference in review intents", () => {
+    const previousForceColor = process.env["FORCE_COLOR"];
+    const previousNoColor = process.env["NO_COLOR"];
+    delete process.env["NO_COLOR"];
+    try {
+      process.env["FORCE_COLOR"] = "1";
+      expect(parseDaemonIntent(["task", "review"]).intent).toEqual({
+        kind: "review",
+        color: true,
+      });
+      process.env["FORCE_COLOR"] = "0";
+      expect(parseDaemonIntent(["task", "review"]).intent).toEqual({
+        kind: "review",
+        color: false,
+      });
+    } finally {
+      if (previousForceColor === undefined) delete process.env["FORCE_COLOR"];
+      else process.env["FORCE_COLOR"] = previousForceColor;
+      if (previousNoColor === undefined) delete process.env["NO_COLOR"];
+      else process.env["NO_COLOR"] = previousNoColor;
+    }
+  });
+
   it("recognizes Ctrl-C as a detach key", () => {
     expect(detachKeyIndex(Buffer.from([0x03]))).toBe(0);
   });

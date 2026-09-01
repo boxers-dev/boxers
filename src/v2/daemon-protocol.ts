@@ -74,7 +74,7 @@ export interface SetupCompletedRequest {
 export type TaskIntent =
   | { kind: "refresh"; json: boolean }
   | { kind: "sync" }
-  | { kind: "review" }
+  | { kind: "review"; color?: boolean }
   | { kind: "check" }
   | { kind: "promote"; message?: string; skipChecks: boolean }
   | { kind: "preview"; action?: "show" | "start" | "stop" | "restart" | "logs" }
@@ -275,6 +275,13 @@ export function parseClientMessage(line: string): ClientMessage | undefined {
       !["refresh", "sync", "review", "check", "promote", "preview", "discard"].includes(
         String((intent as Record<string, unknown>)["kind"]),
       )
+    )
+      return undefined;
+    const intentRecord = intent as Record<string, unknown>;
+    if (
+      intentRecord["kind"] === "review" &&
+      intentRecord["color"] !== undefined &&
+      typeof intentRecord["color"] !== "boolean"
     )
       return undefined;
   }
