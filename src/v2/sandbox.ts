@@ -361,7 +361,7 @@ if test -s "$patch"; then
 fi
 tree=$(GIT_INDEX_FILE="$index" git write-tree)
 test "$tree" = "$expected_tree"
-commit=$(printf 'boxers check candidate\n' | git commit-tree "$tree" -p "$target")
+commit=$(printf 'boxers check candidate\n' | git -c user.name=Boxers -c user.email=boxers@localhost commit-tree "$tree" -p "$target")
 git update-ref "$candidate_ref" "$commit"
 
 check_root="$HOME/.boxers/check-worktrees/$task_id"
