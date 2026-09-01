@@ -1,9 +1,10 @@
-name: Test
+name: Tests
 
-# Run lint, typecheck, and the test suite on pull requests. Ubuntu runners ship
-# a Docker daemon, so the opt-in integration tests run here too; everything else
-# is hermetic.
+# Validate every commit before it can be released. The npm publishing workflow
+# requires a successful push run from this file for the exact tagged commit.
 on:
+  push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -28,3 +29,6 @@ jobs:
 
       - name: Run tests
         run: npm run test:run
+
+      - name: Build
+        run: npm run build
