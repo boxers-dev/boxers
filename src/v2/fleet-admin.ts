@@ -17,6 +17,7 @@ import {
   readJson,
 } from "./paths.ts";
 import { withPidFileLock } from "./lock.ts";
+import { managedSshArgs } from "./ssh-transport.ts";
 
 interface AdminRequestBody {
   fleetId: string;
@@ -99,20 +100,9 @@ function sshCaptured(
   acceptNonZeroStdout = false,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn(
-      "ssh",
-      [
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=8",
-        "--",
-        machine.sshHost,
-        machine.executable ?? "boxers",
-        ...args,
-      ],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
+    const child = spawn("ssh", managedSshArgs(machine.sshHost, args), {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let stdout = "";
     let stderr = "";
     let settled = false;

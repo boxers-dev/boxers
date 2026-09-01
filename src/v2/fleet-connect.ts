@@ -19,6 +19,14 @@ import { listRemoteMachines, queryRemoteMachine, type RemoteMachine } from "./ma
 import type { FleetMember, FleetRemoval, PeerRole } from "./types.ts";
 import type { RuntimeDiagnostic } from "./runtime/types.ts";
 import { installDaemonService } from "./service.ts";
+import {
+  authorizeManagedPeer,
+  encodePeerAuthorization,
+  ensureManagedSshIdentity,
+  reconcileManagedPeerAuthorizations,
+  revokeManagedPeer,
+} from "./ssh-identity.ts";
+import { managedSshArgs } from "./ssh-transport.ts";
 
 const CONNECT_TIMEOUT_MS = 30_000;
 
@@ -97,6 +105,69 @@ function runSshCaptured(
     );
     if (input !== undefined) child.stdin!.end(input);
   });
+}
+
+function runManagedSshCaptured(
+  host: string,
+  args: readonly string[],
+  timeoutMs = CONNECT_TIMEOUT_MS,
+  acceptNewHostKey = false,
+  description = "Managed remote operation",
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("ssh", managedSshArgs(host, args, { acceptNewHostKey }), {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(stdout);
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      finish(new Error(`${description} on ${host} timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+    child.stdout!.setEncoding("utf8");
+    child.stderr!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => (stdout += chunk));
+    child.stderr!.on("data", (chunk: string) => (stderr += chunk));
+    child.on("error", (error) =>
+      finish(new Error(`${description} could not start SSH: ${error.message}`)),
+    );
+    child.on("close", (code) =>
+      finish(
+        code === 0
+          ? undefined
+          : new Error(
+              `${description} on ${host} failed (exit ${code ?? 1})${
+                (stderr || stdout).trim() ? `:\n${(stderr || stdout).trim()}` : "."
+              }`,
+            ),
+      ),
+    );
+  });
+}
+
+function parseManagedSshIdentity(text: string): { publicKey: string; fingerprint: string } {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new Error("Remote managed SSH identity response was not valid JSON.");
+  }
+  const identity = value as { version?: unknown; publicKey?: unknown; fingerprint?: unknown };
+  if (
+    identity.version !== 1 ||
+    typeof identity.publicKey !== "string" ||
+    typeof identity.fingerprint !== "string"
+  )
+    throw new Error("Remote managed SSH identity response was invalid.");
+  return { publicKey: identity.publicKey, fingerprint: identity.fingerprint };
 }
 
 function parseIdentity(text: string): RemoteIdentity {
@@ -321,7 +392,9 @@ export function acceptFleetSync(encoded: string): FleetSyncPayload {
 
 function acceptFleetSyncPayload(payload: FleetSyncPayload): FleetSyncPayload {
   mergeFleetSnapshot(payload.fleetId, payload.members, payload.removedMembers);
-  return currentFleetSyncPayload() as FleetSyncPayload;
+  const current = currentFleetSyncPayload() as FleetSyncPayload;
+  reconcileManagedPeerAuthorizations(current.members, current.removedMembers);
+  return current;
 }
 
 export function acceptFleetSyncResponse(response: string): FleetSyncPayload {
@@ -339,12 +412,10 @@ export async function gossipFleetMembership(): Promise<{
   const results = await Promise.all(
     machines.map(async (machine) => {
       try {
-        await runSshCaptured(
+        await runManagedSshCaptured(
           machine.sshHost,
-          [machine.executable ?? "boxers", "remote", "sync-fleet", encodeFleetSync(payload)],
-          undefined,
+          ["remote", "sync-fleet", encodeFleetSync(payload)],
           CONNECT_TIMEOUT_MS,
-          true,
         );
         return undefined;
       } catch (error) {
@@ -362,17 +433,26 @@ export async function gossipFleetMembership(): Promise<{
 }
 
 export function acceptUnenrollment(reference: string): void {
+  const member = readFleet()?.members.find(
+    (candidate) =>
+      candidate.hostId.toLowerCase() === reference.toLowerCase() ||
+      candidate.name.toLowerCase() === reference.toLowerCase(),
+  );
+  if (member) revokeManagedPeer(member.hostId);
   removeFleetMember(reference);
 }
 
-export async function verifyEnrolledPeer(reference: string): Promise<number> {
+export async function verifyEnrolledPeer(
+  reference: string,
+  acceptNewHostKey = false,
+): Promise<number> {
   const normalized = reference.toLowerCase();
   const machine = listRemoteMachines().find(
     (candidate) =>
       candidate.id.toLowerCase() === normalized || candidate.name.toLowerCase() === normalized,
   );
   if (!machine) throw new Error(`Unknown enrolled peer "${reference}".`);
-  const view = await queryRemoteMachine(machine);
+  const view = await queryRemoteMachine(machine, false, acceptNewHostKey);
   process.stdout.write(`${JSON.stringify(view)}\n`);
   return view.connection === "online" ? 0 : 1;
 }
@@ -407,12 +487,17 @@ export async function connectHost(
     options.host,
     await discoverOrInstall(options.host, options.install),
   );
+  const localSsh = ensureManagedSshIdentity();
+  const remoteSsh = parseManagedSshIdentity(
+    await runSshCaptured(options.host, [remote.executable, "remote", "ssh-identity"]),
+  );
   const fleet = ensureFleet(remote.fleetId);
   const remoteRoles: PeerRole[] = options.admin ? ["observe", "operate", "admin"] : ["observe"];
   const remoteMember: FleetMember = {
     hostId: remote.machine.id,
     name: options.name ?? remote.machine.name,
     publicKey: remote.publicKey,
+    ssh: { version: 1, publicKey: remoteSsh.publicKey, fingerprint: remoteSsh.fingerprint },
     endpoints: [{ transport: "ssh", target: options.host, executable: remote.executable }],
     roles: remoteRoles,
     enrolledAt: new Date().toISOString(),
@@ -443,47 +528,69 @@ export async function connectHost(
   );
   validateFleetMember(remoteMember);
   validateFleetMember(localMember);
-  await runSshCaptured(options.host, [
-    remote.executable,
-    "remote",
-    "enroll",
-    encodeEnrollment({ fleetId: fleet.fleetId, member: localMember, recipient: remoteMember }),
-  ]);
-  const initialSync = currentFleetSyncPayload();
-  const reciprocalFleet = initialSync
-    ? await runSshCaptured(options.host, [
-        remote.executable,
-        "remote",
-        "sync-fleet",
-        encodeFleetSync(initialSync),
-      ])
-    : undefined;
+  const previouslyEnrolled = fleet.members.some((member) => member.hostId === remoteMember.hostId);
+  let reciprocalFleet: string | undefined;
   let serviceWarning: string | undefined;
   try {
     await runSshCaptured(options.host, [
       remote.executable,
       "remote",
-      "verify-peer",
-      localMachineIdentity().id,
+      "authorize-peer",
+      encodePeerAuthorization(localMachineIdentity().id, localSsh.publicKey),
     ]);
+    authorizeManagedPeer(remoteMember.hostId, remoteSsh.publicKey, localExecutable ?? "boxers");
+    await runSshCaptured(options.host, [
+      remote.executable,
+      "remote",
+      "enroll",
+      encodeEnrollment({ fleetId: fleet.fleetId, member: localMember, recipient: remoteMember }),
+    ]);
+    enrollFleetMember(fleet.fleetId, remoteMember);
+    const initialSync = currentFleetSyncPayload();
+    reciprocalFleet = initialSync
+      ? await runManagedSshCaptured(
+          options.host,
+          ["remote", "sync-fleet", encodeFleetSync(initialSync)],
+          CONNECT_TIMEOUT_MS,
+        )
+      : undefined;
+    await runManagedSshCaptured(
+      options.host,
+      ["remote", "verify-peer", localMachineIdentity().id, "--accept-new-host-key"],
+      CONNECT_TIMEOUT_MS,
+    );
+    updateLocalFleetMember(localMember);
   } catch (error) {
-    try {
-      await runSshCaptured(options.host, [
-        remote.executable,
-        "remote",
-        "unenroll",
-        localMachineIdentity().id,
-      ]);
-    } catch {
-      // Report the reciprocal verification failure; a repeated connect repairs enrollment.
+    if (!previouslyEnrolled) {
+      try {
+        await runSshCaptured(options.host, [
+          remote.executable,
+          "remote",
+          "unenroll",
+          localMachineIdentity().id,
+        ]);
+      } catch {
+        // The peer may not have reached the enrollment stage.
+      }
+      try {
+        await runSshCaptured(options.host, [
+          remote.executable,
+          "remote",
+          "revoke-peer",
+          localMachineIdentity().id,
+        ]);
+      } catch {
+        // Preserve the primary enrollment failure below.
+      }
+      revokeManagedPeer(remoteMember.hostId);
+      removeFleetMember(remoteMember.hostId);
     }
     throw new Error(
-      `The remote host could not connect back through ${reverseTarget}: ${error instanceof Error ? error.message : String(error)}`,
+      `Could not establish managed reciprocal SSH between ${options.host} and ${reverseTarget}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
   try {
-    await runSshCaptured(options.host, [
-      remote.executable,
+    await runManagedSshCaptured(options.host, [
       "service",
       "install",
       "--executable",
@@ -493,8 +600,6 @@ export async function connectHost(
     serviceWarning = error instanceof Error ? error.message : String(error);
   }
   if (reciprocalFleet) acceptFleetSyncResponse(reciprocalFleet);
-  updateLocalFleetMember(localMember);
-  enrollFleetMember(fleet.fleetId, remoteMember);
   const gossip = await gossipFleetMembership();
   for (const failure of gossip.failures)
     process.stderr.write(
@@ -535,8 +640,7 @@ export async function disconnectHost(reference: string): Promise<number> {
   let reciprocalWarning: string | undefined;
   if (machine) {
     try {
-      await runSshCaptured(machine.sshHost, [
-        machine.executable ?? "boxers",
+      await runManagedSshCaptured(machine.sshHost, [
         "remote",
         "unenroll",
         localMachineIdentity().id,
@@ -545,6 +649,7 @@ export async function disconnectHost(reference: string): Promise<number> {
       reciprocalWarning = error instanceof Error ? error.message : String(error);
     }
   }
+  revokeManagedPeer(member.hostId);
   removeFleetMember(member.hostId);
   const gossip = await gossipFleetMembership();
   process.stdout.write(`Disconnected ${member.name}.\n`);

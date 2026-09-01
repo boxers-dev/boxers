@@ -97,6 +97,14 @@ That setup installs and authenticates Docker Sandboxes, initializes its network
 policy, offers agent authentication, and installs the daemon. Successful setup
 is recorded on the remote machine, so later connections skip it.
 
+The initial connection uses your normal interactive SSH authentication. During
+enrollment, each machine creates a dedicated Ed25519 key under its Boxers state
+directory and the machines authorize those keys reciprocally. Background
+reconnections always select the Boxers key explicitly, so they do not depend on
+a desktop keyring, a forwarded agent, or an unlocked personal key. The
+authorized key is forced through the Boxers command gateway and cannot be used
+for SSH forwarding or arbitrary shell commands.
+
 `list` includes tasks from connected machines. Prefix a remote task with its
 machine name:
 
@@ -112,8 +120,9 @@ To create a remote task, include the machine, project, and new task name:
 boxers build-box/my-project/fix-parser new
 ```
 
-SSH connectivity must be non-interactive so Boxers can reconnect in the
-background.
+Both SSH targets must be reachable from their reciprocal machine. Boxers uses
+standard SSH host aliases, so stable LAN DNS or an overlay network such as
+Tailscale can provide the addresses for laptops that move between networks.
 
 ## Health and authentication
 

@@ -214,6 +214,11 @@ export interface FleetMember {
   hostId: string;
   name: string;
   publicKey: string;
+  ssh: {
+    version: 1;
+    publicKey: string;
+    fingerprint: string;
+  };
   endpoints: { transport: "ssh"; target: string; executable?: string | undefined }[];
   roles: PeerRole[];
   enrolledAt: string;

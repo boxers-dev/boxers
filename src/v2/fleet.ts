@@ -13,6 +13,11 @@ import { withPidFileLock } from "./lock.ts";
 import { localMachineIdentity } from "./registry.ts";
 import { notifyDaemonStateChanged } from "./daemon-client.ts";
 import type { FleetManifest, FleetMember, FleetRemoval, PeerRole } from "./types.ts";
+import {
+  canonicalSshPublicKey,
+  ensureManagedSshIdentity,
+  sshPublicKeyFingerprint,
+} from "./ssh-identity.ts";
 
 interface HostKey {
   version: 1;
@@ -51,10 +56,12 @@ export function localFleetMember(
   enrolledAt?: string,
 ): FleetMember {
   const identity = localMachineIdentity();
+  const ssh = ensureManagedSshIdentity();
   return {
     hostId: identity.id,
     name: identity.name,
     publicKey: localHostKey().publicKey,
+    ssh: { version: 1, publicKey: ssh.publicKey, fingerprint: ssh.fingerprint },
     endpoints,
     roles,
     enrolledAt: enrolledAt ?? identity.createdAt,
@@ -74,8 +81,21 @@ export function validateFleetMember(member: FleetMember): void {
     throw new Error(
       "Fleet member names may contain letters, numbers, dots, underscores, and hyphens.",
     );
-  if (!member.publicKey || !Array.isArray(member.endpoints) || !Array.isArray(member.roles))
+  if (
+    !member.publicKey ||
+    member.ssh?.version !== 1 ||
+    typeof member.ssh.publicKey !== "string" ||
+    typeof member.ssh.fingerprint !== "string" ||
+    !Array.isArray(member.endpoints) ||
+    !Array.isArray(member.roles)
+  )
     throw new Error("Invalid fleet member identity.");
+  const sshPublicKey = canonicalSshPublicKey(member.ssh.publicKey, `boxers:${member.hostId}`);
+  if (
+    member.ssh.publicKey !== sshPublicKey ||
+    member.ssh.fingerprint !== sshPublicKeyFingerprint(sshPublicKey)
+  )
+    throw new Error("Invalid fleet member managed SSH identity.");
   timestamp(member.enrolledAt, "fleet enrollment");
   if (member.roles.some((role) => role !== "observe" && role !== "operate" && role !== "admin"))
     throw new Error("Invalid fleet member role.");
@@ -144,6 +164,8 @@ function mergeFleetUnlocked(
     const previous = members.get(member.hostId);
     if (previous && previous.publicKey !== member.publicKey)
       throw new Error(`Host identity collision for ${member.hostId}.`);
+    if (previous && previous.ssh.publicKey !== member.ssh.publicKey)
+      throw new Error(`Host managed SSH identity collision for ${member.hostId}.`);
     if (preserveLocalMember && member.hostId === localId) continue;
     members.set(member.hostId, previous ? newestMember(previous, member) : member);
   }
@@ -238,7 +260,12 @@ export function enrollFleetMember(fleetId: string, member: FleetMember): FleetMa
 /** Record an explicitly configured local endpoint without trusting peer gossip. */
 export function updateLocalFleetMember(member: FleetMember): FleetManifest {
   const fleet = ensureFleet();
-  if (member.hostId !== localMachineIdentity().id || member.publicKey !== localHostKey().publicKey)
+  const ssh = ensureManagedSshIdentity();
+  if (
+    member.hostId !== localMachineIdentity().id ||
+    member.publicKey !== localHostKey().publicKey ||
+    member.ssh.publicKey !== ssh.publicKey
+  )
     throw new Error("Local fleet member identity does not match this host.");
   return mergeFleet(fleet, [member], [], false);
 }

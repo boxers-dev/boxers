@@ -6,6 +6,7 @@ import type { MachineView, RemoteSnapshot } from "./types.ts";
 import { captureStateProjection } from "./projection.ts";
 import { isTaskState } from "./state.ts";
 import { collectHostStatus, isHostStatusObservation, readHostStatus } from "./host-status.ts";
+import { managedSshArgs } from "./ssh-transport.ts";
 export type { MachineView } from "./types.ts";
 
 const SNAPSHOT_TIMEOUT_MS = 10_000;
@@ -139,24 +140,18 @@ export function remoteArgs(
   machine: RemoteMachine,
   command: "snapshot" | "watch",
   refreshStatus = false,
+  acceptNewHostKey = false,
 ): string[] {
-  return [
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "ConnectTimeout=5",
-    "--",
+  return managedSshArgs(
     machine.sshHost,
-    machine.executable ?? "boxers",
-    "remote",
-    command,
-    ...(command === "snapshot" && refreshStatus ? ["--refresh-status"] : []),
-  ];
+    ["remote", command, ...(command === "snapshot" && refreshStatus ? ["--refresh-status"] : [])],
+    { connectTimeout: 5, acceptNewHostKey },
+  );
 }
 
 function authenticationHelp(detail: string, host: string): string {
   if (!/permission denied|authentication failed/i.test(detail)) return detail;
-  return `${detail}\nBoxers requires non-interactive SSH authentication. Configure an SSH key or agent, then verify with: ssh -o BatchMode=yes ${host} true`;
+  return `${detail}\nThe managed Boxers SSH authorization is missing or invalid. Re-run \`boxers connect ${host} --reverse-host <this-host-as-seen-by-${host}>\` to repair reciprocal access.`;
 }
 
 function runCaptured(cmd: string, args: string[], timeoutMs: number): Promise<string> {
@@ -194,11 +189,12 @@ function runCaptured(cmd: string, args: string[], timeoutMs: number): Promise<st
 export async function queryRemoteMachine(
   machine: RemoteMachine,
   refreshStatus = false,
+  acceptNewHostKey = false,
 ): Promise<MachineView> {
   try {
     const output = await runCaptured(
       "ssh",
-      remoteArgs(machine, "snapshot", refreshStatus),
+      remoteArgs(machine, "snapshot", refreshStatus, acceptNewHostKey),
       refreshStatus ? 30_000 : SNAPSHOT_TIMEOUT_MS,
     );
     const snapshot = parseRemoteSnapshot(output);
@@ -309,10 +305,6 @@ export function formatMachineViews(views: readonly MachineView[], groupByProject
     .join("\n")}\n`;
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", `'\\''`)}'`;
-}
-
 export function runRemoteTaskCommand(
   reference: string,
   task: string,
@@ -333,9 +325,8 @@ export function runRemoteCommand(reference: string, args: readonly string[], tty
   if (!matches.length) throw new Error(`Unknown machine "${reference}".`);
   if (matches.length > 1) throw new Error(`Machine reference "${reference}" is ambiguous.`);
   const machine = matches[0]!;
-  const remoteCommand = [machine.executable ?? "boxers", ...args].map(shellQuote).join(" ");
   return (
-    spawnSync("ssh", [...(tty ? ["-t"] : []), "--", machine.sshHost, remoteCommand], {
+    spawnSync("ssh", managedSshArgs(machine.sshHost, args, { tty }), {
       stdio: "inherit",
     }).status ?? 1
   );

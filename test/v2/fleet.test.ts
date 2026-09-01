@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -29,12 +29,14 @@ const originalHome = process.env.BOXERS_HOME;
 function stateDirectory(): string {
   const directory = mkdtempSync(join(tmpdir(), "boxers-fleet-test-"));
   directories.push(directory);
+  process.env.BOXERS_AUTHORIZED_KEYS ??= join(directory, "authorized_keys");
   return directory;
 }
 
 afterEach(() => {
   if (originalHome === undefined) delete process.env.BOXERS_HOME;
   else process.env.BOXERS_HOME = originalHome;
+  delete process.env.BOXERS_AUTHORIZED_KEYS;
   for (const directory of directories.splice(0))
     rmSync(directory, { recursive: true, force: true });
 });
@@ -161,6 +163,43 @@ describe("fleet identity and administration", () => {
     expect(readFleet()?.members.find((member) => member.hostId === receiver.hostId)).toEqual(
       receiver,
     );
+  });
+
+  it("reconciles managed SSH authorizations from membership and tombstones", () => {
+    const senderHome = stateDirectory();
+    const receiverHome = stateDirectory();
+    const authorizedKeys = process.env.BOXERS_AUTHORIZED_KEYS!;
+
+    process.env.BOXERS_HOME = senderHome;
+    const fleet = ensureFleet();
+    const sender = localFleetMember(
+      [{ transport: "ssh", target: "sender" }],
+      ["observe", "operate", "admin"],
+    );
+
+    process.env.BOXERS_HOME = receiverHome;
+    ensureFleet(fleet.fleetId);
+    acceptFleetSync(
+      encodeFleetSync({
+        version: 1,
+        fleetId: fleet.fleetId,
+        members: [sender],
+        removedMembers: [],
+        sentAt: new Date().toISOString(),
+      }),
+    );
+    expect(readFileSync(authorizedKeys, "utf8")).toContain(`# boxers-managed ${sender.hostId}`);
+
+    acceptFleetSync(
+      encodeFleetSync({
+        version: 1,
+        fleetId: fleet.fleetId,
+        members: [],
+        removedMembers: [{ hostId: sender.hostId, removedAt: new Date().toISOString() }],
+        sentAt: new Date().toISOString(),
+      }),
+    );
+    expect(readFileSync(authorizedKeys, "utf8")).not.toContain(sender.hostId);
   });
 
   it("keeps previously learned direct endpoints when a member is refreshed", () => {

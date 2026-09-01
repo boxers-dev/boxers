@@ -7,6 +7,10 @@ import { list } from "../../src/v2/commands.ts";
 import { atomicWriteJson, taskDir, taskIntentLeasePath } from "../../src/v2/paths.ts";
 import { createTaskManifest, initProject, updateTask } from "../../src/v2/registry.ts";
 import { enrollFleetMember, ensureFleet } from "../../src/v2/fleet.ts";
+import {
+  canonicalSshPublicKey,
+  ensureManagedSshIdentity,
+} from "../../src/v2/ssh-identity.ts";
 
 describe("task list", () => {
   it("lists cached task state without contacting Docker Sandboxes", async () => {
@@ -91,10 +95,16 @@ describe("task list", () => {
       const task = createTaskManifest(project, "local-task", "codex");
       updateTask(project, task, { phase: "idle", agent: "codex" });
       const fleet = ensureFleet();
+      const managedSsh = ensureManagedSshIdentity();
       enrollFleetMember(fleet.fleetId, {
         hostId: "remote-id",
         name: "remote",
         publicKey: "remote-public-key",
+        ssh: {
+          version: 1,
+          publicKey: canonicalSshPublicKey(managedSsh.publicKey, "boxers:remote-id"),
+          fingerprint: managedSsh.fingerprint,
+        },
         endpoints: [{ transport: "ssh", target: "remote-box" }],
         roles: ["observe"],
         enrolledAt: "2026-08-10T00:00:00.000Z",

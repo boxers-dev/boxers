@@ -12,6 +12,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { activateManagedExecutable, doctorFleet, updateFleet } from "../../src/v2/fleet-admin.ts";
 import { enrollFleetMember, ensureFleet } from "../../src/v2/fleet.ts";
+import {
+  canonicalSshPublicKey,
+  ensureManagedSshIdentity,
+  sshPublicKeyFingerprint,
+} from "../../src/v2/ssh-identity.ts";
 
 const cleanup: string[] = [];
 const originalHome = process.env.BOXERS_HOME;
@@ -68,6 +73,7 @@ describe("managed fleet update activation", () => {
     cleanup.push(state, bin);
     process.env.BOXERS_HOME = state;
     const fleet = ensureFleet();
+    const managedSsh = ensureManagedSshIdentity();
     for (const [hostId, name, target] of [
       ["good-id", "good", "good-host"],
       ["down-id", "down", "down-host"],
@@ -76,6 +82,11 @@ describe("managed fleet update activation", () => {
         hostId: hostId!,
         name: name!,
         publicKey: `${name}-public-key`,
+        ssh: {
+          version: 1,
+          publicKey: canonicalSshPublicKey(managedSsh.publicKey, `boxers:${hostId}`),
+          fingerprint: sshPublicKeyFingerprint(managedSsh.publicKey),
+        },
         endpoints: [{ transport: "ssh", target: target!, executable: "boxers" }],
         roles: ["observe", "operate", "admin"],
         enrolledAt: "2026-08-26T00:00:00.000Z",
@@ -85,8 +96,15 @@ describe("managed fleet update activation", () => {
       ssh,
       `#!/bin/sh
 case "$*" in
-  *good-host*" remote update "*) printf '%s\n' '{"version":"1.2.3","executable":"/managed/boxers","daemonRestartRequired":true}' ;;
-  *good-host*" doctor --json"*) printf '%s\n' '{"ok":true,"warnings":[],"checks":[{"name":"daemon","ok":true,"detail":"ready","remediation":{"kind":"manual","value":"none"}}]}' ;;
+  *good-host*"boxers-gateway-request "*)
+    for token do :; done
+    decoded=$(node -e 'const value=JSON.parse(Buffer.from(process.argv[1], "base64url")); process.stdout.write(value.args.join(" "))' "$token")
+    case "$decoded" in
+      "remote update "*) printf '%s\n' '{"version":"1.2.3","executable":"/managed/boxers","daemonRestartRequired":true}' ;;
+      "doctor --json"*) printf '%s\n' '{"ok":true,"warnings":[],"checks":[{"name":"daemon","ok":true,"detail":"ready","remediation":{"kind":"manual","value":"none"}}]}' ;;
+      *) printf '%s\n' 'host unavailable' >&2; exit 1 ;;
+    esac
+    ;;
   *) printf '%s\n' 'host unavailable' >&2; exit 1 ;;
 esac
 `,

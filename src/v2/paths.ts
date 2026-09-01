@@ -102,6 +102,26 @@ export function hostKeyLockPath(): string {
   return join(boxersHome(), "host-key.lock");
 }
 
+export function managedSshDir(): string {
+  return join(boxersHome(), "ssh");
+}
+
+export function managedSshPrivateKeyPath(): string {
+  return join(managedSshDir(), "id_ed25519");
+}
+
+export function managedSshPublicKeyPath(): string {
+  return `${managedSshPrivateKeyPath()}.pub`;
+}
+
+export function managedSshLockPath(): string {
+  return join(managedSshDir(), "identity.lock");
+}
+
+export function authorizedKeysLockPath(): string {
+  return join(boxersHome(), "authorized-keys.lock");
+}
+
 export function machineIdentityLockPath(): string {
   return join(boxersHome(), "machine.lock");
 }

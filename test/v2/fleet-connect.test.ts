@@ -7,6 +7,7 @@ import { connectHost, disconnectHost, remoteIdentity } from "../../src/v2/fleet-
 import { ensureFleet, localFleetMember, localHostKey, readFleet } from "../../src/v2/fleet.ts";
 import { localMachineIdentity } from "../../src/v2/registry.ts";
 import { listRemoteMachines } from "../../src/v2/machines.ts";
+import { ensureManagedSshIdentity } from "../../src/v2/ssh-identity.ts";
 
 const cleanup: string[] = [];
 const originalHome = process.env.BOXERS_HOME;
@@ -21,13 +22,16 @@ afterEach(() => {
   else process.argv[1] = originalEntry;
   delete process.env.FAKE_REMOTE_IDENTITY;
   delete process.env.FAKE_REMOTE_FLEET;
+  delete process.env.FAKE_REMOTE_SSH_IDENTITY;
   delete process.env.FAKE_SSH_LOG;
   delete process.env.FAKE_VERIFY_FAIL;
+  delete process.env.FAKE_ENROLL_FAIL;
   delete process.env.FAKE_UNENROLL_FAIL;
   delete process.env.FAKE_SERVICE_FAIL;
   delete process.env.FAKE_SETUP_MARKER;
   delete process.env.FAKE_UNINITIALIZED_IDENTITY;
   delete process.env.FAKE_BOOTSTRAP_FAILURE;
+  delete process.env.BOXERS_AUTHORIZED_KEYS;
   vi.restoreAllMocks();
   for (const directory of cleanup.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
@@ -64,9 +68,16 @@ function fixture(): { localHome: string; log: string; remoteId: string } {
     removedMembers: [],
     sentAt: new Date().toISOString(),
   });
+  const managedSsh = ensureManagedSshIdentity();
+  process.env.FAKE_REMOTE_SSH_IDENTITY = JSON.stringify({
+    version: 1,
+    publicKey: managedSsh.publicKey,
+    fingerprint: managedSsh.fingerprint,
+  });
 
   const localHome = directory("boxers-connect-local-");
   process.env.BOXERS_HOME = localHome;
+  process.env.BOXERS_AUTHORIZED_KEYS = join(localHome, "authorized_keys");
   ensureFleet("fleet-id");
 
   const bin = directory("boxers-connect-bin-");
@@ -83,6 +94,7 @@ if [ -n "$FAKE_BOOTSTRAP_FAILURE" ]; then
   esac
 fi
 case "$*" in
+  *" remote ssh-identity") printf '%s\n' "$FAKE_REMOTE_SSH_IDENTITY" ;;
   *" remote identity")
     if [ -n "$FAKE_SETUP_MARKER" ] && [ ! -f "$FAKE_SETUP_MARKER" ]; then
       printf '%s\n' "$FAKE_UNINITIALIZED_IDENTITY"
@@ -91,10 +103,19 @@ case "$*" in
     fi
     ;;
   *" init") touch "$FAKE_SETUP_MARKER" ;;
-  *" remote sync-fleet "*) printf '%s\n' "$FAKE_REMOTE_FLEET" ;;
-  *" remote verify-peer "*) test -z "$FAKE_VERIFY_FAIL" ;;
+  *" remote enroll "*) test -z "$FAKE_ENROLL_FAIL" ;;
   *" remote unenroll "*) test -z "$FAKE_UNENROLL_FAIL" ;;
-  *" service install "*) test -z "$FAKE_SERVICE_FAIL" ;;
+  *"boxers-gateway-request "*)
+    for token do :; done
+    decoded=$(node -e 'const value=JSON.parse(Buffer.from(process.argv[1], "base64url")); process.stdout.write(value.args.join(" "))' "$token")
+    case "$decoded" in
+      "remote sync-fleet "*) printf '%s\n' "$FAKE_REMOTE_FLEET" ;;
+      "remote verify-peer "*) test -z "$FAKE_VERIFY_FAIL" ;;
+      "remote unenroll "*) test -z "$FAKE_UNENROLL_FAIL" ;;
+      "service install "*) test -z "$FAKE_SERVICE_FAIL" ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
   *) printf '{}\n' ;;
 esac
 `,
@@ -186,7 +207,7 @@ describe("reciprocal fleet connection", () => {
   });
 
   it("enrolls both directions and records the remote route locally", async () => {
-    const { remoteId } = fixture();
+    const { log, remoteId } = fixture();
     vi.spyOn(process.stdout, "write").mockReturnValue(true);
     vi.spyOn(process.stderr, "write").mockReturnValue(true);
 
@@ -207,6 +228,10 @@ describe("reciprocal fleet connection", () => {
     expect(listRemoteMachines()).toContainEqual(
       expect.objectContaining({ id: remoteId, sshHost: "remote-box", executable: "boxers" }),
     );
+    const calls = readFileSync(log, "utf8");
+    expect(calls).toContain("remote authorize-peer");
+    expect(calls).toContain("IdentitiesOnly=yes");
+    expect(calls).toContain("boxers-gateway-request");
   });
 
   it("cleans up failed reverse enrollment and propagates an offline disconnect honestly", async () => {
@@ -222,7 +247,7 @@ describe("reciprocal fleet connection", () => {
         install: false,
         admin: true,
       }),
-    ).rejects.toThrow("could not connect back");
+    ).rejects.toThrow("managed reciprocal SSH");
     expect(readFileSync(log, "utf8")).toContain("remote unenroll");
     expect(readFleet()?.members.some((member) => member.hostId === remoteId)).toBe(false);
 
@@ -240,6 +265,25 @@ describe("reciprocal fleet connection", () => {
     expect(stderr.mock.calls.map((call) => String(call[0])).join("")).toContain(
       "could not be updated",
     );
+  });
+
+  it("revokes both managed keys when enrollment fails after authorization", async () => {
+    const { localHome, log, remoteId } = fixture();
+    vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    process.env.FAKE_ENROLL_FAIL = "1";
+
+    await expect(
+      connectHost({
+        host: "remote-box",
+        reverseHost: "local-box",
+        install: false,
+        admin: true,
+      }),
+    ).rejects.toThrow("managed reciprocal SSH");
+
+    expect(readFileSync(log, "utf8")).toContain("remote revoke-peer");
+    expect(readFleet()?.members.some((member) => member.hostId === remoteId)).toBe(false);
+    expect(readFileSync(join(localHome, "authorized_keys"), "utf8")).not.toContain(remoteId);
   });
 
   it("keeps successful enrollment but reports remote service setup failure", async () => {

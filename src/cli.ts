@@ -50,6 +50,12 @@ import {
   remoteIdentity,
   verifyEnrolledPeer,
 } from "./v2/fleet-connect.ts";
+import {
+  acceptPeerAuthorization,
+  ensureManagedSshIdentity,
+  revokeManagedPeer,
+} from "./v2/ssh-identity.ts";
+import { runSshGateway } from "./v2/ssh-transport.ts";
 import { readFleet } from "./v2/fleet.ts";
 import { acceptManagedUpdate, doctorFleet, updateFleet } from "./v2/fleet-admin.ts";
 import {
@@ -637,6 +643,30 @@ export async function dispatch(argv: string[]): Promise<number> {
   }
   if (first === "remote") {
     const [command, ...args] = rest;
+    if (command === "ssh-identity") {
+      only(args, [], "remote ssh-identity");
+      const identity = ensureManagedSshIdentity();
+      process.stdout.write(
+        `${JSON.stringify({ version: 1, publicKey: identity.publicKey, fingerprint: identity.fingerprint })}\n`,
+      );
+      return 0;
+    }
+    if (command === "authorize-peer") {
+      if (args.length !== 1) throw new UsageError("remote authorize-peer requires one payload.");
+      acceptPeerAuthorization(args[0] as string);
+      process.stdout.write(`${JSON.stringify({ authorized: true })}\n`);
+      return 0;
+    }
+    if (command === "revoke-peer") {
+      if (args.length !== 1) throw new UsageError("remote revoke-peer requires one host ID.");
+      revokeManagedPeer(args[0] as string);
+      process.stdout.write(`${JSON.stringify({ authorized: false })}\n`);
+      return 0;
+    }
+    if (command === "gateway") {
+      if (args.length !== 1) throw new UsageError("remote gateway requires one host ID.");
+      return runSshGateway(args[0] as string);
+    }
     if (command === "identity") {
       only(args, [], "remote identity");
       process.stdout.write(`${JSON.stringify(remoteIdentity())}\n`);
@@ -660,8 +690,14 @@ export async function dispatch(argv: string[]): Promise<number> {
       return 0;
     }
     if (command === "verify-peer") {
-      if (args.length !== 1) throw new UsageError("remote verify-peer requires one host ID.");
-      return verifyEnrolledPeer(args[0] as string);
+      if (
+        (args.length !== 1 && args.length !== 2) ||
+        (args.length === 2 && args[1] !== "--accept-new-host-key")
+      )
+        throw new UsageError(
+          "remote verify-peer requires one host ID and optional --accept-new-host-key.",
+        );
+      return verifyEnrolledPeer(args[0] as string, args[1] === "--accept-new-host-key");
     }
     if (command === "update") {
       if (args.length !== 1) throw new UsageError("remote update requires one request.");
