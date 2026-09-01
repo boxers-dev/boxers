@@ -1,8 +1,9 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { connectHost, disconnectHost } from "../../src/v2/fleet-connect.ts";
+import { readVersion } from "../../src/core/version.ts";
+import { connectHost, disconnectHost, remoteIdentity } from "../../src/v2/fleet-connect.ts";
 import { ensureFleet, localFleetMember, localHostKey, readFleet } from "../../src/v2/fleet.ts";
 import { localMachineIdentity } from "../../src/v2/registry.ts";
 import { listRemoteMachines } from "../../src/v2/machines.ts";
@@ -50,7 +51,7 @@ function fixture(): { localHome: string; log: string; remoteId: string } {
     protocolVersion: 1,
     machine: remoteMachine,
     publicKey: localHostKey().publicKey,
-    boxersVersion: "0.2.0",
+    boxersVersion: readVersion(),
     executable: "boxers",
     setupComplete: true,
     fleetId: "fleet-id",
@@ -107,6 +108,19 @@ esac
 }
 
 describe("reciprocal fleet connection", () => {
+  it("keeps bootstrap identity discovery free of live runtime diagnostics", () => {
+    process.env.BOXERS_HOME = directory("boxers-connect-identity-");
+    const bin = directory("boxers-connect-identity-bin-");
+    const marker = join(bin, "sbx-called");
+    const sbx = join(bin, "sbx");
+    writeFileSync(sbx, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\n`);
+    chmodSync(sbx, 0o755);
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+
+    expect(remoteIdentity().diagnostics).toEqual([]);
+    expect(existsSync(marker)).toBe(false);
+  });
+
   it("streams bootstrap diagnostics and includes operation context in failures", async () => {
     fixture();
     process.env.FAKE_BOOTSTRAP_FAILURE = "1";
@@ -121,7 +135,7 @@ describe("reciprocal fleet connection", () => {
         admin: false,
       }),
     ).rejects.toThrow(
-      "Boxers 0.2.0 installation on remote-box failed (exit 1):\nnpm ERR! code E401",
+      `Boxers ${readVersion()} installation on remote-box failed (exit 1):\nnpm ERR! code E401`,
     );
     expect(stderr.mock.calls.flat().join("")).toContain("npm ERR! code E401");
   });

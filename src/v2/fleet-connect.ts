@@ -15,7 +15,6 @@ import {
 } from "./fleet.ts";
 import { isMachineSetupComplete } from "./machine-setup.ts";
 import { localMachineIdentity } from "./registry.ts";
-import { registeredRuntimes } from "./runtime/registry.ts";
 import { listRemoteMachines, queryRemoteMachine, type RemoteMachine } from "./machines.ts";
 import type { FleetMember, FleetRemoval, PeerRole } from "./types.ts";
 import type { RuntimeDiagnostic } from "./runtime/types.ts";
@@ -149,6 +148,7 @@ function managedBootstrapScript(): string {
     'mv -f "$temporary" "$bin_dir/boxers"',
     "trap - EXIT",
     'printf "Installed Boxers %s at %s.\\n" "$version" "$bin_dir/boxers" >&2',
+    'printf "Reading the remote Boxers identity...\\n" >&2',
     'BOXERS_EXECUTABLE="$bin_dir/boxers" exec "$bin_dir/boxers" remote identity',
     "",
   ].join("\n");
@@ -219,16 +219,20 @@ export function remoteIdentity(): RemoteIdentity {
   const connection = process.env.SSH_CONNECTION?.trim().split(/\s+/);
   const fleet = readFleet();
   const reverseCandidate = connection?.[0];
+  const setupComplete = isMachineSetupComplete();
   return {
     protocolVersion: 1,
     machine: localMachineIdentity(),
     publicKey: localHostKey().publicKey,
     boxersVersion: readVersion(),
     executable: executablePath(process.env.BOXERS_EXECUTABLE ?? process.argv[1] ?? "boxers"),
-    setupComplete: isMachineSetupComplete(),
+    setupComplete,
     ...(fleet ? { fleetId: fleet.fleetId } : {}),
     ...(reverseCandidate ? { reverseCandidate } : {}),
-    diagnostics: registeredRuntimes().flatMap((runtime) => runtime.diagnose()),
+    // Identity discovery is part of bootstrapping and must stay fast. Live
+    // runtime diagnostics can block while Docker Sandboxes is uninstalled or
+    // unhealthy; the interactive machine setup performs those checks instead.
+    diagnostics: [],
   };
 }
 
