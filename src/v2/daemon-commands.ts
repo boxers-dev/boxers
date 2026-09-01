@@ -3,7 +3,7 @@ import { connect } from "node:net";
 import { daemonMain } from "./daemon.ts";
 import { ensureDaemonReady } from "./daemon-client.ts";
 import { encodeMessage, LineDecoder, parseServerMessage } from "./daemon-protocol.ts";
-import { daemonLogPath, daemonPidPath, daemonSocketPath } from "./paths.ts";
+import { daemonLockPath, daemonLogPath, daemonPidPath, daemonSocketPath } from "./paths.ts";
 import { listRegisteredTasks } from "./registry.ts";
 import { taskRuntimeId } from "./runtime/task.ts";
 import { readTaskState } from "./state.ts";
@@ -12,13 +12,17 @@ import { daemonProcessCommandLine, isBoxersDaemonCommand } from "./daemon-identi
 
 export { isBoxersDaemonCommand } from "./daemon-identity.ts";
 
-function readDaemonPid(): number | undefined {
+function readPidFile(path: string): number | undefined {
   try {
-    const pid = Number.parseInt(readFileSync(daemonPidPath(), "utf8").trim(), 10);
+    const pid = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
     return Number.isInteger(pid) && pid > 0 ? pid : undefined;
   } catch {
     return undefined;
   }
+}
+
+function readDaemonPid(): number | undefined {
+  return readPidFile(daemonPidPath());
 }
 
 function processIsAlive(pid: number): boolean {
@@ -217,17 +221,24 @@ export async function daemonStop(
   force = false,
   inspectProcess: (pid: number) => string | undefined = daemonProcessCommandLine,
 ): Promise<number> {
-  const pid = readDaemonPid();
-  if (pid === undefined || !processIsAlive(pid)) {
-    process.stdout.write("The boxers daemon is not running.\n");
-    return 0;
-  }
   if (force) {
-    const commandLine = inspectProcess(pid);
-    if (!commandLine || !isBoxersDaemonCommand(commandLine))
-      throw new Error(
-        `Refusing to force-stop PID ${pid}: the process from ${daemonPidPath()} could not be verified as an Boxers daemon.`,
-      );
+    const candidates = [readPidFile(daemonLockPath()), readDaemonPid()];
+    const liveCandidates = candidates.filter(
+      (pid, index): pid is number =>
+        pid !== undefined && processIsAlive(pid) && candidates.indexOf(pid) === index,
+    );
+    const pid = liveCandidates.find((candidate) => {
+      const commandLine = inspectProcess(candidate);
+      return commandLine !== undefined && isBoxersDaemonCommand(commandLine);
+    });
+    if (pid === undefined) {
+      if (liveCandidates.length)
+        throw new Error(
+          `Refusing to force-stop PID ${liveCandidates.join(", ")}: the process recorded by Boxers could not be verified as a Boxers daemon.`,
+        );
+      process.stdout.write("The boxers daemon is not running.\n");
+      return 0;
+    }
     process.stderr.write(
       `Force-stopping Boxers daemon PID ${pid} without checking live sessions or intents; daemon-owned work may be interrupted.\n`,
     );
@@ -237,14 +248,17 @@ export async function daemonStop(
   try {
     status = await querySessions();
   } catch (error) {
+    const recordedPids = [readPidFile(daemonLockPath()), readDaemonPid()].filter(
+      (pid): pid is number => pid !== undefined && processIsAlive(pid),
+    );
+    if (!recordedPids.length) {
+      process.stdout.write("The boxers daemon is not running.\n");
+      return 0;
+    }
     throw new Error(
       `Could not verify that the daemon is safe to stop: ${error instanceof Error ? error.message : String(error)} If interrupting daemon-owned work is acceptable, run \`boxers daemon stop --force\`.`,
     );
   }
-  if (status.pid !== pid)
-    throw new Error(
-      `Refusing to stop daemon PID ${pid}: the active daemon socket belongs to PID ${status.pid}.`,
-    );
   const runningSessions = status.sessions.filter((session) => session.state === "running");
   const blockingSessions = runningSessions.flatMap((session) => {
     const boundary = sessionRestartBoundary(session.sessionId);
@@ -262,7 +276,7 @@ export async function daemonStop(
       `The daemon still owns ${blockingSessions.length} agent session(s) that are working or not confirmed to be awaiting input${details ? `: ${details}` : ""}, and ${status.intents.length} intent(s). Finish them before restarting the daemon; stopping now would interrupt durable task work.`,
     );
   }
-  return stopDaemonProcess(pid, false);
+  return stopDaemonProcess(status.pid, false);
 }
 
 /** Safely stop the current daemon, then start and readiness-check its replacement. */

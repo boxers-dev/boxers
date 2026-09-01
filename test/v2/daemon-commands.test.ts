@@ -13,6 +13,7 @@ import {
   waitForProcessExit,
 } from "../../src/v2/daemon-commands.ts";
 import {
+  daemonLockPath,
   daemonLogPath,
   daemonPidPath,
   daemonSocketPath,
@@ -38,11 +39,14 @@ afterEach(async () => {
   else process.env.BOXERS_HOME = previousHome;
 });
 
-async function activityFixture(response: unknown): Promise<ReturnType<typeof vi.spyOn>> {
+async function activityFixture(
+  response: unknown,
+  recordedPid = 424_242,
+): Promise<ReturnType<typeof vi.spyOn>> {
   home = mkdtempSync(join(tmpdir(), "boxers-daemon-stop-"));
   process.env.BOXERS_HOME = home;
   const pid = 424_242;
-  writeFileSync(daemonPidPath(), `${pid}\n`);
+  writeFileSync(daemonPidPath(), `${recordedPid}\n`);
   server = createServer((socket) => {
     socket.once("data", () => socket.end(`${JSON.stringify(response)}\n`));
   });
@@ -52,6 +56,8 @@ async function activityFixture(response: unknown): Promise<ReturnType<typeof vi.
   });
   let stopped = false;
   return vi.spyOn(process, "kill").mockImplementation((target, signal) => {
+    if (target === recordedPid && recordedPid !== pid && signal === 0)
+      throw Object.assign(new Error("stale pid"), { code: "ESRCH" });
     if (target !== pid) throw Object.assign(new Error("unexpected pid"), { code: "ESRCH" });
     if (signal === "SIGTERM") {
       stopped = true;
@@ -279,15 +285,18 @@ describe("daemon lifecycle safety", () => {
     expect(kill.mock.calls.some((call: unknown[]) => call[1] === "SIGTERM")).toBe(true);
   });
 
-  it("refuses to signal a PID file that does not own the daemon socket", async () => {
+  it("stops the live socket owner when the PID file is stale", async () => {
     const kill = await activityFixture({
       type: "sessions",
-      pid: 424_243,
+      pid: 424_242,
       sessions: [],
       intents: [],
-    });
-    await expect(daemonStop()).rejects.toThrow(/socket belongs to PID 424243/);
-    expect(kill.mock.calls.some((call: unknown[]) => call[1] === "SIGTERM")).toBe(false);
+    }, 424_243);
+    vi.spyOn(process.stdout, "write").mockReturnValue(true);
+
+    await expect(daemonStop()).resolves.toBe(0);
+    expect(kill.mock.calls.some((call: unknown[]) => call[0] === 424_242 && call[1] === "SIGTERM"))
+      .toBe(true);
   });
 
   it("force-stops a verified daemon without querying its socket", async () => {
@@ -310,7 +319,7 @@ describe("daemon lifecycle safety", () => {
 
     await expect(
       daemonStop(true, () => "/usr/bin/node /srv/other/index.mjs __daemon-run"),
-    ).rejects.toThrow(/could not be verified as an Boxers daemon/);
+    ).rejects.toThrow(/could not be verified as a Boxers daemon/);
     expect(kill.mock.calls.some((call: unknown[]) => call[1] === "SIGTERM")).toBe(false);
   });
 
@@ -336,6 +345,31 @@ describe("daemon lifecycle safety", () => {
     await vi.advanceTimersByTimeAsync(4_100);
     await expect(stopping).resolves.toBe(0);
     expect(kill.mock.calls.some((call: unknown[]) => call[1] === "SIGKILL")).toBe(true);
+  });
+
+  it("force-stops a verified lock owner when the PID file is stale", async () => {
+    home = mkdtempSync(join(tmpdir(), "boxers-daemon-stop-"));
+    process.env.BOXERS_HOME = home;
+    writeFileSync(daemonPidPath(), "424243\n");
+    writeFileSync(daemonLockPath(), "424242\n");
+    let stopped = false;
+    const kill = vi.spyOn(process, "kill").mockImplementation((target, signal) => {
+      if (target === 424_243 && signal === 0)
+        throw Object.assign(new Error("stale pid"), { code: "ESRCH" });
+      if (target !== 424_242) throw Object.assign(new Error("unexpected pid"), { code: "ESRCH" });
+      if (signal === "SIGTERM") {
+        stopped = true;
+        return true;
+      }
+      if (signal === 0 && stopped) throw Object.assign(new Error("stopped"), { code: "ESRCH" });
+      return true;
+    });
+    vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    vi.spyOn(process.stderr, "write").mockReturnValue(true);
+
+    await expect(daemonStop(true, () => "/usr/local/bin/boxers debug daemon")).resolves.toBe(0);
+    expect(kill.mock.calls.some((call: unknown[]) => call[0] === 424_242 && call[1] === "SIGTERM"))
+      .toBe(true);
   });
 
   it("reports an active but unresponsive daemon accurately", async () => {
