@@ -50,9 +50,9 @@ printf '{"version":1,"sequence":%s,"provider":"%s","recordedAt":"%s","raw":' "$s
 cat "$raw" >> "$event" || exit 0
 printf '}\n' >> "$event" || exit 0
 rm -f "$raw"
-sync -f "$event" 2>/dev/null || true
 mv "$event" "$ready/$sequence.json" || exit 0
 flock -u 9 || true
+sync -f "$ready/$sequence.json" 2>/dev/null || true
 
 token=''
 [ ! -f "$git_dir/boxers/bridge-token" ] || read -r token < "$git_dir/boxers/bridge-token"

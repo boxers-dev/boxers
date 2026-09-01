@@ -1,6 +1,14 @@
 import { spawn } from "node:child_process";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -13,6 +21,9 @@ describe("lifecycle hook recorder", () => {
     expect(script).toContain('mv "$event" "$ready/$sequence.json"');
     expect(script.indexOf('mv "$event" "$ready/$sequence.json"')).toBeLessThan(
       script.indexOf("> /dev/tty"),
+    );
+    expect(script.indexOf("flock -u 9")).toBeLessThan(
+      script.indexOf('sync -f "$ready/$sequence.json"'),
     );
     expect(script).toContain("flock -w 2");
     expect(script).toContain("mutation.json");
@@ -32,12 +43,18 @@ describe("lifecycle hook recorder", () => {
       const recorder = join(repository, "record-lifecycle");
       writeFileSync(recorder, renderLifecycleRecorder());
       chmodSync(recorder, 0o700);
+      const bin = join(repository, "bin");
+      mkdirSync(bin);
+      const slowSync = join(bin, "sync");
+      writeFileSync(slowSync, "#!/bin/sh\nsleep 0.3\n");
+      chmodSync(slowSync, 0o700);
       const runs = Array.from(
         { length: 12 },
         (_, index) =>
           new Promise<void>((resolve, reject) => {
             const child = spawn(recorder, ["codex", "user_prompt"], {
               cwd: repository,
+              env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
               stdio: ["pipe", "ignore", "ignore"],
             });
             child.once("error", reject);
