@@ -214,7 +214,7 @@ export interface FleetMember {
   hostId: string;
   name: string;
   publicKey: string;
-  ssh: {
+  ssh?: {
     version: 1;
     publicKey: string;
     fingerprint: string;

@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { runDaemon, type DaemonHandle } from "../../src/v2/daemon.ts";
+import { daemonMain, runDaemon, type DaemonHandle } from "../../src/v2/daemon.ts";
 import {
   encodeMessage,
   LineDecoder,
@@ -22,6 +22,9 @@ import {
 } from "../../src/v2/daemon-protocol.ts";
 import {
   atomicWriteJson,
+  daemonLockPath,
+  daemonSocketPath,
+  fleetPath,
   taskMutationBarrierPath,
   taskIntentLeasePath,
 } from "../../src/v2/paths.ts";
@@ -91,6 +94,21 @@ function registerTask(state: string, name: string, runtimeId: string): void {
     })}\n`,
   );
 }
+
+it("does not strand the daemon lock when synchronous startup fails", () => {
+  useTemporaryState();
+  atomicWriteJson(fleetPath(), {
+    version: 1,
+    fleetId: "invalid-fleet",
+    members: [{}],
+    removedMembers: [],
+    updatedAt: "2026-09-01T00:00:00.000Z",
+  });
+
+  expect(() => daemonMain()).toThrow("Invalid fleet member host ID");
+  expect(existsSync(daemonLockPath())).toBe(false);
+  expect(existsSync(daemonSocketPath())).toBe(false);
+});
 
 interface Client {
   send: (message: ClientMessage) => void;

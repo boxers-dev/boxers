@@ -217,7 +217,7 @@ export function reconcileManagedPeerAuthorizations(
   const localId = localMachineIdentity().id;
   const executable = process.env["BOXERS_EXECUTABLE"] ?? process.argv[1] ?? "boxers";
   for (const member of members) {
-    if (member.hostId !== localId)
+    if (member.hostId !== localId && member.ssh)
       authorizeManagedPeer(member.hostId, member.ssh.publicKey, executable);
   }
   for (const removal of removedMembers) {

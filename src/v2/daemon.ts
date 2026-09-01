@@ -784,12 +784,6 @@ export function runDaemon(
     });
   });
 
-  server.listen(socketPath);
-  server.once("listening", () => {
-    if (process.platform !== "win32") chmodSync(socketPath, 0o600);
-    debug(`Listening for commands on ${debugValue(socketPath)}.`);
-  });
-
   let fleetGossip: ReturnType<typeof setTimeout> | undefined;
   let fleetGossipClosed = false;
   const scheduleFleetGossip = (delay: number, failedAttempts = 0): void => {
@@ -864,6 +858,14 @@ export function runDaemon(
           )
       : Promise.resolve();
 
+  // Listen only after synchronous startup initialization has succeeded. If an
+  // initializer rejects persisted state, no live server handle is left behind.
+  server.listen(socketPath);
+  server.once("listening", () => {
+    if (process.platform !== "win32") chmodSync(socketPath, 0o600);
+    debug(`Listening for commands on ${debugValue(socketPath)}.`);
+  });
+
   const close = (): Promise<void> => {
     debug("Stopping daemon event loop.");
     closing = true;
@@ -912,7 +914,18 @@ export function daemonMain(): boolean {
     }
   };
   if (!claim()) return false;
-  const { close } = runDaemon();
+  let close: () => Promise<void>;
+  try {
+    ({ close } = runDaemon());
+  } catch (error) {
+    try {
+      if (Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10) === process.pid)
+        unlinkSync(lockPath);
+    } catch {
+      // A later startup can recover the PID lock if cleanup is interrupted.
+    }
+    throw error;
+  }
   atomicWriteText(daemonPidPath(), `${process.pid}\n`);
   atomicWriteJson(daemonHealthPath(), {
     version: 1,

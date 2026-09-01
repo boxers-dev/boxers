@@ -14,7 +14,7 @@ import {
   verifyHostProjection,
 } from "../../src/v2/fleet.ts";
 import { decodeAdminRequest, encodeAdminRequest } from "../../src/v2/fleet-admin.ts";
-import { fleetAdminStateLockPath, fleetLockPath } from "../../src/v2/paths.ts";
+import { fleetAdminStateLockPath, fleetLockPath, fleetPath } from "../../src/v2/paths.ts";
 import {
   acceptEnrollment,
   acceptFleetSync,
@@ -42,6 +42,53 @@ afterEach(() => {
 });
 
 describe("fleet identity and administration", () => {
+  it("migrates a persisted local member that predates managed SSH", () => {
+    process.env.BOXERS_HOME = stateDirectory();
+    const fleet = ensureFleet();
+    const legacy = {
+      ...fleet,
+      members: fleet.members.map(({ ssh: _ssh, ...member }) => member),
+    };
+    writeFileSync(fleetPath(), `${JSON.stringify(legacy, null, 2)}\n`);
+
+    const migrated = readFleet();
+
+    expect(migrated?.members[0]?.ssh).toMatchObject({ version: 1 });
+    expect(JSON.parse(readFileSync(fleetPath(), "utf8")).members[0].ssh).toMatchObject({
+      version: 1,
+    });
+  });
+
+  it("keeps legacy remote members readable until their managed identity arrives", () => {
+    const localHome = stateDirectory();
+    const remoteHome = stateDirectory();
+    process.env.BOXERS_HOME = localHome;
+    const fleet = ensureFleet();
+
+    process.env.BOXERS_HOME = remoteHome;
+    ensureFleet(fleet.fleetId);
+    const remote = localFleetMember([{ transport: "ssh", target: "remote" }]);
+
+    process.env.BOXERS_HOME = localHome;
+    enrollFleetMember(fleet.fleetId, remote);
+    const persisted = readFleet()!;
+    writeFileSync(
+      fleetPath(),
+      `${JSON.stringify({
+        ...persisted,
+        members: persisted.members.map(({ ssh: _ssh, ...member }) => member),
+      })}\n`,
+    );
+
+    const legacy = readFleet()!;
+    expect(legacy.members.find((member) => member.hostId === remote.hostId)?.ssh).toBeUndefined();
+
+    enrollFleetMember(fleet.fleetId, remote);
+    expect(readFleet()?.members.find((member) => member.hostId === remote.hostId)?.ssh).toEqual(
+      remote.ssh,
+    );
+  });
+
   it("recovers a fleet lock left by a dead writer", () => {
     process.env.BOXERS_HOME = stateDirectory();
     writeFileSync(fleetLockPath(), "2147483647\n");
