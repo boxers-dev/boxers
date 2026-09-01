@@ -1,0 +1,183 @@
+name: Publish Sandbox templates
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "templates/**"
+      - ".github/workflows/publish-templates.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/boxers-dev/boxers-templates
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      image: ${{ steps.image.outputs.value }}
+      codex_version: ${{ steps.versions.outputs.codex_version }}
+      claude_version: ${{ steps.versions.outputs.claude_version }}
+      node_version: ${{ steps.versions.outputs.node_version }}
+      corepack_version: ${{ steps.versions.outputs.corepack_version }}
+      get_pnpm_version: ${{ steps.versions.outputs.get_pnpm_version }}
+      pnpm_version: ${{ steps.versions.outputs.pnpm_version }}
+      yarn_version: ${{ steps.versions.outputs.yarn_version }}
+      bun_version: ${{ steps.versions.outputs.bun_version }}
+      rust_version: ${{ steps.versions.outputs.rust_version }}
+      codex_fingerprint: ${{ steps.inputs.outputs.codex_fingerprint }}
+      claude_fingerprint: ${{ steps.inputs.outputs.claude_fingerprint }}
+      codex_changed: ${{ steps.inputs.outputs.codex_changed }}
+      claude_changed: ${{ steps.inputs.outputs.claude_changed }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: image
+        shell: bash
+        run: echo "value=${IMAGE,,}" >> "$GITHUB_OUTPUT"
+      - id: versions
+        run: node templates/resolve-versions.mjs >> "$GITHUB_OUTPUT"
+      - id: inputs
+        env:
+          CODEX_VERSION: ${{ steps.versions.outputs.codex_version }}
+          CLAUDE_VERSION: ${{ steps.versions.outputs.claude_version }}
+          NODE_VERSION: ${{ steps.versions.outputs.node_version }}
+          COREPACK_VERSION: ${{ steps.versions.outputs.corepack_version }}
+          GET_PNPM_VERSION: ${{ steps.versions.outputs.get_pnpm_version }}
+          PNPM_VERSION: ${{ steps.versions.outputs.pnpm_version }}
+          YARN_VERSION: ${{ steps.versions.outputs.yarn_version }}
+          BUN_VERSION: ${{ steps.versions.outputs.bun_version }}
+          RUST_VERSION: ${{ steps.versions.outputs.rust_version }}
+          NORMALIZED_IMAGE: ${{ steps.image.outputs.value }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          template_hash=$(sha256sum templates/Dockerfile templates/docker-bake.hcl templates/resolve-versions.mjs | sha256sum | cut -c1-16)
+          for agent in codex claude; do
+            if test "$agent" = codex; then
+              base=docker.io/docker/sandbox-templates:codex-docker
+              version=$CODEX_VERSION
+            else
+              base=docker.io/docker/sandbox-templates:claude-code-docker
+              version=$CLAUDE_VERSION
+            fi
+            base_digest=$(docker buildx imagetools inspect --raw "$base" | sha256sum | cut -c1-16)
+            fingerprint=$(printf '%s\n' "$agent" "$base_digest" "$version" "$NODE_VERSION" "$COREPACK_VERSION" "$GET_PNPM_VERSION" "$PNPM_VERSION" "$YARN_VERSION" "$RUST_VERSION" "$BUN_VERSION" "$template_hash" | sha256sum | cut -c1-16)
+            changed=false
+            if ! docker buildx imagetools inspect "$NORMALIZED_IMAGE:$agent-default-$fingerprint" >/dev/null 2>&1 \
+              || ! docker buildx imagetools inspect "$NORMALIZED_IMAGE:$agent-tauri-$fingerprint" >/dev/null 2>&1 \
+              || ! docker buildx imagetools inspect "$NORMALIZED_IMAGE:$agent-bun-$fingerprint" >/dev/null 2>&1; then
+              changed=true
+            fi
+            echo "${agent}_fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+            echo "${agent}_changed=$changed" >> "$GITHUB_OUTPUT"
+          done
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.codex_changed == 'true' || needs.prepare.outputs.claude_changed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - agent: codex
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - agent: codex
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - agent: claude
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - agent: claude
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Skip unchanged agent
+        if: (matrix.agent == 'codex' && needs.prepare.outputs.codex_changed != 'true') || (matrix.agent == 'claude' && needs.prepare.outputs.claude_changed != 'true')
+        run: echo "${{ matrix.agent }} inputs are unchanged"
+      - uses: actions/checkout@v6
+        if: (matrix.agent == 'codex' && needs.prepare.outputs.codex_changed == 'true') || (matrix.agent == 'claude' && needs.prepare.outputs.claude_changed == 'true')
+      - uses: docker/setup-buildx-action@v4
+        if: (matrix.agent == 'codex' && needs.prepare.outputs.codex_changed == 'true') || (matrix.agent == 'claude' && needs.prepare.outputs.claude_changed == 'true')
+      - uses: docker/login-action@v4
+        if: (matrix.agent == 'codex' && needs.prepare.outputs.codex_changed == 'true') || (matrix.agent == 'claude' && needs.prepare.outputs.claude_changed == 'true')
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build, smoke test, and push
+        if: (matrix.agent == 'codex' && needs.prepare.outputs.codex_changed == 'true') || (matrix.agent == 'claude' && needs.prepare.outputs.claude_changed == 'true')
+        env:
+          AGENT: ${{ matrix.agent }}
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          TAG_SUFFIX: -${{ matrix.arch }}
+          FINGERPRINT: ${{ matrix.agent == 'codex' && needs.prepare.outputs.codex_fingerprint || needs.prepare.outputs.claude_fingerprint }}
+          BASE_IMAGE: ${{ matrix.agent == 'codex' && 'docker.io/docker/sandbox-templates:codex-docker' || 'docker.io/docker/sandbox-templates:claude-code-docker' }}
+          AGENT_PACKAGE: ${{ matrix.agent == 'codex' && '@openai/codex' || '@anthropic-ai/claude-code' }}
+          AGENT_VERSION: ${{ matrix.agent == 'codex' && needs.prepare.outputs.codex_version || needs.prepare.outputs.claude_version }}
+          AGENT_COMMAND: ${{ matrix.agent }}
+          NODE_VERSION: ${{ needs.prepare.outputs.node_version }}
+          COREPACK_VERSION: ${{ needs.prepare.outputs.corepack_version }}
+          GET_PNPM_VERSION: ${{ needs.prepare.outputs.get_pnpm_version }}
+          PNPM_VERSION: ${{ needs.prepare.outputs.pnpm_version }}
+          YARN_VERSION: ${{ needs.prepare.outputs.yarn_version }}
+          BUN_VERSION: ${{ needs.prepare.outputs.bun_version }}
+          RUST_VERSION: ${{ needs.prepare.outputs.rust_version }}
+        run: |
+          docker buildx bake --file templates/docker-bake.hcl smoke-default smoke-tauri smoke-bun --set '*.platform=${{ matrix.platform }}'
+          docker buildx bake --file templates/docker-bake.hcl default tauri bun --set '*.platform=${{ matrix.platform }}' --push
+
+  publish:
+    needs: [prepare, build]
+    if: always() && needs.prepare.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-platform manifests
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          CODEX_CHANGED: ${{ needs.prepare.outputs.codex_changed }}
+          CLAUDE_CHANGED: ${{ needs.prepare.outputs.claude_changed }}
+          CODEX_FINGERPRINT: ${{ needs.prepare.outputs.codex_fingerprint }}
+          CLAUDE_FINGERPRINT: ${{ needs.prepare.outputs.claude_fingerprint }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for agent in codex claude; do
+            changed_name=$(printf '%s_CHANGED' "$agent" | tr '[:lower:]' '[:upper:]')
+            fingerprint_name=$(printf '%s_FINGERPRINT' "$agent" | tr '[:lower:]' '[:upper:]')
+            changed=${!changed_name}
+            fingerprint=${!fingerprint_name}
+            test "$changed" = true || continue
+            for kind in default tauri bun; do
+              immutable="$agent-$kind-$fingerprint"
+              docker buildx imagetools create \
+                --tag "$IMAGE:$immutable" \
+                "$IMAGE:$immutable-amd64" "$IMAGE:$immutable-arm64"
+              docker buildx imagetools create \
+                --tag "$IMAGE:$agent-$kind" "$IMAGE:$immutable"
+              docker buildx imagetools inspect "$IMAGE:$agent-$kind"
+            done
+          done

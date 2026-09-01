@@ -1,0 +1,59 @@
+name: Publish to npm
+
+# Publish to npm whenever a version tag (e.g. v1.2.3) is pushed. The version
+# from the tag is written into package.json before building so the published
+# package matches the tag exactly.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  # Required for npm trusted publishing (OIDC): lets the job mint a
+  # short-lived OIDC token instead of using a long-lived NPM_TOKEN.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+
+      # Node 22 bundles an npm older than 11.5.1, which does not support
+      # trusted publishing. Upgrade before running any npm auth/publish steps.
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Derive version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Set package version from tag
+        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Gate publishing on a green test run: lint, typecheck, and the full
+      # suite must pass before the package is published from a tag.
+      - name: Lint and typecheck
+        run: npm run check
+
+      - name: Run tests
+        run: npm run test:run
+
+      # No explicit build step: the package's `prepublishOnly` script runs
+      # `npm run build` automatically as part of `npm publish` below, so the
+      # published tarball always contains a freshly built `dist/`.
+
+      # No NODE_AUTH_TOKEN: with trusted publishing npm authenticates via the
+      # OIDC token from the id-token permission above. Provenance is generated
+      # automatically. A trusted publisher for this package must be configured
+      # at npmjs.com pointing at this repo + workflow file (publish-npm.yml).
+      - name: Publish to npm
+        run: npm publish --access public

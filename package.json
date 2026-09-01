@@ -1,0 +1,68 @@
+{
+  "name": "@boxers-dev/boxers",
+  "version": "0.0.1",
+  "description": "Run a fleet of sandbox-native autonomous coding agents that pack a punch.",
+  "keywords": [
+    "agent",
+    "claude-code",
+    "cli",
+    "codex",
+    "coding-agent",
+    "docker",
+    "isolation",
+    "sandbox",
+    "workspace",
+    "yolo"
+  ],
+  "homepage": "https://github.com/boxers-dev/boxers#readme",
+  "bugs": {
+    "url": "https://github.com/boxers-dev/boxers/issues"
+  },
+  "license": "MIT",
+  "author": "Imre Gelens <imre@boxers.dev>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/boxers-dev/boxers.git"
+  },
+  "bin": {
+    "boxers": "dist/index.mjs"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "dist/index.mjs",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsdown",
+    "prepublishOnly": "npm run build",
+    "check": "oxlint . && tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "format": "oxfmt ."
+  },
+  "dependencies": {
+    "@lydell/node-pty": "1.2.0-beta.15",
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "@vitest/coverage-v8": "^4.1.8",
+    "oxc": "^1.0.1",
+    "oxfmt": "^0.53.0",
+    "oxlint": "^1.68.0",
+    "tsdown": "^0.22.2",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "unrun": "^0.3.1",
+    "vitest": "^4.1.8"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "fsevents@2.3.3": true
+  }
+}

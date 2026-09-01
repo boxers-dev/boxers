@@ -1,0 +1,544 @@
+import { existsSync } from "node:fs";
+import { atomicWriteJson, readJson, taskStatePath } from "./paths.ts";
+import { withPidFileLock } from "./lock.ts";
+import type {
+  Observation,
+  ObservationSource,
+  CandidateCommitMessage,
+  CheckRun,
+  ProjectManifest,
+  SetupStatus,
+  TaskManifest,
+  TaskSnapshot,
+  TaskState,
+  WorkspaceRelation,
+  PersistedSettlementState,
+} from "./types.ts";
+import type { ConversationEventRecord } from "./conversation.ts";
+import { settlementPublicationAllowed } from "./settlement-publication.ts";
+
+function observation<T>(value: T, observedAt: string, source: ObservationSource): Observation<T> {
+  return { value, observedAt, source };
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+export function initialTaskState(
+  _project: ProjectManifest,
+  task: TaskManifest,
+  now = new Date().toISOString(),
+): TaskState {
+  return {
+    version: 3,
+    taskId: task.id,
+    revision: 1,
+    updatedAt: now,
+    agentTurnState: "not_started",
+    conversationHighWaterSequence: 0,
+    lifecycleDrainSequence: 0,
+    promotionConversationCheckpoint: 0,
+    hasUnmergedChanges: observation("unknown", now, "initial"),
+  };
+}
+
+function validObservation<T>(
+  value: unknown,
+  valid: (candidate: unknown) => candidate is T,
+): value is Observation<T> {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return (
+    hasOnlyKeys(record, ["value", "observedAt", "source"]) &&
+    valid(record["value"]) &&
+    typeof record["observedAt"] === "string" &&
+    Number.isFinite(Date.parse(record["observedAt"])) &&
+    ["command", "daemon", "worker", "git", "initial"].includes(String(record["source"]))
+  );
+}
+
+function validSetup(value: unknown): value is SetupStatus {
+  if (!value || typeof value !== "object") return false;
+  const setup = value as Record<string, unknown>;
+  return (
+    hasOnlyKeys(setup, [
+      "state",
+      "command",
+      "startedAt",
+      "finishedAt",
+      "pid",
+      "exitCode",
+      "logPath",
+    ]) &&
+    ["running", "passed", "failed", "timed_out"].includes(String(setup.state)) &&
+    typeof setup.command === "string" &&
+    typeof setup.startedAt === "string" &&
+    typeof setup.logPath === "string" &&
+    (setup.finishedAt === undefined || typeof setup.finishedAt === "string") &&
+    (setup.pid === undefined || typeof setup.pid === "number") &&
+    (setup.exitCode === undefined || typeof setup.exitCode === "number")
+  );
+}
+
+function validCheck(value: unknown): value is CheckRun {
+  if (!value || typeof value !== "object") return false;
+  const check = value as Record<string, unknown>;
+  return (
+    hasOnlyKeys(check, ["status", "targetOid", "candidateTreeOid", "configHash", "results"]) &&
+    (check.status === "passed" || check.status === "failed") &&
+    typeof check.targetOid === "string" &&
+    typeof check.candidateTreeOid === "string" &&
+    typeof check.configHash === "string" &&
+    Array.isArray(check.results) &&
+    check.results.every((result) => {
+      if (!result || typeof result !== "object") return false;
+      const item = result as Record<string, unknown>;
+      return (
+        hasOnlyKeys(item, ["name", "command", "status", "exitCode", "durationMs", "logPath"]) &&
+        typeof item.name === "string" &&
+        typeof item.command === "string" &&
+        ["passed", "failed", "timed_out"].includes(String(item.status)) &&
+        typeof item.durationMs === "number" &&
+        (item.exitCode === undefined || typeof item.exitCode === "number") &&
+        (item.logPath === undefined || typeof item.logPath === "string")
+      );
+    })
+  );
+}
+
+function validCandidateCommitMessage(value: unknown): value is CandidateCommitMessage {
+  if (!value || typeof value !== "object") return false;
+  const message = value as Record<string, unknown>;
+  return (
+    hasOnlyKeys(message, [
+      "targetOid",
+      "candidateTreeOid",
+      "conversationHighWaterSequence",
+      "lifecycleDrainSequence",
+      "subject",
+      "note",
+    ]) &&
+    typeof message.targetOid === "string" &&
+    typeof message.candidateTreeOid === "string" &&
+    Number.isSafeInteger(message.conversationHighWaterSequence) &&
+    Number(message.conversationHighWaterSequence) >= 0 &&
+    typeof message.subject === "string" &&
+    message.subject.length > 0 &&
+    message.subject.length <= 72 &&
+    ![...message.subject].some((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      return code < 32 || code === 127;
+    }) &&
+    (message.note === undefined ||
+      (typeof message.note === "string" &&
+        message.note.length > 0 &&
+        message.note.length <= 8_000 &&
+        ![...message.note].some((character) => {
+          const code = character.codePointAt(0) ?? 0;
+          return (code < 32 && code !== 9 && code !== 10) || code === 127;
+        })))
+  );
+}
+
+export function isTaskState(value: unknown, taskId: string): value is TaskState {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Partial<TaskState>;
+  const record = value as Record<string, unknown>;
+  return (
+    hasOnlyKeys(record, [
+      "version",
+      "taskId",
+      "revision",
+      "updatedAt",
+      "agentTurnState",
+      "conversationHighWaterSequence",
+      "lifecycleDrainSequence",
+      "promotionConversationCheckpoint",
+      "providerSessionId",
+      "providerTurnId",
+      "lastLifecycleEventKind",
+      "lastLifecycleEventAt",
+      "settlement",
+      "lifecycleDiagnostic",
+      "hasUnmergedChanges",
+      "baseOid",
+      "candidateTreeOid",
+      "lastDelivery",
+      "setup",
+      "check",
+      "commitMessage",
+      "summary",
+      "failure",
+    ]) &&
+    state.version === 3 &&
+    state.taskId === taskId &&
+    Number.isInteger(state.revision) &&
+    (state.revision ?? 0) > 0 &&
+    typeof state.updatedAt === "string" &&
+    Number.isFinite(Date.parse(state.updatedAt)) &&
+    ["not_started", "working", "awaiting_input", "exited", "unknown"].includes(
+      String(state.agentTurnState),
+    ) &&
+    Number.isSafeInteger(state.conversationHighWaterSequence) &&
+    Number(state.conversationHighWaterSequence) >= 0 &&
+    Number.isSafeInteger(state.lifecycleDrainSequence) &&
+    Number(state.lifecycleDrainSequence) >= Number(state.conversationHighWaterSequence) &&
+    Number.isSafeInteger(state.promotionConversationCheckpoint) &&
+    Number(state.promotionConversationCheckpoint) >= 0 &&
+    Number(state.promotionConversationCheckpoint) <= Number(state.conversationHighWaterSequence) &&
+    [
+      state.providerSessionId,
+      state.providerTurnId,
+      state.lastLifecycleEventAt,
+      state.lifecycleDiagnostic,
+    ].every((candidate) => candidate === undefined || typeof candidate === "string") &&
+    (state.lastLifecycleEventKind === undefined ||
+      state.lastLifecycleEventKind === "user_prompt" ||
+      state.lastLifecycleEventKind === "turn_finished") &&
+    (state.settlement === undefined || validSettlement(state.settlement)) &&
+    validObservation(
+      state.hasUnmergedChanges,
+      (candidate): candidate is boolean | "unknown" =>
+        typeof candidate === "boolean" || candidate === "unknown",
+    ) &&
+    (state.setup === undefined || validSetup(state.setup)) &&
+    (state.check === undefined || validCheck(state.check)) &&
+    (state.commitMessage === undefined || validCandidateCommitMessage(state.commitMessage)) &&
+    (state.lastDelivery === undefined ||
+      validObservation(
+        state.lastDelivery,
+        (candidate): candidate is { ref: string; oid: string; subject: string } => {
+          if (!candidate || typeof candidate !== "object") return false;
+          const delivery = candidate as Record<string, unknown>;
+          return (
+            hasOnlyKeys(delivery, ["ref", "oid", "subject"]) &&
+            typeof delivery.ref === "string" &&
+            typeof delivery.oid === "string" &&
+            typeof delivery.subject === "string"
+          );
+        },
+      )) &&
+    [state.baseOid, state.candidateTreeOid, state.summary, state.failure].every(
+      (candidate) => candidate === undefined || typeof candidate === "string",
+    )
+  );
+}
+
+function validSettlement(value: unknown): value is PersistedSettlementState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const settlement = value as Record<string, unknown>;
+  return (
+    hasOnlyKeys(settlement, [
+      "runId",
+      "phase",
+      "triggerSequence",
+      "startedAt",
+      "updatedAt",
+      "targetOid",
+      "candidateTreeOid",
+      "finishedAt",
+      "failure",
+    ]) &&
+    typeof settlement.runId === "string" &&
+    [
+      "none",
+      "queued",
+      "refreshing",
+      "reconciling",
+      "capturing",
+      "checking",
+      "generating",
+      "ready",
+      "needs_input",
+      "cancelled",
+      "failed",
+    ].includes(String(settlement.phase)) &&
+    Number.isSafeInteger(settlement.triggerSequence) &&
+    Number(settlement.triggerSequence) > 0 &&
+    typeof settlement.startedAt === "string" &&
+    typeof settlement.updatedAt === "string" &&
+    [
+      settlement.targetOid,
+      settlement.candidateTreeOid,
+      settlement.finishedAt,
+      settlement.failure,
+    ].every((candidate) => candidate === undefined || typeof candidate === "string")
+  );
+}
+
+function withTaskStateLock<T>(path: string, action: () => T): T {
+  return withPidFileLock(`${path}.lock`, action);
+}
+
+export function readTaskState(project: ProjectManifest, task: TaskManifest): TaskState {
+  const path = taskStatePath(project.id, task.id);
+  if (!existsSync(path)) return initialTaskState(project, task);
+  const state = readJson<unknown>(path);
+  if (!isTaskState(state, task.id))
+    throw new Error(`Unsupported task state at ${path}; discard and recreate the task.`);
+  return state;
+}
+
+/** Create only the current schema. Older state is deliberately unsupported. */
+export function ensureTaskState(project: ProjectManifest, task: TaskManifest): TaskState {
+  const path = taskStatePath(project.id, task.id);
+  return withTaskStateLock(path, () => {
+    if (existsSync(path)) return readTaskState(project, task);
+    const state = initialTaskState(project, task);
+    atomicWriteJson(path, state);
+    return state;
+  });
+}
+
+export interface TaskStateUpdate {
+  hasUnmergedChanges?: boolean | "unknown";
+  baseOid?: string | null;
+  candidateTreeOid?: string | null;
+  setup?: TaskSnapshot["setup"] | null;
+  check?: TaskSnapshot["check"] | null;
+  summary?: string | null;
+  failure?: string | null;
+  lastDelivery?: { ref: string; oid: string; subject: string };
+  settlement?: PersistedSettlementState | null;
+  lifecycleDiagnostic?: string | null;
+  promotionConversationCheckpoint?: number;
+}
+
+export function updateTaskState(
+  project: ProjectManifest,
+  task: TaskManifest,
+  update: TaskStateUpdate,
+  source: ObservationSource = "daemon",
+  observedAt = new Date().toISOString(),
+): TaskState {
+  const path = taskStatePath(project.id, task.id);
+  return withTaskStateLock(path, () => {
+    const previous = existsSync(path)
+      ? readTaskState(project, task)
+      : initialTaskState(project, task);
+    if (!settlementPublicationAllowed(task.id, previous)) return previous;
+    const state: TaskState = {
+      ...previous,
+      revision: previous.revision + 1,
+      updatedAt: observedAt,
+      ...(update.hasUnmergedChanges === undefined
+        ? {}
+        : {
+            hasUnmergedChanges: observation(update.hasUnmergedChanges, observedAt, source),
+          }),
+      ...(update.lastDelivery
+        ? { lastDelivery: observation(update.lastDelivery, observedAt, source) }
+        : {}),
+    };
+    for (const [field, value] of [
+      ["baseOid", update.baseOid],
+      ["candidateTreeOid", update.candidateTreeOid],
+      ["setup", update.setup],
+      ["check", update.check],
+      ["summary", update.summary],
+      ["failure", update.failure],
+      ["settlement", update.settlement],
+      ["lifecycleDiagnostic", update.lifecycleDiagnostic],
+      ["promotionConversationCheckpoint", update.promotionConversationCheckpoint],
+    ] as const) {
+      if (value === undefined) continue;
+      if (value === null) delete (state as unknown as Record<string, unknown>)[field];
+      else (state as unknown as Record<string, unknown>)[field] = value;
+    }
+    if (
+      state.commitMessage &&
+      (state.commitMessage.targetOid !== state.baseOid ||
+        state.commitMessage.candidateTreeOid !== state.candidateTreeOid)
+    )
+      delete state.commitMessage;
+    atomicWriteJson(path, state);
+    return state;
+  });
+}
+
+/** Publish a generated commit message only while its exact candidate is still current. */
+export function recordCandidateCommitMessage(
+  project: ProjectManifest,
+  task: TaskManifest,
+  message: CandidateCommitMessage,
+  observedAt = new Date().toISOString(),
+): boolean {
+  const path = taskStatePath(project.id, task.id);
+  return withTaskStateLock(path, () => {
+    const previous = existsSync(path)
+      ? readTaskState(project, task)
+      : initialTaskState(project, task);
+    if (!settlementPublicationAllowed(task.id, previous)) return false;
+    if (
+      previous.baseOid !== message.targetOid ||
+      previous.candidateTreeOid !== message.candidateTreeOid ||
+      previous.conversationHighWaterSequence !== message.conversationHighWaterSequence
+    )
+      return false;
+    atomicWriteJson(path, {
+      ...previous,
+      revision: previous.revision + 1,
+      updatedAt: observedAt,
+      commitMessage: message,
+    } satisfies TaskState);
+    return true;
+  });
+}
+
+export function taskNeedsAttention(state: TaskState): boolean {
+  if (state.agentTurnState === "working") return false;
+  return (
+    state.agentTurnState === "awaiting_input" ||
+    Boolean(state.failure) ||
+    state.settlement?.phase === "failed" ||
+    state.settlement?.phase === "needs_input"
+  );
+}
+
+/** Record the daemon-owned durable provider process reaching a terminal state. */
+export function recordAgentExited(
+  project: ProjectManifest,
+  task: TaskManifest,
+  observedAt = new Date().toISOString(),
+): TaskState {
+  const path = taskStatePath(project.id, task.id);
+  return withTaskStateLock(path, () => {
+    const previous = existsSync(path)
+      ? readTaskState(project, task)
+      : initialTaskState(project, task);
+    if (previous.agentTurnState === "exited") return previous;
+    const state = {
+      ...previous,
+      revision: previous.revision + 1,
+      updatedAt: observedAt,
+      agentTurnState: "exited" as const,
+    };
+    atomicWriteJson(path, state);
+    return state;
+  });
+}
+
+/** Atomically accept one strictly newer normalized lifecycle event. */
+export function recordLifecycleEvent(
+  project: ProjectManifest,
+  task: TaskManifest,
+  record: ConversationEventRecord,
+): boolean {
+  const path = taskStatePath(project.id, task.id);
+  return withTaskStateLock(path, () => {
+    const previous = existsSync(path)
+      ? readTaskState(project, task)
+      : initialTaskState(project, task);
+    if (record.sequence <= previous.lifecycleDrainSequence) return false;
+    const event = record.event;
+    const duplicate =
+      previous.providerSessionId === event.providerSessionId &&
+      previous.providerTurnId === event.providerTurnId &&
+      previous.lastLifecycleEventKind === event.kind;
+    if (duplicate) {
+      atomicWriteJson(path, {
+        ...previous,
+        revision: previous.revision + 1,
+        updatedAt: event.recordedAt,
+        lifecycleDrainSequence: record.sequence,
+      } satisfies TaskState);
+      return false;
+    }
+    const next: TaskState = {
+      ...previous,
+      revision: previous.revision + 1,
+      updatedAt: event.recordedAt,
+      agentTurnState: event.kind === "user_prompt" ? "working" : "awaiting_input",
+      conversationHighWaterSequence: record.sequence,
+      lifecycleDrainSequence: record.sequence,
+      providerSessionId: event.providerSessionId,
+      ...(event.providerTurnId ? { providerTurnId: event.providerTurnId } : {}),
+      lastLifecycleEventKind: event.kind,
+      lastLifecycleEventAt: event.recordedAt,
+    };
+    if (!event.providerTurnId) delete next.providerTurnId;
+    atomicWriteJson(path, next);
+    return true;
+  });
+}
+
+export function recordLifecycleDiagnostic(
+  project: ProjectManifest,
+  task: TaskManifest,
+  sequence: number,
+  diagnostic: string,
+): void {
+  const path = taskStatePath(project.id, task.id);
+  withTaskStateLock(path, () => {
+    const previous = existsSync(path)
+      ? readTaskState(project, task)
+      : initialTaskState(project, task);
+    if (sequence <= previous.lifecycleDrainSequence) return;
+    atomicWriteJson(path, {
+      ...previous,
+      revision: previous.revision + 1,
+      updatedAt: new Date().toISOString(),
+      lifecycleDrainSequence: sequence,
+      lifecycleDiagnostic: diagnostic,
+    } satisfies TaskState);
+  });
+}
+
+/** Publish the five user-facing facts derived from one coherent snapshot. */
+export function recordTaskSnapshot(
+  project: ProjectManifest,
+  task: TaskManifest,
+  snapshot: TaskSnapshot,
+  options: {
+    source?: ObservationSource;
+    workspaceRelation?: WorkspaceRelation;
+    observedAt?: string;
+    publishSnapshot?: boolean;
+    lastDelivery?: { ref: string; oid: string; subject: string };
+  } = {},
+): TaskState {
+  const relation = options.workspaceRelation;
+  const publish = options.publishSnapshot === true;
+  return updateTaskState(
+    project,
+    task,
+    {
+      ...(relation === undefined
+        ? {}
+        : {
+            hasUnmergedChanges:
+              relation === "on_base"
+                ? false
+                : relation === "not_on_base" || relation === "conflicted"
+                  ? true
+                  : "unknown",
+          }),
+      ...(snapshot.targetOid ? { baseOid: snapshot.targetOid } : {}),
+      ...(snapshot.candidateTreeOid
+        ? { candidateTreeOid: snapshot.candidateTreeOid }
+        : publish
+          ? { candidateTreeOid: null }
+          : {}),
+      ...(publish ? { setup: snapshot.setup ?? null, check: snapshot.check ?? null } : {}),
+      ...(publish ? { summary: snapshot.summary ?? null, failure: snapshot.failure ?? null } : {}),
+      ...(options.lastDelivery ? { lastDelivery: options.lastDelivery } : {}),
+    },
+    options.source ?? "command",
+    options.observedAt,
+  );
+}
+
+export function recordWorkspaceRelation(
+  project: ProjectManifest,
+  task: TaskManifest,
+  relation: WorkspaceRelation,
+  source: ObservationSource = "git",
+): TaskState {
+  return recordTaskSnapshot(
+    project,
+    task,
+    task.lastSnapshot ?? { phase: "idle", agent: task.agent },
+    { source, workspaceRelation: relation },
+  );
+}

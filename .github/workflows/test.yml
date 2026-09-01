@@ -1,0 +1,30 @@
+name: Test
+
+# Run lint, typecheck, and the test suite on pull requests. Ubuntu runners ship
+# a Docker daemon, so the opt-in integration tests run here too; everything else
+# is hermetic.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint and typecheck
+        run: npm run check
+
+      - name: Run tests
+        run: npm run test:run

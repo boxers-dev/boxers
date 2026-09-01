@@ -1,0 +1,16 @@
+version: 3
+integration:
+  mode: local
+  base: main
+setup:
+  run: npm ci
+check:
+  commands:
+    check: npm run check
+    test:
+      run: npm run test:run
+      timeout: 30m
+defaults:
+  agent: codex
+  model: gpt-5.6-sol
+  effort: medium
