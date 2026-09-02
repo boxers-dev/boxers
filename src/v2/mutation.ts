@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
-import { atomicWriteJson, taskMutationBarrierPath } from "./paths.ts";
+import { atomicWriteText, taskMutationBarrierPath } from "./paths.ts";
 import { runtimeForTask } from "./runtime/registry.ts";
 import type { TaskManifest } from "./types.ts";
 
@@ -18,21 +18,29 @@ function ownerAlive(pid: number): boolean {
   }
 }
 
+function parseMutationMarker(marker: string): { pid: number; canonical: string } | undefined {
+  const value = JSON.parse(marker) as Record<string, unknown>;
+  if (typeof value["pid"] !== "number") return undefined;
+  return { pid: value["pid"], canonical: `${JSON.stringify(value)}\n` };
+}
+
 /** Asynchronous hot-path variant used before forwarding terminal input. */
 export async function taskMutationBarrierActiveAsync(task: TaskManifest): Promise<boolean> {
   const path = taskMutationBarrierPath(task.name);
   let marker: string;
+  let canonical: string;
   try {
     marker = await readFile(path, "utf8");
-    const value = JSON.parse(marker) as { pid?: unknown };
-    if (typeof value.pid === "number" && ownerAlive(value.pid)) return true;
-    if (typeof value.pid !== "number") return true;
+    const parsed = parseMutationMarker(marker);
+    if (!parsed) return true;
+    if (ownerAlive(parsed.pid)) return true;
+    canonical = parsed.canonical;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     // Never clear a companion when the marker cannot prove its owner is dead.
     return true;
   }
-  if (!(await clearSandboxMarkerAsync(task, marker))) return true;
+  if (!(await clearSandboxMarkerAsync(task, canonical))) return true;
   try {
     await unlink(path);
   } catch {
@@ -95,16 +103,17 @@ export function recoverTaskMutationBarrier(task: TaskManifest): boolean {
   if (!existsSync(path)) return false;
   let pid: number;
   let marker: string;
+  let canonical: string;
   try {
     marker = readFileSync(path, "utf8");
-    const value = JSON.parse(marker) as { pid?: unknown };
-    if (typeof value.pid !== "number") return false;
-    pid = value.pid;
+    const parsed = parseMutationMarker(marker);
+    if (!parsed) return false;
+    ({ pid, canonical } = parsed);
   } catch {
     return false;
   }
   if (ownerAlive(pid)) return false;
-  if (!clearSandboxMarker(task, marker)) return false;
+  if (!clearSandboxMarker(task, canonical)) return false;
   try {
     unlinkSync(path);
   } catch {
@@ -135,7 +144,10 @@ export function withTaskMutationBarrier<T>(task: TaskManifest, action: () => T):
     };
     marker = `${JSON.stringify(value)}\n`;
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    atomicWriteJson(path, value);
+    // The Sandbox companion is compared byte-for-byte during cleanup. Publish
+    // the same canonical bytes on both sides so crash recovery can prove that
+    // it is removing the marker for this exact mutation run.
+    atomicWriteText(path, marker);
     try {
       sandboxMarker(task, marker);
     } catch (error) {

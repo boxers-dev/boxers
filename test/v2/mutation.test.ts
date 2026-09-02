@@ -65,9 +65,11 @@ describe("task mutation barrier", () => {
     const { writes, removals } = prepare();
     const manifest = task();
     withTaskMutationBarrier(manifest, () => {
-      const host = JSON.parse(readFileSync(taskMutationBarrierPath(manifest.name), "utf8")) as {
+      const hostMarker = readFileSync(taskMutationBarrierPath(manifest.name), "utf8");
+      const host = JSON.parse(hostMarker) as {
         runId: string;
       };
+      expect(writes[0]).toBe(hostMarker);
       expect(JSON.parse(writes[0] ?? "{}")).toMatchObject({ runId: host.runId, pid: process.pid });
       withTaskMutationBarrier(manifest, () => expect(writes).toHaveLength(1));
     });
@@ -80,9 +82,11 @@ describe("task mutation barrier", () => {
     const manifest = task();
     const path = taskMutationBarrierPath(manifest.name);
     mkdirSync(dirname(path), { recursive: true });
-    atomicWriteJson(path, { version: 1, task: manifest.name, runId: "stale", pid: 2 ** 30 });
+    const value = { version: 1, task: manifest.name, runId: "stale", pid: 2 ** 30 };
+    atomicWriteJson(path, value);
     expect(recoverTaskMutationBarrier(manifest)).toBe(true);
     expect(removals).toHaveLength(1);
+    expect(removals[0]?.at(-1)).toBe(`${JSON.stringify(value)}\n`);
     expect(() => readFileSync(path, "utf8")).toThrow();
   });
 
@@ -91,9 +95,11 @@ describe("task mutation barrier", () => {
     const manifest = task();
     const path = taskMutationBarrierPath(manifest.name);
     mkdirSync(dirname(path), { recursive: true });
-    atomicWriteJson(path, { version: 1, task: manifest.name, runId: "stale", pid: 2 ** 30 });
+    const value = { version: 1, task: manifest.name, runId: "stale", pid: 2 ** 30 };
+    atomicWriteJson(path, value);
     await expect(taskMutationBarrierActiveAsync(manifest)).resolves.toBe(false);
     expect(removals).toHaveLength(1);
+    expect(removals[0]?.at(-1)).toBe(`${JSON.stringify(value)}\n`);
     expect(() => readFileSync(path, "utf8")).toThrow();
   });
 
