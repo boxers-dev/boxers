@@ -139,6 +139,18 @@ describe("daemon lifecycle safety", () => {
     await expect(runUpdateHandoffWorker(buildId, 1)).resolves.toBe(0);
   });
 
+  it("retires an update handoff worker whose build was superseded", async () => {
+    home = mkdtempSync(join(tmpdir(), "boxers-daemon-handoff-"));
+    process.env.BOXERS_HOME = home;
+    const buildId = "a".repeat(64);
+    const newerBuildId = "b".repeat(64);
+    const kill = vi.spyOn(process, "kill");
+
+    await expect(runUpdateHandoffWorker(buildId, 1, () => newerBuildId)).resolves.toBe(0);
+
+    expect(kill).not.toHaveBeenCalled();
+  });
+
   it("keeps a service waiter alive until the existing daemon exits", async () => {
     vi.useFakeTimers();
     let alive = true;
@@ -315,6 +327,33 @@ describe("daemon lifecycle safety", () => {
     vi.spyOn(process.stdout, "write").mockReturnValue(true);
     await expect(daemonStop()).resolves.toBe(0);
     expect(kill.mock.calls.some((call: unknown[]) => call[1] === "SIGTERM")).toBe(true);
+  });
+
+  it("retires a handoff superseded while it checks daemon safety", async () => {
+    const kill = await activityFixture({
+      type: "sessions",
+      pid: 424_242,
+      sessions: [],
+      intents: [],
+    });
+    const buildId = "a".repeat(64);
+    const newerBuildId = "b".repeat(64);
+    writeFileSync(
+      daemonHealthPath(),
+      `${JSON.stringify({
+        version: 1,
+        pid: 424_242,
+        protocolVersion: 1,
+        boxersVersion: "1.2.3",
+        boxersBuildId: "c".repeat(64),
+      })}\n`,
+    );
+    let activationReads = 0;
+
+    await expect(
+      runUpdateHandoffWorker(buildId, 1, () => (activationReads++ === 0 ? buildId : newerBuildId)),
+    ).resolves.toBe(0);
+    expect(kill.mock.calls.some((call: unknown[]) => call[1] === "SIGTERM")).toBe(false);
   });
 
   it("stops the live socket owner when the PID file is stale", async () => {

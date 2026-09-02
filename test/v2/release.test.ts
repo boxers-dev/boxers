@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  activeManagedBuildId,
   cachedReleaseCapsule,
   createReleaseCapsule,
   decodeReleaseCapsule,
@@ -120,6 +121,7 @@ if (process.argv[2] === "--version") process.stdout.write("1.2.3\\n");
     const capsule = createReleaseCapsule(root);
     const installed = installReleaseCapsule(capsule);
     expect(installed.runtimeInstalled).toBe(true);
+    expect(activeManagedBuildId()).toBe(installed.manifest.buildId);
     expect(readlinkSync(join(home, ".local", "bin", "boxers"))).toBe(installed.executable);
     expect(cachedReleaseCapsule(installed.manifest.buildId).equals(capsule)).toBe(true);
 

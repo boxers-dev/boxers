@@ -58,7 +58,7 @@ describe("daemon service executable resolution", () => {
       installDaemonService(stable);
 
       const unit = readFileSync(join(root, ".config", "systemd", "user", "boxers.service"), "utf8");
-      expect(unit).toContain(`ExecStart="${stable}" __daemon-run`);
+      expect(unit).toContain(`ExecStart="${process.execPath}" "${stable}" __daemon-run`);
       expect(unit).not.toContain(target);
     } finally {
       if (previous.home === undefined) delete process.env.HOME;

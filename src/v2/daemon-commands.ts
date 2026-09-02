@@ -10,10 +10,12 @@ import { readTaskState } from "./state.ts";
 import type { AgentTurnState } from "./types.ts";
 import { daemonProcessCommandLine, isBoxersDaemonCommand } from "./daemon-identity.ts";
 import { daemonServiceStatus } from "./service.ts";
-import { rollbackManagedRelease } from "./release.ts";
+import { activeManagedBuildId, rollbackManagedRelease } from "./release.ts";
 import { recordFleetReleaseFailure } from "./fleet-update.ts";
 
 export { isBoxersDaemonCommand } from "./daemon-identity.ts";
+
+class SupersededUpdateHandoff extends Error {}
 
 function readPidFile(path: string): number | undefined {
   try {
@@ -223,6 +225,7 @@ async function stopDaemonProcess(
 export async function daemonStop(
   force = false,
   inspectProcess: (pid: number) => string | undefined = daemonProcessCommandLine,
+  beforeSignal?: () => void,
 ): Promise<number> {
   if (force) {
     const candidates = [readPidFile(daemonLockPath()), readDaemonPid()];
@@ -282,6 +285,7 @@ export async function daemonStop(
       `The daemon still owns ${blockingSessions.length} agent session(s) that are working or not confirmed to be awaiting input${details ? `: ${details}` : ""}, ${status.intents.length} intent(s), and ${backgroundWork} background operation(s). Finish them before restarting the daemon; stopping now would interrupt durable task work.`,
     );
   }
+  beforeSignal?.();
   return stopDaemonProcess(status.pid, false);
 }
 
@@ -299,13 +303,22 @@ export async function daemonRestart(
 export async function runUpdateHandoffWorker(
   expectedBuildId: string,
   intervalMs = 1_000,
+  activatedBuildId: () => string | undefined = activeManagedBuildId,
 ): Promise<number> {
   if (!/^[a-f0-9]{64}$/.test(expectedBuildId))
     throw new Error("Invalid Boxers update handoff build ID.");
+  const isCurrent = (): boolean => activatedBuildId() === expectedBuildId;
+  const assertCurrent = (): void => {
+    if (!isCurrent()) throw new SupersededUpdateHandoff();
+  };
   while (daemonServiceStatus().boxersBuildId !== expectedBuildId) {
     try {
-      await daemonRestart(false);
+      assertCurrent();
+      await daemonRestart(false, (force) =>
+        daemonStop(force, daemonProcessCommandLine, assertCurrent),
+      );
     } catch (error) {
+      if (error instanceof SupersededUpdateHandoff || !isCurrent()) return 0;
       if (!daemonServiceStatus().active && rollbackManagedRelease(expectedBuildId)) {
         try {
           recordFleetReleaseFailure(

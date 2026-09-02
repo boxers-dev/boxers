@@ -256,6 +256,15 @@ export function activeManagedExecutable(): string | undefined {
   }
 }
 
+/** Return the build selected by the host-wide managed launcher. */
+export function activeManagedBuildId(): string | undefined {
+  try {
+    return readJsonActivation().currentBuildId;
+  } catch {
+    return undefined;
+  }
+}
+
 function activationPath(): string {
   return join(managedDataRoot(), "activation.json");
 }
