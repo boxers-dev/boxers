@@ -222,9 +222,15 @@ For lower-level troubleshooting:
 
 ```sh
 boxers daemon status
+boxers daemon restart --host old-framework-ubuntu
 boxers debug daemon
 boxers debug shell fix-parser
 ```
+
+`daemon restart --host <machine>` uses the managed fleet SSH transport, so no
+separate interactive SSH login is required. Remote daemon control requires the
+fleet `admin` role. Add `--force` only when interrupting daemon-owned work on
+that host is acceptable.
 
 ## Safety model
 

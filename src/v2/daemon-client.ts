@@ -15,6 +15,7 @@ import {
   type TaskIntent,
 } from "./daemon-protocol.ts";
 import type { RemoteSnapshot } from "./types.ts";
+import { activeManagedExecutable } from "./release.ts";
 
 const CONNECT_RETRY_DELAY_MS = 150;
 const CONNECT_RETRY_ATTEMPTS = 40; // ~6s of retrying while a fresh daemon boots.
@@ -112,7 +113,7 @@ function wait(ms: number): Promise<void> {
 /** `tsx`-run sources can't be handed to a plain `node` child; match how "dev" launches. */
 export function daemonSpawnCommand(
   entry = process.argv[1] ?? "",
-  managedExecutable = process.env["BOXERS_EXECUTABLE"],
+  managedExecutable = process.env["BOXERS_EXECUTABLE"] ?? activeManagedExecutable(),
 ): { command: string; args: string[] } {
   // Fleet bootstrap records the authoritative launcher explicitly. Preserve
   // that boundary instead of assuming it is JavaScript for this Node runtime.

@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   readdirSync,
   renameSync,
   rmSync,
@@ -242,6 +243,17 @@ export function managedDataRoot(): string {
 
 export function stableExecutablePath(): string {
   return join(homedir(), ".local", "bin", "boxers");
+}
+
+/** Return the stable launcher only when it resolves to the activated managed release. */
+export function activeManagedExecutable(): string | undefined {
+  try {
+    const activation = readJsonActivation();
+    const stable = stableExecutablePath();
+    return realpathSync(stable) === realpathSync(activation.currentExecutable) ? stable : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function activationPath(): string {

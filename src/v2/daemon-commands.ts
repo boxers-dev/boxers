@@ -298,7 +298,7 @@ export async function daemonRestart(
 /** Wait for the provider-confirmed safe boundary used by automatic update handoff. */
 export async function runUpdateHandoffWorker(
   expectedBuildId: string,
-  intervalMs = 15_000,
+  intervalMs = 1_000,
 ): Promise<number> {
   if (!/^[a-f0-9]{64}$/.test(expectedBuildId))
     throw new Error("Invalid Boxers update handoff build ID.");

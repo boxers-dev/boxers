@@ -126,7 +126,7 @@ describe("v2 CLI", () => {
     expect(output).not.toContain("boxers update (--host");
     expect(output).toContain("boxers daemon install");
     expect(output).toContain("boxers daemon start");
-    expect(output).toContain("boxers daemon restart [--force]");
+    expect(output).toContain("boxers daemon restart [--host <machine>] [--force]");
     expect(output).toContain("boxers project init");
     expect(output).toContain("boxers init");
     expect(output).toContain("boxers list templates [--json]");
@@ -327,8 +327,22 @@ describe("v2 CLI", () => {
     expect(daemonCommands.daemonRestart).toHaveBeenLastCalledWith(false);
     await dispatch(["daemon", "restart", "--force"]);
     expect(daemonCommands.daemonRestart).toHaveBeenLastCalledWith(true);
+    await dispatch(["daemon", "restart", "--host", "server"]);
+    expect(machines.runRemoteCommand).toHaveBeenLastCalledWith(
+      "server",
+      ["daemon", "restart"],
+      false,
+    );
+    await dispatch(["daemon", "restart", "--host=server", "--force"]);
+    expect(machines.runRemoteCommand).toHaveBeenLastCalledWith(
+      "server",
+      ["daemon", "restart", "--force"],
+      false,
+    );
     await expect(dispatch(["daemon", "stop", "--hard"])).rejects.toBeInstanceOf(UsageError);
     await expect(dispatch(["daemon", "restart", "--hard"])).rejects.toBeInstanceOf(UsageError);
+    await expect(dispatch(["daemon", "restart", "--host"])).rejects.toBeInstanceOf(UsageError);
+    await expect(dispatch(["daemon", "restart", "--host="])).rejects.toBeInstanceOf(UsageError);
   });
 
   it("keeps foreground daemon execution under debug and a private service entrypoint", async () => {

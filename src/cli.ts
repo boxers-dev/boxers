@@ -127,7 +127,7 @@ Diagnostics
 Daemon
   boxers daemon install
   boxers daemon start
-  boxers daemon restart [--force]
+  boxers daemon restart [--host <machine>] [--force]
   boxers daemon status [--json]
   boxers daemon stop [--force]
 
@@ -743,8 +743,21 @@ export async function dispatch(argv: string[]): Promise<number> {
       return daemonStop(args.includes("--force"));
     }
     if (command === "restart") {
-      only(args, ["--force"], "daemon restart");
-      return daemonRestart(args.includes("--force"));
+      let host: string | undefined;
+      let force = false;
+      for (let index = 0; index < args.length; index++) {
+        const arg = args[index];
+        if (arg === "--force") force = true;
+        else if (arg === "--host") host = value(args, index++, arg);
+        else if (arg?.startsWith("--host=")) {
+          host = arg.slice(7);
+          if (!host) throw new UsageError("--host requires a value.");
+        }
+        else throw new UsageError(`Unexpected argument for daemon restart: ${arg}`);
+      }
+      if (host)
+        return runRemoteCommand(host, ["daemon", "restart", ...(force ? ["--force"] : [])], false);
+      return daemonRestart(force);
     }
     if (command === "status") {
       only(args, ["--json"], "daemon status");

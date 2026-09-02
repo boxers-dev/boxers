@@ -24,6 +24,13 @@ describe("interactive daemon client input", () => {
     );
   });
 
+  it("keeps source development launches on the TypeScript runner", () => {
+    expect(daemonSpawnCommand("/workspace/src/index.ts", "")).toEqual({
+      command: "npx",
+      args: ["tsx", "/workspace/src/index.ts", "__daemon-run"],
+    });
+  });
+
   it("includes recent daemon output in an auto-start failure", () => {
     const directory = mkdtempSync(join(tmpdir(), "boxers-daemon-client-"));
     const log = join(directory, "daemon.log");
