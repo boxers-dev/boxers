@@ -1,5 +1,4 @@
 import {
-  appendFileSync,
   closeSync,
   existsSync,
   mkdtempSync,
@@ -61,19 +60,21 @@ import {
   findTaskRuntime,
   isRuntimeRunning,
   openTaskShell,
-  prepareTaskCheckWorkspace,
   publishTaskPorts,
   reconcileTaskWorkspace,
   runtimeInventory,
-  runTaskShellStreamingAt,
+  inspectTaskJob,
+  startTaskJob,
   startTaskPreview,
   stopTaskPreview,
   taskConflictPaths,
   taskRuntimeHandle,
   taskRuntimeId,
   taskPreviewLogs,
+  taskJobLogs,
   taskPublishedUrls,
   taskWorkspacePatch,
+  taskWorkspacePath,
   taskWorkspaceTreeAt,
   type TaskGitStatusObservation,
 } from "./runtime/task.ts";
@@ -86,8 +87,14 @@ import {
   runAgentSessionInteractive,
   runRepairAgent,
 } from "./session.ts";
-import { withTaskMutationBarrier } from "./mutation.ts";
-import { readSetupStatus, retryTaskSetup, startBackgroundSetup, waitForSetup } from "./setup.ts";
+import {
+  ensureCurrentSetup,
+  readSetupStatus,
+  refreshSetupStatus,
+  retryTaskSetup,
+  startBackgroundSetup,
+  waitForSetup,
+} from "./setup.ts";
 import { formatMachineViews } from "./machines.ts";
 import {
   readTaskState,
@@ -98,16 +105,11 @@ import {
 import { captureStateProjection, projectTaskView } from "./projection.ts";
 import { formatTaskView } from "./task-view.ts";
 import { defaultRuntime } from "./runtime/registry.ts";
-import type { RuntimeDiagnostic } from "./runtime/types.ts";
+import type { RuntimeDiagnostic, RuntimeJobRequest } from "./runtime/types.ts";
 import { readCachedPeerViews } from "./peer-cache-store.ts";
 import { collectHostStatus, daemonStatusChecks } from "./host-status.ts";
 import type { DaemonServiceStatus } from "./service.ts";
 import type { TaskIntent } from "./daemon-protocol.ts";
-import {
-  beginSettlementPublicationGuard,
-  endSettlementPublicationGuard,
-  identifySettlementPublication,
-} from "./settlement-publication.ts";
 import type {
   Agent,
   CheckDefinition,
@@ -115,7 +117,6 @@ import type {
   IntegrationMode,
   ProjectConfig,
   ProjectManifest,
-  SetupStatus,
   TaskManifest,
   TaskSnapshot,
 } from "./types.ts";
@@ -614,30 +615,79 @@ async function runNativeCheck(
   task: TaskManifest,
   definition: CheckDefinition,
   directory: string,
+  identity: {
+    conversationSequence: number;
+    targetOid: string;
+    candidateTreeOid: string;
+    configHash: string;
+  },
 ): Promise<CheckResult> {
   const started = Date.now();
+  const startedAt = new Date(started).toISOString();
   const logPath = nativeCheckLog(task, definition.name);
   writeFileSync(logPath, "", { mode: 0o600 });
   note(`Running ${definition.name}: ${definition.run}`);
-  const stream = (chunk: string) => {
-    appendFileSync(logPath, chunk);
-    writeStderr(chunk);
+  const semanticKey = createHash("sha256")
+    .update(
+      JSON.stringify({
+        ...identity,
+        name: definition.name,
+        command: definition.run,
+        timeoutMs: definition.timeoutMs,
+      }),
+    )
+    .digest("hex");
+  // A new attempt id deliberately avoids treating an agent-writable Sandbox
+  // result as a host certificate after the host cache was lost. Exact passed
+  // checks are reused from the host observation before reaching this point.
+  const attemptKey = createHash("sha256").update(`${semanticKey}\0${startedAt}`).digest("hex");
+  const request: RuntimeJobRequest = {
+    version: 1,
+    jobId: `check-${attemptKey.slice(0, 32)}`,
+    taskId: task.id,
+    kind: "check",
+    semanticKey,
+    conversationSequence: identity.conversationSequence,
+    targetOid: identity.targetOid,
+    workspaceTreeOid: identity.candidateTreeOid,
+    configHash: identity.configHash,
+    command: definition.run,
+    directory,
+    timeoutMs: definition.timeoutMs,
+    createdAt: startedAt,
   };
-  const result = await runTaskShellStreamingAt(task, directory, definition.run, {
-    timeout: definition.timeoutMs,
-    onStdout: stream,
-    onStderr: stream,
-  });
-  if (result.timedOut) {
+  startTaskJob(task, request);
+  let status = inspectTaskJob(task, request.jobId);
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  const observeLogs = () => {
+    const logs = taskJobLogs(task, request.jobId);
+    if (!logs) return;
+    if (logs.stdout.length > stdoutBytes) writeStderr(logs.stdout.slice(stdoutBytes));
+    if (logs.stderr.length > stderrBytes) writeStderr(logs.stderr.slice(stderrBytes));
+    stdoutBytes = logs.stdout.length;
+    stderrBytes = logs.stderr.length;
+    writeFileSync(logPath, `${logs.stdout}${logs.stderr}`, { mode: 0o600 });
+  };
+  const observationDeadline = Date.now() + Math.max(definition.timeoutMs + 10_000, 15_000);
+  while (!status || status.state === "queued" || status.state === "running") {
+    observeLogs();
+    if (Date.now() >= observationDeadline)
+      throw new Error(`Lost contact with Sandbox check job ${request.jobId}.`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    status = inspectTaskJob(task, request.jobId);
+  }
+  observeLogs();
+  if (status.state === "timed_out") {
     const timeout = `Timed out after ${humanDuration(definition.timeoutMs)}.\n`;
-    appendFileSync(logPath, timeout);
     writeStderr(timeout);
   }
   const check: CheckResult = {
     name: definition.name,
     command: definition.run,
-    status: result.timedOut ? "timed_out" : result.status === 0 ? "passed" : "failed",
-    exitCode: result.status,
+    status:
+      status.state === "timed_out" ? "timed_out" : status.state === "passed" ? "passed" : "failed",
+    ...(status.exitCode === undefined ? {} : { exitCode: status.exitCode }),
     durationMs: Date.now() - started,
     logPath,
   };
@@ -645,40 +695,6 @@ async function runNativeCheck(
     `${definition.name} ${check.status === "passed" ? "passed" : "failed"} in ${humanDuration(check.durationMs)}.`,
   );
   return check;
-}
-
-async function prepareIsolatedCheckSetup(
-  task: TaskManifest,
-  candidateTreeOid: string,
-  directory: string,
-  run: string | undefined,
-): Promise<SetupStatus | undefined> {
-  if (!run) return undefined;
-  const marker = join(taskDir(task.projectId, task.id), "check-worktree-setup.json");
-  const key = JSON.stringify({ candidateTreeOid, run });
-  if (existsSync(marker) && readFileSync(marker, "utf8") === key) return undefined;
-  const logPath = join(taskDir(task.projectId, task.id), "check-worktree-setup.log");
-  writeFileSync(logPath, "", { mode: 0o600 });
-  const startedAt = new Date().toISOString();
-  const stream = (chunk: string) => {
-    appendFileSync(logPath, chunk);
-    writeStderr(chunk);
-  };
-  const result = await runTaskShellStreamingAt(task, directory, run, {
-    timeout: 900_000,
-    onStdout: stream,
-    onStderr: stream,
-  });
-  const status: SetupStatus = {
-    state: result.timedOut ? "timed_out" : result.status === 0 ? "passed" : "failed",
-    command: run,
-    startedAt,
-    finishedAt: new Date().toISOString(),
-    exitCode: result.status,
-    logPath,
-  };
-  if (status.state === "passed") writeFileSync(marker, key, { mode: 0o600 });
-  return status;
 }
 
 async function nativeSnapshot(task: TaskManifest, running: boolean): Promise<TaskSnapshot> {
@@ -835,10 +851,16 @@ export async function newTask(name: string, options: NewTaskOptions): Promise<nu
       task = requireRegisteredTask(name).task;
     } else if (configuredPreview) {
       try {
-        startTaskPreview(task, configuredPreview.run);
+        const handle = startTaskPreview(task, configuredPreview.run);
         task = updateTask(project, task, {
           ...(task.lastSnapshot as TaskSnapshot),
-          preview: { state: "running", urls: previewUrls },
+          preview: {
+            state: "running",
+            ...handle,
+            observedAt: new Date().toISOString(),
+            source: "command",
+            urls: previewUrls,
+          },
         });
       } catch (error) {
         previewFailure = error instanceof Error ? error.message : String(error);
@@ -1015,10 +1037,46 @@ async function liveSnapshot(
   const withSetup = {
     ...decorated,
     runtimeState: info?.state ?? "missing",
-    setup: readSetupStatus(task),
+    setup: refreshSetupStatus(task),
   };
   updateTask(project, task, withSetup, undefined, "daemon");
   return withSetup;
+}
+
+function refreshPreviewStatus(project: ProjectManifest, task: TaskManifest): TaskManifest {
+  const preview = task.lastSnapshot?.preview;
+  if (!preview?.jobId) return task;
+  const observedAt = new Date().toISOString();
+  const job = inspectTaskJob(task, preview.jobId);
+  const next: NonNullable<TaskSnapshot["preview"]> = !job
+    ? {
+        ...preview,
+        state: "failed",
+        observedAt,
+        source: "command",
+        failure: `Preview job ${preview.jobId} is not available in the Sandbox.`,
+      }
+    : job.state === "queued" || job.state === "running"
+      ? { ...preview, state: "running", observedAt, source: "command", failure: undefined }
+      : job.state === "passed"
+        ? { ...preview, state: "stopped", observedAt, source: "command", failure: undefined }
+        : preview.state === "stopped" && job.state === "interrupted"
+          ? { ...preview, observedAt, source: "command", failure: undefined }
+          : {
+              ...preview,
+              state: "failed",
+              observedAt,
+              source: "command",
+              failure: `Preview job ${preview.jobId} ${job.state.replaceAll("_", " ")}.`,
+            };
+  if (JSON.stringify(next) === JSON.stringify(preview)) return task;
+  return updateTask(
+    project,
+    task,
+    { ...(task.lastSnapshot ?? { phase: "idle", agent: task.agent }), preview: next },
+    undefined,
+    "command",
+  );
 }
 
 async function refreshTaskStatus(name: string, json: boolean): Promise<number> {
@@ -1026,6 +1084,10 @@ async function refreshTaskStatus(name: string, json: boolean): Promise<number> {
   await waitForSetup(task);
   ({ project, task } = requireRegisteredTask(name));
   drainTaskLifecycleEvents(project, task);
+  const info = findTaskRuntime(runtimeInventory(), task);
+  await liveSnapshot(project, task, info);
+  ({ project, task } = requireRegisteredTask(name));
+  if (isRuntimeRunning(info)) task = refreshPreviewStatus(project, task);
   if (readTaskState(project, task).agentTurnState !== "working")
     await refreshSettledCandidate(name);
   return renderTaskStatus(name, json, "refreshing_target");
@@ -1224,9 +1286,7 @@ function materializeNativeCandidate(
   task: TaskManifest,
   targetOid: string,
 ): string {
-  return withTaskMutationBarrier(task, () =>
-    materializeNativeCandidateUnsafe(project, task, targetOid),
-  );
+  return materializeNativeCandidateUnsafe(project, task, targetOid);
 }
 
 interface NativeTaskReconciliation {
@@ -1377,9 +1437,7 @@ function reconcileNativeTask(
   oldTargetOid: string,
   targetOid: string,
 ): NativeTaskReconciliation {
-  return withTaskMutationBarrier(task, () =>
-    reconcileNativeTaskUnsafe(project, task, previous, oldTargetOid, targetOid),
-  );
+  return reconcileNativeTaskUnsafe(project, task, previous, oldTargetOid, targetOid);
 }
 
 function reportNativeReconciliationConflict(
@@ -1418,6 +1476,12 @@ function fetchCandidate(
   return reviewRef(task);
 }
 
+interface PreparedCandidate {
+  snapshot: TaskSnapshot;
+  targetOid: string;
+  candidateTreeOid?: string;
+}
+
 function recordedPreparedCandidate(
   project: ProjectManifest,
   task: TaskManifest,
@@ -1429,56 +1493,31 @@ function recordedPreparedCandidate(
     snapshot?.phase !== "reviewed" ||
     state.agentTurnState === "working" ||
     snapshot.targetOid !== targetOid ||
-    !snapshot.candidateTreeOid
-  )
-    return undefined;
-  if (
+    !snapshot.candidateTreeOid ||
     state.hasUnmergedChanges.value !== true ||
     state.baseOid !== targetOid ||
     state.candidateTreeOid !== snapshot.candidateTreeOid
   )
     return undefined;
+  const stored = command("git", ["-C", project.seedPath, "rev-parse", `${reviewRef(task)}^{tree}`]);
+  if (stored.status !== 0 || stored.stdout.trim() !== snapshot.candidateTreeOid) return undefined;
   return { snapshot, targetOid, candidateTreeOid: snapshot.candidateTreeOid };
 }
 
-interface PreparedCandidate {
-  snapshot: TaskSnapshot;
-  targetOid: string;
-  candidateTreeOid?: string;
-}
-
-function prepareCandidate(
+function publishCandidateObservation(
   project: ProjectManifest,
   task: TaskManifest,
-  initial: TaskSnapshot,
+  previous: TaskSnapshot,
   targetOid: string,
-): PreparedCandidate | { conflictStatus: 1 } {
-  let previous = initial;
-  const conflicts = taskConflictPaths(task);
-  if (conflicts.length) {
-    recordUnresolvedNativeConflicts(project, task, previous, conflicts);
-    writeStderr(
-      `Task ${task.name} still has unresolved reconciliation conflicts:\n${conflicts.map((path) => `  ${path}`).join("\n")}\nRun \`boxers ${task.name} attach\` to resolve and stage them, then try again.\n`,
-    );
-    return { conflictStatus: 1 };
-  }
-  if (previous.targetOid && previous.targetOid !== targetOid) {
-    note("The target advanced; reconciling the task.");
-    const result = reconcileNativeTask(project, task, previous, previous.targetOid, targetOid);
-    if (result.status === "conflicted")
-      return { conflictStatus: reportNativeReconciliationConflict(project, task, result) };
-    previous = result.snapshot;
-    writeStdout(
-      `Target advanced from ${result.fromTargetOid} to ${targetOid}; reconciled automatically.\n`,
-    );
-  }
-  const candidateTreeOid = materializeNativeCandidate(project, task, targetOid);
+  candidateTreeOid: string,
+  announceCapture: boolean,
+): PreparedCandidate {
   const targetTree = requireSuccess(
     command("git", ["-C", project.seedPath, "rev-parse", `${targetOid}^{tree}`]),
     "Could not resolve target tree",
   );
   const changed = candidateTreeOid !== targetTree;
-  if (candidateTreeOid !== (previous.candidateTreeOid ?? targetTree))
+  if (announceCapture && candidateTreeOid !== (previous.candidateTreeOid ?? targetTree))
     note(
       `Syncing task ${task.name} with ${project.integration.base} and capturing its exact candidate.`,
     );
@@ -1515,17 +1554,47 @@ function prepareCandidate(
   return { snapshot, targetOid, ...(changed ? { candidateTreeOid } : {}) };
 }
 
+function prepareCandidate(
+  project: ProjectManifest,
+  task: TaskManifest,
+  initial: TaskSnapshot,
+  targetOid: string,
+): PreparedCandidate | { conflictStatus: 1 } {
+  let previous = initial;
+  const conflicts = taskConflictPaths(task);
+  if (conflicts.length) {
+    recordUnresolvedNativeConflicts(project, task, previous, conflicts);
+    writeStderr(
+      `Task ${task.name} still has unresolved reconciliation conflicts:\n${conflicts.map((path) => `  ${path}`).join("\n")}\nRun \`boxers ${task.name} attach\` to resolve and stage them, then try again.\n`,
+    );
+    return { conflictStatus: 1 };
+  }
+  if (previous.targetOid && previous.targetOid !== targetOid) {
+    note("The target advanced; reconciling the task.");
+    const result = reconcileNativeTask(project, task, previous, previous.targetOid, targetOid);
+    if (result.status === "conflicted")
+      return { conflictStatus: reportNativeReconciliationConflict(project, task, result) };
+    previous = result.snapshot;
+    writeStdout(
+      `Target advanced from ${result.fromTargetOid} to ${targetOid}; reconciled automatically.\n`,
+    );
+  }
+  const candidateTreeOid = materializeNativeCandidate(project, task, targetOid);
+  return publishCandidateObservation(project, task, previous, targetOid, candidateTreeOid, true);
+}
+
 /**
  * The shared strong capture passage for an event-confirmed stable workspace.
  * It refreshes and reconciles the canonical target and captures one exact
- * candidate for automatic settlement and explicit intents alike.
+ * candidate for automatic post-turn work and explicit intents alike.
  */
 export async function refreshSettledCandidate(
   name: string,
   onPhase?: (phase: "refreshing" | "reconciling" | "capturing") => void,
+  capture = true,
 ): Promise<TaskSnapshot> {
   let { project, task } = requireRegisteredTask(name);
-  const setup = readSetupStatus(task);
+  let setup = refreshSetupStatus(task);
   const previous = task.lastSnapshot ?? { phase: "idle" as const, agent: task.agent };
   updateTask(project, task, { ...previous, setup, runtimeState: "running" }, undefined, "daemon");
   if (readTaskState(project, task).agentTurnState === "working" || setup?.state === "running")
@@ -1533,6 +1602,34 @@ export async function refreshSettledCandidate(
 
   onPhase?.("refreshing");
   const targetOid = refreshSeed(project);
+  let config: ProjectConfig | undefined;
+  try {
+    config = parseProjectConfig(targetConfig(project, targetOid).text);
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes("has no .boxers/config.yml"))
+      throw error;
+  }
+  setup = ensureCurrentSetup(task, config?.setup, config?.preview?.run);
+  updateTaskState(
+    project,
+    task,
+    {
+      setupConfigured: Boolean(config?.setup),
+      checksConfigured: Boolean(config?.check?.commands.length),
+      checkConfigHash: config?.check ? checkConfigHash(config.check) : null,
+    },
+    "git",
+  );
+  if (setup?.state === "running") {
+    updateTask(
+      project,
+      task,
+      { ...(task.lastSnapshot ?? previous), setup, runtimeState: "running" },
+      undefined,
+      "command",
+    );
+    return task.lastSnapshot ?? previous;
+  }
   recordAdvancedTargetPending(project, task, targetOid);
   if (previous.targetOid && previous.targetOid !== targetOid) {
     onPhase?.("reconciling");
@@ -1555,67 +1652,60 @@ export async function refreshSettledCandidate(
   }
 
   onPhase?.("capturing");
-  const prepared = prepareCandidate(project, task, task.lastSnapshot ?? previous, targetOid);
+  const prepared = capture
+    ? prepareCandidate(project, task, task.lastSnapshot ?? previous, targetOid)
+    : publishCandidateObservation(
+        project,
+        task,
+        task.lastSnapshot ?? previous,
+        targetOid,
+        taskWorkspaceTreeAt(task, taskWorkspacePath(task)),
+        false,
+      );
   if ("conflictStatus" in prepared) return requireRegisteredTask(name).task.lastSnapshot!;
   return prepared.snapshot;
 }
 
-export interface AutomaticSettlementResult {
+export interface PostTurnResult {
   targetOid?: string;
   candidateTreeOid?: string;
   deferred?: boolean;
   needsInput?: string;
 }
 
-/** One automatic post-turn passage: capture, check, and conversation metadata. */
-export async function runAutomaticSettlement(
+/** Idempotent post-turn passage; exact identities make interrupted work disposable. */
+export async function runPostTurn(
   name: string,
   triggerSequence: number,
-  runId: string,
-  onPhase?: (phase: "refreshing" | "reconciling" | "capturing" | "checking" | "generating") => void,
-  onIdentity?: (targetOid: string, candidateTreeOid: string) => void,
-): Promise<AutomaticSettlementResult> {
+  onPhase?: (phase: "refreshing" | "reconciling" | "capturing" | "checking") => void,
+): Promise<PostTurnResult> {
   const initial = requireRegisteredTask(name);
-  beginSettlementPublicationGuard({
-    taskId: initial.task.id,
-    runId,
-    triggerSequence,
-  });
-  try {
-    const state = readTaskState(initial.project, initial.task);
-    if (
-      state.agentTurnState !== "awaiting_input" ||
-      state.conversationHighWaterSequence !== triggerSequence
-    )
-      return {};
-    if (readSetupStatus(initial.task)?.state === "running") return { deferred: true };
-    const captured = await refreshSettledCandidate(name, onPhase);
-    const afterCapture = requireRegisteredTask(name);
-    const current = readTaskState(afterCapture.project, afterCapture.task);
-    if (
-      current.agentTurnState !== "awaiting_input" ||
-      current.conversationHighWaterSequence !== triggerSequence
-    )
-      return {};
-    if (captured.failure) return { needsInput: captured.failure };
-    if (captured.candidateTreeOid) {
-      if (!captured.targetOid) return {};
-      identifySettlementPublication(captured.targetOid, captured.candidateTreeOid);
-      onIdentity?.(captured.targetOid, captured.candidateTreeOid);
-      onPhase?.("checking");
-      await refreshAutomaticCheck(name);
-      onPhase?.("generating");
-      if (!refreshAutomaticCommitMessage(name))
-        throw new Error("Commit metadata generation failed for the current candidate.");
-    }
-    const final = readTaskState(afterCapture.project, requireRegisteredTask(name).task);
-    return {
-      ...(final.baseOid ? { targetOid: final.baseOid } : {}),
-      ...(final.candidateTreeOid ? { candidateTreeOid: final.candidateTreeOid } : {}),
-    };
-  } finally {
-    endSettlementPublicationGuard();
+  const state = readTaskState(initial.project, initial.task);
+  if (
+    state.agentTurnState !== "awaiting_input" ||
+    state.conversationHighWaterSequence !== triggerSequence
+  )
+    return {};
+  if (refreshSetupStatus(initial.task)?.state === "running") return { deferred: true };
+  const captured = await refreshSettledCandidate(name, onPhase, false);
+  const afterCapture = requireRegisteredTask(name);
+  const current = readTaskState(afterCapture.project, afterCapture.task);
+  if (
+    current.agentTurnState !== "awaiting_input" ||
+    current.conversationHighWaterSequence !== triggerSequence
+  )
+    return {};
+  if (captured.failure) return { needsInput: captured.failure };
+  if (captured.candidateTreeOid) {
+    if (!captured.targetOid) return {};
+    onPhase?.("checking");
+    await refreshAutomaticCheck(name);
   }
+  const final = readTaskState(afterCapture.project, requireRegisteredTask(name).task);
+  return {
+    ...(final.baseOid ? { targetOid: final.baseOid } : {}),
+    ...(final.candidateTreeOid ? { candidateTreeOid: final.candidateTreeOid } : {}),
+  };
 }
 
 /** Run or reuse the configured check for the task's currently captured candidate. */
@@ -1711,164 +1801,69 @@ async function executeChecksUnsafe(
   configHash: string,
 ): Promise<TaskSnapshot> {
   if (!prepared.candidateTreeOid) throw new Error("Cannot check an empty candidate.");
-  const startedAt = new Date().toISOString();
   const setupCommand = config.check?.setup ?? config.setup?.run;
   const definitions = config.check?.commands ?? [];
-  const total = definitions.length + (setupCommand ? 1 : 0);
-  updateTaskState(
-    project,
-    task,
-    {
-      checkProgress: {
-        targetOid: prepared.targetOid,
-        candidateTreeOid: prepared.candidateTreeOid,
-        configHash,
-        total,
-        completed: 0,
-        ...(setupCommand
-          ? { current: "setup" }
-          : definitions[0]
-            ? { current: definitions[0].name }
-            : {}),
-        startedAt,
-      },
-    },
-    "worker",
-  );
-  let completed = 0;
-  try {
-    const candidateDiff = command("git", [
-      "-C",
-      project.seedPath,
-      "diff",
-      "--binary",
-      "--full-index",
-      "--no-ext-diff",
-      prepared.targetOid,
-      prepared.candidateTreeOid,
-    ]);
-    requireSuccess(candidateDiff, "Could not read the exact candidate patch for checks");
-    // A Git patch is byte-sensitive: requireSuccess intentionally trims display
-    // output, so pass the original stdout through to `git apply`.
-    const candidatePatch = candidateDiff.stdout;
-    const checkWorkspace = prepareTaskCheckWorkspace(
-      task,
-      project.integration.base,
-      prepared.targetOid,
-      prepared.candidateTreeOid,
-      candidatePatch,
-    );
-    if (checkWorkspace.candidateTreeOid !== prepared.candidateTreeOid)
-      throw new Error(
-        `Candidate changed while preparing checks: captured ${prepared.candidateTreeOid}, isolated ${checkWorkspace.candidateTreeOid}.`,
-      );
-    const setup = await prepareIsolatedCheckSetup(
-      task,
-      prepared.candidateTreeOid,
-      checkWorkspace.path,
-      config.check?.setup ?? config.setup?.run,
-    );
-    if (setupCommand) {
-      completed++;
-      updateTaskState(
-        project,
-        task,
-        {
-          checkProgress: {
-            targetOid: prepared.targetOid,
-            candidateTreeOid: prepared.candidateTreeOid,
-            configHash,
-            total,
-            completed,
-            ...(setup?.state === "passed" && definitions[0]
-              ? { current: definitions[0].name }
-              : {}),
-            startedAt,
-          },
-        },
-        "worker",
-      );
-    }
-    if (!definitions.length) return prepared.snapshot;
-    const candidateTreeOid =
-      prepared.candidateTreeOid ?? materializeNativeCandidate(project, task, prepared.targetOid);
-    const currentCandidate = (): TaskManifest | undefined => {
-      const current = listTasks(project).find((candidate) => candidate.id === task.id);
-      if (!current) return undefined;
-      const state = readTaskState(project, current);
-      return state.baseOid === prepared.targetOid && state.candidateTreeOid === candidateTreeOid
-        ? current
-        : undefined;
-    };
-    const results: CheckResult[] = [];
-    if (setup && setup.state !== "passed") {
-      results.push({
-        name: "setup",
-        command: setup.command,
-        status: setup.state === "timed_out" ? "timed_out" : "failed",
-        ...(setup.exitCode === undefined ? {} : { exitCode: setup.exitCode }),
-        durationMs:
-          setup.finishedAt === undefined
-            ? 0
-            : Math.max(0, Date.parse(setup.finishedAt) - Date.parse(setup.startedAt)),
-        logPath: setup.logPath,
-      });
-    }
-    for (const definition of setup && setup.state !== "passed" ? [] : definitions) {
-      results.push(await runNativeCheck(task, definition, checkWorkspace.path));
-      completed++;
-      updateTaskState(
-        project,
-        task,
-        {
-          checkProgress: {
-            targetOid: prepared.targetOid,
-            candidateTreeOid,
-            configHash,
-            total,
-            completed,
-            ...(definitions[completed - (setupCommand ? 1 : 0)]
-              ? { current: definitions[completed - (setupCommand ? 1 : 0)]!.name }
-              : {}),
-            startedAt,
-          },
-        },
-        "worker",
-      );
-    }
-    const finalTree = taskWorkspaceTreeAt(task, checkWorkspace.path);
-    if (finalTree !== candidateTreeOid)
-      throw new Error(
-        "A configured check modified the workspace. Check commands must be read-only; move formatting or fixes into the agent workflow.",
-      );
-    const failures = results.filter((result) => result.status !== "passed");
-    const current = currentCandidate();
-    if (!current) return requireRegisteredTask(task.name).task.lastSnapshot ?? prepared.snapshot;
-    const snapshot: TaskSnapshot = {
-      ...(current.lastSnapshot ?? prepared.snapshot),
-      check: {
-        status: failures.length ? "failed" : "passed",
-        targetOid: prepared.targetOid,
-        candidateTreeOid,
-        configHash,
-        results,
-      },
-    };
-    updateTask(project, current, snapshot);
-    return snapshot;
-  } finally {
+  const workspace = taskWorkspacePath(task);
+  const initialTree = taskWorkspaceTreeAt(task, workspace);
+  if (initialTree !== prepared.candidateTreeOid)
+    return requireRegisteredTask(task.name).task.lastSnapshot ?? prepared.snapshot;
+  const startedSequence = readTaskState(project, task).conversationHighWaterSequence;
+  if (!definitions.length) return prepared.snapshot;
+  const candidateTreeOid =
+    prepared.candidateTreeOid ?? materializeNativeCandidate(project, task, prepared.targetOid);
+  const currentCandidate = (): TaskManifest | undefined => {
     const current = listTasks(project).find((candidate) => candidate.id === task.id);
-    if (current) {
-      const progress = readTaskState(project, current).checkProgress;
-      if (
-        progress?.targetOid === prepared.targetOid &&
-        progress.candidateTreeOid === prepared.candidateTreeOid &&
-        progress.configHash === configHash &&
-        progress.startedAt === startedAt
-      )
-        updateTaskState(project, current, { checkProgress: null }, "worker");
-    }
+    if (!current) return undefined;
+    const state = readTaskState(project, current);
+    return state.baseOid === prepared.targetOid && state.candidateTreeOid === candidateTreeOid
+      ? current
+      : undefined;
+  };
+  const results: CheckResult[] = [];
+  const steps: CheckDefinition[] = [
+    ...(setupCommand ? [{ name: "setup", run: setupCommand, timeoutMs: 900_000 }] : []),
+    ...definitions,
+  ];
+  for (const definition of steps) {
+    const result = await runNativeCheck(task, definition, workspace, {
+      conversationSequence: startedSequence,
+      targetOid: prepared.targetOid,
+      candidateTreeOid,
+      configHash,
+    });
+    results.push(result);
+    if (definition.name === "setup" && result.status !== "passed") break;
   }
+  const finalTree = taskWorkspaceTreeAt(task, workspace);
+  const finalState = readTaskState(project, requireRegisteredTask(task.name).task);
+  if (finalState.conversationHighWaterSequence !== startedSequence)
+    return requireRegisteredTask(task.name).task.lastSnapshot ?? prepared.snapshot;
+  if (finalTree !== candidateTreeOid)
+    throw new Error(
+      "Check command modified tracked content. Checks must be read-only; use a separate formatting or fix operation.",
+    );
+  if (refreshSeed(project) !== prepared.targetOid)
+    return requireRegisteredTask(task.name).task.lastSnapshot ?? prepared.snapshot;
+  const currentConfig = parseProjectConfig(targetConfig(project, prepared.targetOid).text).check;
+  if (!currentConfig || checkConfigHash(currentConfig) !== configHash)
+    return requireRegisteredTask(task.name).task.lastSnapshot ?? prepared.snapshot;
+  const failures = results.filter((result) => result.status !== "passed");
+  const current = currentCandidate();
+  if (!current) return requireRegisteredTask(task.name).task.lastSnapshot ?? prepared.snapshot;
+  const snapshot: TaskSnapshot = {
+    ...(current.lastSnapshot ?? prepared.snapshot),
+    check: {
+      status: failures.length ? "failed" : "passed",
+      targetOid: prepared.targetOid,
+      candidateTreeOid,
+      configHash,
+      observedAt: new Date().toISOString(),
+      source: "worker",
+      results,
+    },
+  };
+  updateTask(project, current, snapshot);
+  return snapshot;
 }
 
 function executeChecks(
@@ -2367,12 +2362,23 @@ export async function preview(
     return current?.state === "failed" ? 1 : 0;
   }
   if (action === "logs") {
-    const result = taskPreviewLogs(task);
-    writeStdout(result.stdout);
-    return result.status;
+    const jobId = task.lastSnapshot?.preview?.jobId;
+    if (!jobId) throw new Error(`No preview job has been recorded for ${name}.`);
+    const logs = taskPreviewLogs(task, jobId);
+    if (!logs) throw new Error(`Preview job ${jobId} is not available for ${name}.`);
+    writeStdout(logs.stdout);
+    writeStderr(logs.stderr);
+    const status = inspectTaskJob(task, jobId);
+    return status && ["failed", "timed_out", "interrupted"].includes(status.state) ? 1 : 0;
   }
-  if (action === "stop" || action === "restart") stopTaskPreview(task);
-  let preview: NonNullable<TaskSnapshot["preview"]> = { state: "stopped" };
+  const previousJobId = task.lastSnapshot?.preview?.jobId;
+  if ((action === "stop" || action === "restart") && previousJobId)
+    stopTaskPreview(task, previousJobId);
+  let preview: NonNullable<TaskSnapshot["preview"]> = {
+    state: "stopped",
+    observedAt: new Date().toISOString(),
+    source: "command",
+  };
   if (action === "start" || action === "restart") {
     const setup = await waitForSetup(task);
     ({ project, task } = requireRegisteredTask(name));
@@ -2381,15 +2387,21 @@ export async function preview(
     const target = refreshSeed(project);
     const configuredPreview = parseProjectPreview(targetConfig(project, target).text);
     if (!configuredPreview) throw new Error("No preview is configured on the canonical target.");
-    startTaskPreview(task, configuredPreview.run);
+    const handle = startTaskPreview(task, configuredPreview.run);
     let urls = task.lastSnapshot?.preview?.urls ?? taskPublishedUrls(task);
     try {
       if (!urls.length) urls = publishTaskPorts(task, configuredPreview.ports);
     } catch (error) {
-      stopTaskPreview(task);
+      stopTaskPreview(task, handle.jobId);
       throw error;
     }
-    preview = { state: "running", urls };
+    preview = {
+      state: "running",
+      ...handle,
+      observedAt: new Date().toISOString(),
+      source: "command",
+      urls,
+    };
     if (urls.length)
       writeStdout(`Preview available at:\n${urls.map((url) => `  ${url}`).join("\n")}\n`);
     else writeStdout("Preview started, but the runtime reported no published URL.\n");

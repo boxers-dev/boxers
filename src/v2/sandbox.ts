@@ -1,7 +1,7 @@
+import { createHash } from "node:crypto";
 import {
   command,
   commandAsync,
-  commandWithInput,
   commandStreaming,
   requireSuccess,
   type CommandResult,
@@ -9,6 +9,13 @@ import {
   type StreamingCommandResult,
 } from "./process.ts";
 import type { TaskManifest } from "./types.ts";
+import type {
+  RuntimeJobLogs,
+  RuntimeJobRequest,
+  RuntimeJobState,
+  RuntimeJobStatus,
+  RuntimePreviewHandle,
+} from "./runtime/types.ts";
 import { note } from "../core/ui.ts";
 
 export interface SandboxInfo {
@@ -327,82 +334,6 @@ export function runSandboxShellStreamingAt(
   );
 }
 
-/**
- * Materialize the host-recorded candidate patch over its exact base and reset
- * a persistent check worktree to that immutable commit. The live task workspace
- * is deliberately not read here: it may already contain newer agent edits.
- */
-export function prepareNativeCheckWorkspace(
-  task: TaskManifest,
-  base: string,
-  expectedTargetOid: string,
-  expectedCandidateTreeOid: string,
-  candidatePatch: string,
-): { path: string; candidateTreeOid: string } {
-  const script = String.raw`
-set -euo pipefail
-base="$1"
-expected="$2"
-expected_tree="$3"
-task_id="$4"
-target_ref=refs/boxers/check/target
-candidate_ref=refs/boxers/check/candidate
-git fetch --no-tags -q origin "+refs/heads/$base:$target_ref"
-target=$(git rev-parse "$target_ref^{commit}")
-test "$target" = "$expected"
-
-index=$(mktemp)
-patch=$(mktemp)
-trap 'rm -f "$index" "$patch"' EXIT
-cat >"$patch"
-GIT_INDEX_FILE="$index" git read-tree "$target"
-if test -s "$patch"; then
-  GIT_INDEX_FILE="$index" git apply --cached --binary --whitespace=nowarn "$patch"
-fi
-tree=$(GIT_INDEX_FILE="$index" git write-tree)
-test "$tree" = "$expected_tree"
-commit=$(printf 'boxers check candidate\n' | git -c user.name=Boxers -c user.email=boxers@localhost commit-tree "$tree" -p "$target")
-git update-ref "$candidate_ref" "$commit"
-
-check_root="$HOME/.boxers/check-worktrees/$task_id"
-mkdir -p "$(dirname "$check_root")"
-git worktree prune
-if test -e "$check_root/.git"; then
-  git -C "$check_root" reset --hard -q "$commit"
-else
-  git worktree add --force --detach "$check_root" "$commit" >/dev/null
-fi
-git -C "$check_root" clean -fdq
-printf '%s\n%s\n' "$check_root" "$tree"
-`;
-  const result = commandWithInput(
-    "sbx",
-    [
-      "exec",
-      task.runtime.id,
-      "bash",
-      "-lc",
-      script,
-      "boxers-check",
-      base,
-      expectedTargetOid,
-      expectedCandidateTreeOid,
-      task.id,
-    ],
-    candidatePatch,
-  );
-  if (result.status !== 0)
-    throw new Error(
-      `Could not prepare isolated check workspace for ${task.name}: ${(result.stderr || result.stdout).trim()}`,
-    );
-  const lines = result.stdout.trim().split("\n");
-  const path = lines.at(-2);
-  const candidateTreeOid = lines.at(-1);
-  if (!path || !candidateTreeOid || !/^[0-9a-f]{40,64}$/.test(candidateTreeOid))
-    throw new Error(`Sandbox returned an invalid check workspace for ${task.name}.`);
-  return { path, candidateTreeOid };
-}
-
 export function nativeWorkspaceTreeAt(task: TaskManifest, directory: string): string {
   const script = String.raw`
 set -euo pipefail
@@ -448,63 +379,310 @@ bash -lc "$1" 2>&1 | tee .git/boxers/setup.log
   );
 }
 
-export function startNativePreview(task: TaskManifest, run: string): void {
-  const script = `
-set -eu
-state=.git/boxers
-log="$state/preview.log"
-pidfile="$state/preview.pid"
-mkdir -p "$state"
-if test -f "$pidfile" && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-  exit 0
-fi
-rm -f "$pidfile"
-: > "$log"
-nohup setsid bash -lc "$1" >> "$log" 2>&1 </dev/null &
-pid=$!
-printf '%s\n' "$pid" > "$pidfile"
-sleep 0.1
-kill -0 "$pid"
-`;
-  requireSuccess(
-    sbx(["exec", task.runtime.id, "bash", "-lc", script, "boxers", run]),
-    `Could not start preview for ${task.name}`,
-  );
+const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const JOB_STATES = new Set<RuntimeJobState>([
+  "queued",
+  "running",
+  "passed",
+  "failed",
+  "timed_out",
+  "stale",
+  "interrupted",
+]);
+
+function assertJobIdentifier(value: string, label: string): void {
+  if (!JOB_ID_PATTERN.test(value)) throw new Error(`Invalid Sandbox job ${label}.`);
 }
 
-export function stopNativePreview(task: TaskManifest): void {
-  const script = `
-set -eu
-pidfile=.git/boxers/preview.pid
-if ! test -f "$pidfile"; then exit 0; fi
-pid=$(cat "$pidfile")
-if kill -0 "$pid" 2>/dev/null; then
-  kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
-  count=0
-  while kill -0 "$pid" 2>/dev/null && test "$count" -lt 50; do
-    sleep 0.1
-    count=$((count + 1))
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+function parseRuntimeJobStatus(value: string, expectedJobId: string): RuntimeJobStatus {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error(`Sandbox job ${expectedJobId} returned invalid JSON.`);
+  }
+  if (!parsed || typeof parsed !== "object")
+    throw new Error(`Sandbox job ${expectedJobId} returned an invalid status.`);
+  const record = parsed as Record<string, unknown>;
+  if (
+    record.version !== 1 ||
+    record.jobId !== expectedJobId ||
+    typeof record.state !== "string" ||
+    !JOB_STATES.has(record.state as RuntimeJobState) ||
+    typeof record.updatedAt !== "string"
+  )
+    throw new Error(`Sandbox job ${expectedJobId} returned an invalid status.`);
+  for (const field of ["startedAt", "finishedAt"])
+    if (record[field] !== undefined && typeof record[field] !== "string")
+      throw new Error(`Sandbox job ${expectedJobId} returned an invalid status.`);
+  for (const field of ["pid", "exitCode"])
+    if (record[field] !== undefined && !Number.isInteger(record[field]))
+      throw new Error(`Sandbox job ${expectedJobId} returned an invalid status.`);
+  return record as unknown as RuntimeJobStatus;
+}
+
+/**
+ * Submit a detached job whose durable record lives outside the Git workspace.
+ * The Sandbox home is agent-writable, so this record is operational evidence,
+ * not by itself an authoritative promotion certificate.
+ */
+export function startSandboxJob(task: TaskManifest, request: RuntimeJobRequest): void {
+  assertJobIdentifier(request.taskId, "task id");
+  assertJobIdentifier(request.jobId, "id");
+  assertJobIdentifier(request.semanticKey, "semantic key");
+  if (request.taskId !== task.id) throw new Error("Sandbox job task identity does not match.");
+  if (!Number.isSafeInteger(request.conversationSequence) || request.conversationSequence < 0)
+    throw new Error("Invalid Sandbox job conversation sequence.");
+  if (!Number.isSafeInteger(request.timeoutMs) || request.timeoutMs < 0)
+    throw new Error("Invalid Sandbox job timeout.");
+
+  const wrapper = String.raw`
+set -u
+task_id="$1"
+job_id="$2"
+semantic_key="$3"
+request_json="$4"
+directory="$5"
+job_command="$6"
+timeout_ms="$7"
+root="$HOME/.boxers/jobs/$task_id"
+job="$root/$job_id"
+umask 077
+mkdir -p "$root"
+
+if test -d "$job"; then
+  if ! test -f "$job/identity" || test "$(cat "$job/identity")" != "$semantic_key"; then
+    exit 65
+  fi
+  if test -f "$job/result.json" && grep -q '"state":"passed"' "$job/result.json"; then
+    exit 0
+  fi
+  if test -f "$job/status.json" && grep -Eq '"state":"(queued|running)"' "$job/status.json"; then
+    exit 0
+  fi
+else
+  mkdir "$job"
+fi
+
+printf '%s\n' "$semantic_key" > "$job/identity.tmp.$$"
+mv -f "$job/identity.tmp.$$" "$job/identity"
+printf '%s\n' "$request_json" > "$job/request.json.tmp.$$"
+mv -f "$job/request.json.tmp.$$" "$job/request.json"
+rm -f "$job/result.json" "$job/cancel-requested"
+: > "$job/stdout.log"
+: > "$job/stderr.log"
+printf '%s\n' "$$" > "$job/supervisor.pid"
+
+timestamp() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
+write_status() {
+  state="$1"
+  now="$2"
+  extra="$3"
+  printf '{"version":1,"jobId":"%s","state":"%s","updatedAt":"%s"%s}\n' \
+    "$job_id" "$state" "$now" "$extra" > "$job/status.json.tmp.$$"
+  mv -f "$job/status.json.tmp.$$" "$job/status.json"
+}
+
+queued_at=$(timestamp)
+write_status queued "$queued_at" ''
+started_at=$(timestamp)
+
+if test "$timeout_ms" -gt 0; then
+  timeout_value=$(printf '%d.%03ds' "$((timeout_ms / 1000))" "$((timeout_ms % 1000))")
+  setsid timeout --signal=TERM --kill-after=5s "$timeout_value" \
+    bash -lc 'cd -- "$1" && exec bash -lc "$2"' boxers-job "$directory" "$job_command" \
+    > "$job/stdout.log" 2> "$job/stderr.log" &
+else
+  setsid bash -lc 'cd -- "$1" && exec bash -lc "$2"' boxers-job "$directory" "$job_command" \
+    > "$job/stdout.log" 2> "$job/stderr.log" &
+fi
+runner=$!
+printf '%s\n' "$runner" > "$job/pid.tmp.$$"
+mv -f "$job/pid.tmp.$$" "$job/pid"
+write_status running "$started_at" ",\"startedAt\":\"$started_at\",\"pid\":$runner"
+
+set +e
+wait "$runner"
+exit_code=$?
+set -e
+finished_at=$(timestamp)
+if test -f "$job/cancel-requested"; then
+  terminal=interrupted
+elif test "$timeout_ms" -gt 0 && test "$exit_code" -eq 124; then
+  terminal=timed_out
+elif test "$exit_code" -eq 0; then
+  terminal=passed
+else
+  terminal=failed
+fi
+extra=",\"startedAt\":\"$started_at\",\"finishedAt\":\"$finished_at\",\"pid\":$runner,\"exitCode\":$exit_code"
+printf '{"version":1,"jobId":"%s","state":"%s","updatedAt":"%s"%s}\n' \
+  "$job_id" "$terminal" "$finished_at" "$extra" > "$job/result.json.tmp.$$"
+mv -f "$job/result.json.tmp.$$" "$job/result.json"
+write_status "$terminal" "$finished_at" "$extra"
+rm -f "$job/supervisor.pid"
+`;
+  const result = sbx([
+    "exec",
+    "-d",
+    task.runtime.id,
+    "bash",
+    "-lc",
+    wrapper,
+    "boxers-job",
+    request.taskId,
+    request.jobId,
+    request.semanticKey,
+    JSON.stringify(request),
+    request.directory,
+    request.command,
+    String(request.timeoutMs),
+  ]);
+  requireSuccess(result, `Could not start Sandbox job ${request.jobId} for ${task.name}`);
+}
+
+export function inspectSandboxJob(task: TaskManifest, jobId: string): RuntimeJobStatus | undefined {
+  assertJobIdentifier(task.id, "task id");
+  assertJobIdentifier(jobId, "id");
+  const script = String.raw`
+set -u
+job="$HOME/.boxers/jobs/$1/$2"
+if test -f "$job/result.json"; then cat "$job/result.json"; exit 0; fi
+if ! test -f "$job/status.json"; then exit 44; fi
+if grep -Eq '"state":"(queued|running)"' "$job/status.json"; then
+  pidfile="$job/supervisor.pid"
+  status_age=$(( $(date +%s) - $(stat -c %Y "$job/status.json") ))
+  if test "$status_age" -ge 5 && { ! test -f "$pidfile" || ! kill -0 "$(cat "$pidfile")" 2>/dev/null; }; then
+    now=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+    printf '{"version":1,"jobId":"%s","state":"interrupted","updatedAt":"%s","finishedAt":"%s"}\n' \
+      "$2" "$now" "$now" > "$job/result.json.tmp.$$"
+    mv -f "$job/result.json.tmp.$$" "$job/result.json"
+    cp "$job/result.json" "$job/status.json.tmp.$$"
+    mv -f "$job/status.json.tmp.$$" "$job/status.json"
   fi
 fi
-rm -f "$pidfile"
+if test -f "$job/result.json"; then cat "$job/result.json"; else cat "$job/status.json"; fi
 `;
-  requireSuccess(
-    sbx(["exec", task.runtime.id, "bash", "-lc", script]),
-    `Could not stop preview for ${task.name}`,
-  );
-}
-
-export function nativePreviewLogs(task: TaskManifest): CommandResult {
-  return sbx([
+  const result = sbx([
     "exec",
     task.runtime.id,
     "bash",
     "-lc",
-    "test -f .git/boxers/preview.log && tail -n 200 .git/boxers/preview.log",
+    script,
+    "boxers-job-inspect",
+    task.id,
+    jobId,
   ]);
+  if (result.status === 44) return undefined;
+  return parseRuntimeJobStatus(
+    requireSuccess(result, `Could not inspect Sandbox job ${jobId} for ${task.name}`),
+    jobId,
+  );
+}
+
+export function sandboxJobLogs(task: TaskManifest, jobId: string): RuntimeJobLogs | undefined {
+  assertJobIdentifier(task.id, "task id");
+  assertJobIdentifier(jobId, "id");
+  const script = String.raw`
+set -u
+job="$HOME/.boxers/jobs/$1/$2"
+if ! test -d "$job"; then exit 44; fi
+printf '%s\n' "$(base64 -w0 "$job/stdout.log" 2>/dev/null || true)"
+printf '%s\n' "$(base64 -w0 "$job/stderr.log" 2>/dev/null || true)"
+`;
+  const result = sbx([
+    "exec",
+    task.runtime.id,
+    "bash",
+    "-lc",
+    script,
+    "boxers-job-logs",
+    task.id,
+    jobId,
+  ]);
+  if (result.status === 44) return undefined;
+  const output = requireSuccess(
+    result,
+    `Could not read Sandbox job ${jobId} logs for ${task.name}`,
+  );
+  const [stdout = "", stderr = ""] = output.split("\n");
+  try {
+    return {
+      stdout: Buffer.from(stdout, "base64").toString("utf8"),
+      stderr: Buffer.from(stderr, "base64").toString("utf8"),
+    };
+  } catch {
+    throw new Error(`Sandbox job ${jobId} returned invalid logs.`);
+  }
+}
+
+export function cancelSandboxJob(task: TaskManifest, jobId: string): boolean {
+  assertJobIdentifier(task.id, "task id");
+  assertJobIdentifier(jobId, "id");
+  const script = String.raw`
+set -u
+job="$HOME/.boxers/jobs/$1/$2"
+if test -f "$job/result.json" || ! test -f "$job/pid"; then printf 'not-running\n'; exit 0; fi
+pid=$(cat "$job/pid")
+case "$pid" in *[!0-9]*|'') exit 65;; esac
+if ! kill -0 "$pid" 2>/dev/null; then printf 'not-running\n'; exit 0; fi
+: > "$job/cancel-requested"
+kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+count=0
+while kill -0 "$pid" 2>/dev/null && test "$count" -lt 50; do
+  sleep 0.1
+  count=$((count + 1))
+done
+if kill -0 "$pid" 2>/dev/null; then
+  kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+fi
+printf 'cancelled\n'
+`;
+  const result = sbx([
+    "exec",
+    task.runtime.id,
+    "bash",
+    "-lc",
+    script,
+    "boxers-job-cancel",
+    task.id,
+    jobId,
+  ]);
+  const output = requireSuccess(result, `Could not cancel Sandbox job ${jobId} for ${task.name}`);
+  return output.trim() === "cancelled";
+}
+
+export function startNativePreview(task: TaskManifest, run: string): RuntimePreviewHandle {
+  const configHash = createHash("sha256").update(run).digest("hex");
+  const jobId = `preview-${configHash.slice(0, 24)}`;
+  const directory = requireSuccess(
+    sbx(["exec", task.runtime.id, "pwd", "-P"]),
+    `Could not resolve the workspace for ${task.name}`,
+  ).trim();
+  startSandboxJob(task, {
+    version: 1,
+    jobId,
+    taskId: task.id,
+    kind: "preview-action",
+    semanticKey: configHash,
+    conversationSequence: 0,
+    targetOid: task.lastSnapshot?.targetOid ?? "unknown",
+    workspaceTreeOid: task.lastSnapshot?.candidateTreeOid ?? "unknown",
+    configHash,
+    command: run,
+    directory,
+    timeoutMs: 0,
+    createdAt: new Date().toISOString(),
+  });
+  return { jobId, configHash };
+}
+
+export function stopNativePreview(task: TaskManifest, jobId: string): boolean {
+  return cancelSandboxJob(task, jobId);
+}
+
+export function nativePreviewLogs(task: TaskManifest, jobId: string): RuntimeJobLogs | undefined {
+  return sandboxJobLogs(task, jobId);
 }
 
 export function advanceNativeWorkspace(

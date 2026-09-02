@@ -31,6 +31,7 @@ import { command, requireSuccess } from "./process.ts";
 import { encodeAdminRequest } from "./fleet-admin.ts";
 import { readVersion } from "../core/version.ts";
 import { gossipFleetMembership } from "./fleet-connect.ts";
+import { boxersHome } from "./paths.ts";
 
 const REMOTE_UPDATE_TIMEOUT_MS = 5 * 60_000;
 const MAX_REMOTE_CAPSULE_BYTES = 64 * 1024 * 1024;
@@ -41,7 +42,7 @@ export interface RemoteReleaseResult {
   buildId: string;
   packageVersion: string;
   runtimeInstalled: boolean;
-  daemonHandoffRequired: boolean;
+  daemonReplacementRequired: boolean;
   update: FleetUpdateState;
 }
 
@@ -77,10 +78,11 @@ function finalizeManagedActivation(packageVersion: string, buildId: string): boo
   }
 }
 
-function scheduleDaemonHandoff(buildId: string): void {
-  const child = spawn(stableExecutablePath(), ["__update-handoff", buildId], {
+function scheduleDaemonReplacement(buildId: string): void {
+  const child = spawn(stableExecutablePath(), ["__daemon-replace", buildId], {
     detached: true,
     stdio: "ignore",
+    env: { ...process.env, BOXERS_HOME: boxersHome() },
   });
   child.on("error", () => undefined);
   child.unref();
@@ -101,11 +103,11 @@ function activateDesiredRelease(capsule: Buffer): RemoteReleaseResult {
   if (!isDeepStrictEqual(decoded.manifest, desired.body.release))
     throw new Error("The streamed Boxers release does not match the fleet's desired manifest.");
   const installed = installReleaseCapsule(capsule);
-  const daemonHandoffRequired = finalizeManagedActivation(
+  const daemonReplacementRequired = finalizeManagedActivation(
     installed.manifest.packageVersion,
     installed.manifest.buildId,
   );
-  if (daemonHandoffRequired) scheduleDaemonHandoff(installed.manifest.buildId);
+  if (daemonReplacementRequired) scheduleDaemonReplacement(installed.manifest.buildId);
   const update = acknowledgeFleetRelease();
   return {
     version: 1,
@@ -113,7 +115,7 @@ function activateDesiredRelease(capsule: Buffer): RemoteReleaseResult {
     buildId: installed.manifest.buildId,
     packageVersion: installed.manifest.packageVersion,
     runtimeInstalled: installed.runtimeInstalled,
-    daemonHandoffRequired,
+    daemonReplacementRequired,
     update,
   };
 }
@@ -575,7 +577,7 @@ export async function updateFleetRelease(
   }
   const local = installReleaseCapsule(capsule);
   if (finalizeManagedActivation(local.manifest.packageVersion, local.manifest.buildId))
-    scheduleDaemonHandoff(local.manifest.buildId);
+    scheduleDaemonReplacement(local.manifest.buildId);
   process.stdout.write(
     `Local machine is up to date with Boxers ${local.manifest.packageVersion} (${local.manifest.buildId.slice(0, 8)}).\n`,
   );
@@ -609,7 +611,7 @@ export async function updateFleetRelease(
     if ("result" in item) {
       const suffix = [
         item.result.runtimeInstalled ? "installed native runtime" : undefined,
-        item.result.daemonHandoffRequired ? "daemon handoff deferred" : undefined,
+        item.result.daemonReplacementRequired ? "daemon replacement scheduled" : undefined,
       ]
         .filter(Boolean)
         .join("; ");
@@ -626,7 +628,7 @@ export function desiredFleetRelease(): FleetUpdateState {
   return readFleetUpdateState();
 }
 
-export function fleetReleaseNeedsDaemonHandoff(): boolean {
+export function fleetReleaseNeedsDaemonReplacement(): boolean {
   const state = readFleetUpdateState();
   const desired = state.desired;
   if (!desired) return false;

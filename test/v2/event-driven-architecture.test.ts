@@ -8,7 +8,7 @@ function source(file: string): string {
   return readFileSync(join(root, file), "utf8");
 }
 
-describe("event-driven settlement architecture", () => {
+describe("disposable post-turn architecture", () => {
   it("has no polling-era coordinator modules or worker lanes", () => {
     for (const file of ["observer.ts", "quiescence.ts", "scheduler.ts", "check-coordinator.ts"])
       expect(existsSync(join(root, file)), file).toBe(false);
@@ -44,7 +44,7 @@ describe("event-driven settlement architecture", () => {
     expect(session).not.toMatch(/runDetached|executeDetached|\[\s*["']run["'][^\]]*["']-d["']/s);
   });
 
-  it("does not turn a viewer-only attach into a settlement-cancelling intent", () => {
+  it("does not turn a viewer-only attach into a post-turn-cancelling intent", () => {
     expect(source("commands.ts")).not.toContain("prepare_attach");
     expect(source("daemon-protocol.ts")).not.toContain('kind: "prepare_attach"');
   });

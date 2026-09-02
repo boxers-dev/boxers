@@ -47,24 +47,12 @@ export function daemonHealthPath(): string {
   return join(boxersHome(), "daemon-health.json");
 }
 
-export function daemonHandoffPath(): string {
-  return join(boxersHome(), "daemon-handoff.json");
-}
-
 export function hostStatusPath(): string {
   return join(boxersHome(), "host-status.json");
 }
 
 export function machineSetupPath(): string {
   return join(boxersHome(), "machine-setup.json");
-}
-
-export function taskIntentLeasePath(taskName: string): string {
-  return join(boxersHome(), "intents", `${encodeURIComponent(taskName.toLowerCase())}.json`);
-}
-
-export function taskMutationBarrierPath(taskName: string): string {
-  return join(boxersHome(), "mutations", `${encodeURIComponent(taskName.toLowerCase())}.json`);
 }
 
 export function projectDir(id: string): string {

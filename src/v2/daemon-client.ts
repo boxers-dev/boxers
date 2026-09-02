@@ -5,7 +5,7 @@ import { connect, type Socket } from "node:net";
 import { dirname } from "node:path";
 import { colorEnabled, resetTerminalInputModes } from "../core/ansi.ts";
 import { readVersion } from "../core/version.ts";
-import { daemonLogPath, daemonSocketPath } from "./paths.ts";
+import { boxersHome, daemonLogPath, daemonSocketPath } from "./paths.ts";
 import {
   DAEMON_PROTOCOL_VERSION,
   encodeMessage,
@@ -117,8 +117,7 @@ export function daemonSpawnCommand(
 ): { command: string; args: string[] } {
   // Fleet bootstrap records the authoritative launcher explicitly. Preserve
   // that boundary instead of assuming it is JavaScript for this Node runtime.
-  if (managedExecutable)
-    return { command: managedExecutable, args: ["__daemon-run"] };
+  if (managedExecutable) return { command: managedExecutable, args: ["__daemon-run"] };
   if (entry.endsWith(".ts")) return { command: "npx", args: ["tsx", entry, "__daemon-run"] };
   return { command: process.execPath, args: [entry, "__daemon-run"] };
 }
@@ -166,7 +165,11 @@ async function ensureDaemonRunning(socketPath: string): Promise<Socket> {
   let launchFailure: string | undefined;
   try {
     const { command, args } = daemonSpawnCommand();
-    const child = spawn(command, args, { detached: true, stdio: ["ignore", logFd, logFd] });
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: ["ignore", logFd, logFd],
+      env: { ...process.env, BOXERS_HOME: boxersHome() },
+    });
     child.once("error", (error) => {
       launchFailure = `Daemon launch failed: ${error.message}`;
     });

@@ -151,10 +151,14 @@ export interface ShutdownStartedMessage {
   requestId: string;
   pid: number;
 }
+export interface ShutdownBlocker {
+  kind: "busy" | "superseded" | "failure";
+  detail: string;
+}
 export interface ShutdownBlockedMessage {
   type: "shutdown_blocked";
   requestId: string;
-  blockers: import("./restart-boundary.ts").RestartBlocker[];
+  blockers: ShutdownBlocker[];
 }
 export interface ErrorMessage {
   type: "error";

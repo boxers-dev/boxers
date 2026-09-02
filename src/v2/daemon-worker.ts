@@ -1,5 +1,5 @@
 import { fork } from "node:child_process";
-import { executeTaskIntent, runAutomaticSettlement } from "./commands.ts";
+import { executeTaskIntent, runPostTurn } from "./commands.ts";
 import { withOutputSink, type OutputSink } from "../core/output.ts";
 import type { TaskIntent } from "./daemon-protocol.ts";
 import { requireRegisteredTask } from "./registry.ts";
@@ -22,13 +22,7 @@ interface WorkerResult {
 
 interface WorkerProgress {
   type: "boxers-worker-progress";
-  phase: "refreshing" | "reconciling" | "capturing" | "checking" | "generating";
-}
-
-interface WorkerIdentity {
-  type: "boxers-worker-identity";
-  targetOid: string;
-  candidateTreeOid: string;
+  phase: "refreshing" | "reconciling" | "capturing" | "checking";
 }
 
 interface WorkerOutput {
@@ -59,7 +53,6 @@ function runWorker(
   onSpawn?: (pid: number) => void,
   startAfterReady = false,
   onProgress?: (phase: WorkerProgress["phase"]) => void,
-  onIdentity?: (targetOid: string, candidateTreeOid: string) => void,
 ): Promise<WorkerResult | undefined> {
   const entry = launch.entry ?? process.argv[1];
   if (!entry) throw new Error("Could not locate the boxers executable for a daemon worker.");
@@ -74,7 +67,7 @@ function runWorker(
       // Worker commands report intentional output and progress over IPC. Do not
       // dump incidental command output into the combined daemon debug log.
       stdio: ["ignore", "ignore", "ignore", "ipc"],
-      // Settlement and intent workers invoke synchronous CLI commands. Give each worker
+      // Post-turn and intent workers invoke synchronous CLI commands. Give each worker
       // its own process group so cancellation can also stop a blocked `sbx`
       // descendant instead of waiting forever for the worker's event loop.
       detached: process.platform !== "win32",
@@ -87,15 +80,6 @@ function runWorker(
         (message as { type?: unknown }).type === "boxers-worker-progress"
       ) {
         onProgress?.((message as WorkerProgress).phase);
-        return;
-      }
-      if (
-        message &&
-        typeof message === "object" &&
-        (message as { type?: unknown }).type === "boxers-worker-identity"
-      ) {
-        const identity = message as WorkerIdentity;
-        onIdentity?.(identity.targetOid, identity.candidateTreeOid);
         return;
       }
       if (
@@ -193,24 +177,21 @@ function runWorker(
   });
 }
 
-export async function settlementInWorker(
+export async function postTurnInWorker(
   taskName: string,
   triggerSequence: number,
-  runId: string,
   signal: AbortSignal,
   onProgress?: (phase: WorkerProgress["phase"]) => void,
-  onIdentity?: (targetOid: string, candidateTreeOid: string) => void,
   launch?: DaemonWorkerLaunch,
 ): Promise<
   | { targetOid?: string; candidateTreeOid?: string; deferred?: boolean; needsInput?: string }
   | undefined
 > {
-  const payload = Buffer.from(
-    JSON.stringify({ taskName, triggerSequence, runId }),
-    "utf8",
-  ).toString("base64");
+  const payload = Buffer.from(JSON.stringify({ taskName, triggerSequence }), "utf8").toString(
+    "base64",
+  );
   const result = await runWorker(
-    ["__daemon-settlement-worker", payload],
+    ["__daemon-post-turn-worker", payload],
     true,
     launch,
     signal,
@@ -218,7 +199,6 @@ export async function settlementInWorker(
     undefined,
     false,
     onProgress,
-    onIdentity,
   );
   if (!result) return undefined;
   return {
@@ -257,13 +237,14 @@ export async function executeIntentInWorker(
   output: OutputSink,
   launch?: DaemonWorkerLaunch,
   onSpawn?: (pid: number) => void,
+  signal?: AbortSignal,
 ): Promise<number> {
   const payload = Buffer.from(JSON.stringify({ taskName, intent }), "utf8").toString("base64");
   const result = await runWorker(
     ["__daemon-intent-worker", payload],
     true,
     launch,
-    undefined,
+    signal,
     output,
     onSpawn,
     true,
@@ -328,30 +309,19 @@ export async function runDaemonIntentWorker(value: string): Promise<number> {
   return 0;
 }
 
-export async function runDaemonSettlementWorker(value: string): Promise<number> {
+export async function runDaemonPostTurnWorker(value: string): Promise<number> {
   const payload = JSON.parse(Buffer.from(value, "base64").toString("utf8")) as {
     taskName?: unknown;
     triggerSequence?: unknown;
-    runId?: unknown;
   };
   if (
     typeof payload.taskName !== "string" ||
-    typeof payload.runId !== "string" ||
     !Number.isSafeInteger(payload.triggerSequence) ||
     Number(payload.triggerSequence) < 1
   )
-    throw new Error("Invalid daemon settlement worker payload.");
-  const result = await runAutomaticSettlement(
-    payload.taskName,
-    Number(payload.triggerSequence),
-    payload.runId,
-    (phase) => process.send?.({ type: "boxers-worker-progress", phase } satisfies WorkerProgress),
-    (targetOid, candidateTreeOid) =>
-      process.send?.({
-        type: "boxers-worker-identity",
-        targetOid,
-        candidateTreeOid,
-      } satisfies WorkerIdentity),
+    throw new Error("Invalid daemon post-turn worker payload.");
+  const result = await runPostTurn(payload.taskName, Number(payload.triggerSequence), (phase) =>
+    process.send?.({ type: "boxers-worker-progress", phase } satisfies WorkerProgress),
   );
   process.send?.({ type: "boxers-worker-result", ...result } satisfies WorkerResult);
   return 0;

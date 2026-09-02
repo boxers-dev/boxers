@@ -5,7 +5,6 @@ import { readCachedPeerView, writeCachedPeerView } from "./peer-cache-store.ts";
 import { localMachineIdentity } from "./registry.ts";
 import type { HostStatusObservation, MachineView } from "./types.ts";
 import { fleetReleaseIsAcknowledged, readFleetUpdateState } from "./fleet-update.ts";
-import { readDaemonHandoffState } from "./daemon-handoff.ts";
 
 export interface FleetHostStatusView {
   id: string;
@@ -50,27 +49,16 @@ export async function fleetHostStatusViews(options: {
     const localUpdate = update.acknowledgements.find(
       (acknowledgement) => acknowledgement.body.hostId === identity.id,
     );
-    const handoff = readDaemonHandoffState();
-    const desiredBuildId = update.desired?.body.release.buildId;
-    const matchingHandoff =
-      desiredBuildId && handoff?.desiredBuildId === desiredBuildId ? handoff : undefined;
     views.push({
       id: identity.id,
       name: `${identity.name} (local)`,
       connection: "local",
       ...(status ? { status, observedAt: status.observedAt } : {}),
-      ...(matchingHandoff?.lastError
-        ? { detail: matchingHandoff.lastError }
-        : matchingHandoff?.blockers.length
-          ? { detail: matchingHandoff.blockers.map((blocker) => blocker.detail).join("; ") }
-          : localUpdate?.body.detail
-            ? { detail: localUpdate.body.detail }
-            : {}),
+      ...(localUpdate?.body.detail ? { detail: localUpdate.body.detail } : {}),
       update: update.desired
-        ? localUpdate?.body.status === "failed" || matchingHandoff?.status === "failed"
+        ? localUpdate?.body.status === "failed"
           ? "failed"
-          : fleetReleaseIsAcknowledged(identity.id, update) &&
-              !(matchingHandoff && ["waiting", "restarting"].includes(matchingHandoff.status))
+          : fleetReleaseIsAcknowledged(identity.id, update)
             ? "current"
             : "pending"
         : "none",

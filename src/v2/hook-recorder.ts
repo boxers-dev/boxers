@@ -59,13 +59,6 @@ token=''
 case "$token" in *[!A-Za-z0-9_-]*|'') exit 0 ;; esac
 printf '\033]777;boxers;1;%s;%s\007' "$token" "$sequence" > /dev/tty 2>/dev/null || true
 
-if [ "$event_kind" = user_prompt ]; then
-  attempts=0
-  while [ -e "$git_dir/boxers/mutation.json" ] && [ "$attempts" -lt 200 ]; do
-    sleep 0.025
-    attempts=$((attempts + 1))
-  done
-fi
 exit 0
 `;
 }

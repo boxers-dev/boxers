@@ -23,7 +23,7 @@ import {
 } from "./v2/commands.ts";
 import {
   runDaemonIntentWorker,
-  runDaemonSettlementWorker,
+  runDaemonPostTurnWorker,
   runDaemonLifecycleWorker,
 } from "./v2/daemon-worker.ts";
 import { readVersion } from "./core/version.ts";
@@ -32,10 +32,9 @@ import {
   daemonStart,
   daemonStatus,
   daemonStop,
-  runUpdateHandoffWorker,
+  runDaemonReplacement,
   runDaemonForeground,
 } from "./v2/daemon-commands.ts";
-import { runSetupWorker } from "./v2/setup.ts";
 import { isAgent, type Agent, type IntegrationMode } from "./v2/types.ts";
 import {
   remoteSnapshot,
@@ -409,17 +408,11 @@ export async function dispatch(argv: string[]): Promise<number> {
     only(argv.slice(1), [], "internal daemon entrypoint");
     return runDaemonForeground();
   }
-  if (argv[0] === "__setup-worker") {
-    const [, projectId, taskId, run, timeout, startedAt, previewRun, ...unexpected] = argv;
-    if (!projectId || !taskId || !run || !timeout || !startedAt || unexpected.length)
-      throw new Error("Invalid background setup worker invocation.");
-    return runSetupWorker(projectId, taskId, run, Number(timeout), startedAt, previewRun);
-  }
-  if (argv[0] === "__daemon-settlement-worker") {
+  if (argv[0] === "__daemon-post-turn-worker") {
     const [, payload, ...unexpected] = argv;
     if (!payload || unexpected.length)
-      throw new Error("Invalid daemon settlement worker invocation.");
-    return runDaemonSettlementWorker(payload);
+      throw new Error("Invalid daemon post-turn worker invocation.");
+    return runDaemonPostTurnWorker(payload);
   }
   if (argv[0] === "__daemon-lifecycle-worker") {
     const [, payload, ...unexpected] = argv;
@@ -436,9 +429,9 @@ export async function dispatch(argv: string[]): Promise<number> {
     if (argv.length !== 1) throw new Error("Invalid Boxers update continuation invocation.");
     return updateFleetRelease({ skipRegistry: true });
   }
-  if (argv[0] === "__update-handoff") {
-    if (argv.length !== 2) throw new Error("Invalid Boxers update handoff invocation.");
-    return runUpdateHandoffWorker(argv[1] as string);
+  if (argv[0] === "__daemon-replace") {
+    if (argv.length !== 2) throw new Error("Invalid Boxers daemon replacement invocation.");
+    return runDaemonReplacement(argv[1] as string);
   }
   const [first, ...rest] = argv;
   if (first === undefined || first === "help" || first === "-h" || first === "--help") {
@@ -752,8 +745,7 @@ export async function dispatch(argv: string[]): Promise<number> {
         else if (arg?.startsWith("--host=")) {
           host = arg.slice(7);
           if (!host) throw new UsageError("--host requires a value.");
-        }
-        else throw new UsageError(`Unexpected argument for daemon restart: ${arg}`);
+        } else throw new UsageError(`Unexpected argument for daemon restart: ${arg}`);
       }
       if (host)
         return runRemoteCommand(host, ["daemon", "restart", ...(force ? ["--force"] : [])], false);

@@ -24,7 +24,7 @@ describe("task runtime provider boundary", () => {
     expect(inputCase).not.toMatch(
       /taskMutationBarrierActive\(|recordSessionActivity\(|updateTask\(|writeFileSync\(/,
     );
-    expect(inputCase).toContain("settlements.cancel");
+    expect(inputCase).toContain("abortPostTurn");
     expect(inputCase).toContain("writeSessionInput");
   });
 });

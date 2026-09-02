@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { list } from "../../src/v2/commands.ts";
-import { atomicWriteJson, taskDir, taskIntentLeasePath } from "../../src/v2/paths.ts";
+import { atomicWriteJson, taskDir } from "../../src/v2/paths.ts";
 import { createTaskManifest, initProject, updateTask } from "../../src/v2/registry.ts";
 import { enrollFleetMember, ensureFleet } from "../../src/v2/fleet.ts";
 import { canonicalSshPublicKey, ensureManagedSshIdentity } from "../../src/v2/ssh-identity.ts";
@@ -145,7 +145,7 @@ describe("task list", () => {
     }
   });
 
-  it("never probes leased or setup-running tasks while listing", async () => {
+  it("never probes setup-running tasks while listing", async () => {
     const root = mkdtempSync(join(tmpdir(), "boxers-list-lease-project-"));
     const state = mkdtempSync(join(tmpdir(), "boxers-list-lease-state-"));
     const bin = mkdtempSync(join(tmpdir(), "boxers-list-lease-bin-"));
@@ -165,16 +165,14 @@ describe("task list", () => {
         phase: "checking",
         agent: "codex",
       });
-      atomicWriteJson(taskIntentLeasePath(task.name), {
-        daemonPid: process.pid,
-      });
       const setupTask = createTaskManifest(project, "setup-task", "codex");
       const setup = {
         state: "running" as const,
         command: "npm ci",
         startedAt: "2026-08-26T00:00:00.000Z",
-        pid: process.pid,
         logPath: join(taskDir(project.id, setupTask.id), "setup.log"),
+        jobId: "setup-job",
+        configHash: "setup-config",
       };
       updateTask(project, setupTask, {
         phase: "setting_up",

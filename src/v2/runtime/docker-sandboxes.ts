@@ -4,15 +4,16 @@ import { MIN_SBX_VERSION, type TaskManifest } from "../types.ts";
 import { command, commandWithInput, requireSuccess } from "../process.ts";
 import {
   createSandbox,
+  cancelSandboxJob,
   advanceNativeWorkspace,
   isRunning,
   listSandboxes,
   listSandboxesAsync,
   nativeConflictPaths,
   nativeGitStatus,
+  inspectSandboxJob,
   nativePreviewLogs,
   nativeWorkspaceTreeAt,
-  prepareNativeCheckWorkspace,
   nativeWorkspacePatch,
   publishPorts,
   publishedUrls,
@@ -22,9 +23,11 @@ import {
   runSandboxShellStreaming,
   runSandboxShellStreamingAt,
   runSandboxSetupStreaming,
+  sandboxJobLogs,
   sbx,
   sbxAsync,
   shellSandbox,
+  startSandboxJob,
   startNativePreview,
   stopNativePreview,
   stopSandbox,
@@ -35,6 +38,7 @@ import type {
   RuntimeDiagnosticOptions,
   RuntimeHandle,
   RuntimeInfo,
+  RuntimeJobRequest,
   TaskEnvironmentSpec,
   TaskRuntime,
   RuntimeAuthMode,
@@ -383,6 +387,22 @@ export class DockerSandboxesRuntime implements TaskRuntime {
     return runSandboxSetupStreaming(dockerTask(task), setupCommand, options);
   }
 
+  startJob(task: TaskManifest, request: RuntimeJobRequest): void {
+    startSandboxJob(dockerTask(task), request);
+  }
+
+  inspectJob(task: TaskManifest, jobId: string) {
+    return inspectSandboxJob(dockerTask(task), jobId);
+  }
+
+  jobLogs(task: TaskManifest, jobId: string) {
+    return sandboxJobLogs(dockerTask(task), jobId);
+  }
+
+  cancelJob(task: TaskManifest, jobId: string): boolean {
+    return cancelSandboxJob(dockerTask(task), jobId);
+  }
+
   publishPorts(task: TaskManifest, ports: readonly number[]): string[] {
     return publishPorts(dockerTask(task), ports);
   }
@@ -397,22 +417,6 @@ export class DockerSandboxesRuntime implements TaskRuntime {
 
   gitStatus(task: TaskManifest, base: string, targetOid: string) {
     return nativeGitStatus(dockerTask(task), base, targetOid);
-  }
-
-  prepareCheckWorkspace(
-    task: TaskManifest,
-    base: string,
-    targetOid: string,
-    candidateTreeOid: string,
-    candidatePatch: string,
-  ) {
-    return prepareNativeCheckWorkspace(
-      dockerTask(task),
-      base,
-      targetOid,
-      candidateTreeOid,
-      candidatePatch,
-    );
   }
 
   workspaceTreeAt(task: TaskManifest, directory: string) {
@@ -441,16 +445,16 @@ export class DockerSandboxesRuntime implements TaskRuntime {
     return runSandboxShell(dockerTask(task), script);
   }
 
-  startPreview(task: TaskManifest, run: string): void {
-    startNativePreview(dockerTask(task), run);
+  startPreview(task: TaskManifest, run: string) {
+    return startNativePreview(dockerTask(task), run);
   }
 
-  stopPreview(task: TaskManifest): void {
-    stopNativePreview(dockerTask(task));
+  stopPreview(task: TaskManifest, jobId: string): boolean {
+    return stopNativePreview(dockerTask(task), jobId);
   }
 
-  previewLogs(task: TaskManifest) {
-    return nativePreviewLogs(dockerTask(task));
+  previewLogs(task: TaskManifest, jobId: string) {
+    return nativePreviewLogs(dockerTask(task), jobId);
   }
 
   openShell(task: TaskManifest): number {

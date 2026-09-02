@@ -7,18 +7,13 @@ import {
   LineDecoder,
   parseServerMessage,
   type ShutdownReason,
+  type ShutdownBlocker,
 } from "./daemon-protocol.ts";
 import { daemonLockPath, daemonLogPath, daemonPidPath, daemonSocketPath } from "./paths.ts";
 import { daemonProcessCommandLine, isBoxersDaemonCommand } from "./daemon-identity.ts";
-import { daemonServiceStatus } from "./service.ts";
-import { activeManagedBuildId, rollbackManagedRelease } from "./release.ts";
-import { recordFleetReleaseFailure } from "./fleet-update.ts";
-import type { RestartBlocker } from "./restart-boundary.ts";
-import { readDaemonHandoffState, recordDaemonHandoff } from "./daemon-handoff.ts";
+import { activeManagedBuildId } from "./release.ts";
 
 export { isBoxersDaemonCommand } from "./daemon-identity.ts";
-
-class SupersededUpdateHandoff extends Error {}
 
 function readPidFile(path: string): number | undefined {
   try {
@@ -270,7 +265,7 @@ export async function daemonStop(
   }
   if (result.status === "blocked")
     throw new Error(
-      `The daemon is not ready to stop:\n${result.blockers.map((blocker) => `  ${blocker.task ? `${blocker.task}: ` : ""}${blocker.detail}`).join("\n")}`,
+      `The daemon is not ready to stop:\n${result.blockers.map((blocker) => `  ${blocker.detail}`).join("\n")}`,
     );
   for (let attempt = 0; attempt < 20; attempt++) {
     if (!processIsAlive(result.pid)) {
@@ -293,13 +288,11 @@ export async function daemonRestart(
   return start();
 }
 
-/** Wait for the provider-confirmed safe boundary used by automatic update handoff. */
-export async function runUpdateHandoffWorker(
+/** Bounded replacement after activating a new managed executable. */
+export async function runDaemonReplacement(
   expectedBuildId: string,
-  intervalMs = 1_000,
   activatedBuildId: () => string | undefined = activeManagedBuildId,
   dependencies: {
-    serviceBuildId?: () => string | undefined;
     requestShutdown?: (
       reason: ShutdownReason,
       expectedBuildId?: string,
@@ -309,59 +302,19 @@ export async function runUpdateHandoffWorker(
   } = {},
 ): Promise<number> {
   if (!/^[a-f0-9]{64}$/.test(expectedBuildId))
-    throw new Error("Invalid Boxers update handoff build ID.");
-  const isCurrent = (): boolean => activatedBuildId() === expectedBuildId;
-  const assertCurrent = (): void => {
-    if (!isCurrent()) throw new SupersededUpdateHandoff();
-  };
-  const serviceBuildId = dependencies.serviceBuildId ?? (() => daemonServiceStatus().boxersBuildId);
+    throw new Error("Invalid Boxers replacement build ID.");
+  if (activatedBuildId() !== expectedBuildId) return 0;
   const requestShutdown = dependencies.requestShutdown ?? requestPreparedShutdown;
   const start = dependencies.start ?? daemonStart;
   const waitForExit = dependencies.waitForExit ?? waitForProcessExit;
-  while (serviceBuildId() !== expectedBuildId) {
-    try {
-      assertCurrent();
-      recordDaemonHandoff(expectedBuildId, "waiting");
-      const result = await requestShutdown("update", expectedBuildId);
-      if (result.status === "blocked") {
-        recordDaemonHandoff(expectedBuildId, "waiting", result.blockers);
-        if (result.blockers.some((blocker) => blocker.kind === "superseded")) return 0;
-        await wait(intervalMs);
-        continue;
-      }
-      recordDaemonHandoff(expectedBuildId, "restarting");
-      await waitForExit(result.pid);
-      assertCurrent();
-      await start();
-    } catch (error) {
-      if (error instanceof SupersededUpdateHandoff || !isCurrent()) return 0;
-      if (!daemonServiceStatus().active && rollbackManagedRelease(expectedBuildId)) {
-        try {
-          recordFleetReleaseFailure(
-            `Daemon handoff failed and the previous release was restored: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        } catch {
-          // Local-only updates have no fleet rollout to mark failed.
-        }
-        await daemonRestart(false);
-        recordDaemonHandoff(
-          expectedBuildId,
-          "failed",
-          [],
-          error instanceof Error ? error.message : String(error),
-        );
-        return 1;
-      }
-      recordDaemonHandoff(
-        expectedBuildId,
-        "waiting",
-        [],
-        error instanceof Error ? error.message : String(error),
-      );
-      await wait(intervalMs);
-    }
+  const result = await requestShutdown("update", expectedBuildId);
+  if (result.status === "blocked") {
+    if (result.blockers.some((blocker) => blocker.kind === "superseded")) return 0;
+    throw new Error(result.blockers.map((blocker) => blocker.detail).join("; "));
   }
-  recordDaemonHandoff(expectedBuildId, "active");
+  await waitForExit(result.pid);
+  if (activatedBuildId() !== expectedBuildId) return 0;
+  await start();
   return 0;
 }
 
@@ -374,7 +327,7 @@ interface SessionsQuery {
 
 export type PreparedShutdownResult =
   | { status: "started"; pid: number }
-  | { status: "blocked"; blockers: RestartBlocker[] };
+  | { status: "blocked"; blockers: ShutdownBlocker[] };
 
 /** Ask the daemon to freeze admission, drain lifecycle state, classify work, and shut itself down. */
 export function requestPreparedShutdown(
@@ -480,7 +433,6 @@ function querySessions(): Promise<SessionsQuery> {
 }
 
 export async function daemonStatus(json: boolean): Promise<number> {
-  const handoff = readDaemonHandoffState();
   let status: SessionsQuery;
   try {
     status = await querySessions();
@@ -490,7 +442,7 @@ export async function daemonStatus(json: boolean): Promise<number> {
       const detail = error instanceof Error ? error.message : String(error);
       if (json)
         process.stdout.write(
-          `${JSON.stringify({ running: true, responsive: false, pid, error: detail, ...(handoff ? { handoff } : {}) })}\n`,
+          `${JSON.stringify({ running: true, responsive: false, pid, error: detail })}\n`,
         );
       else
         process.stdout.write(
@@ -500,15 +452,13 @@ export async function daemonStatus(json: boolean): Promise<number> {
     }
     if (json)
       process.stdout.write(
-        `${JSON.stringify({ running: false, responsive: false, sessions: [], intents: [], ...(handoff ? { handoff } : {}) })}\n`,
+        `${JSON.stringify({ running: false, responsive: false, sessions: [], intents: [] })}\n`,
       );
     else process.stdout.write("The boxers daemon is not running.\n");
     return 0;
   }
   if (json) {
-    process.stdout.write(
-      `${JSON.stringify({ running: true, responsive: true, ...status, ...(handoff ? { handoff } : {}) })}\n`,
-    );
+    process.stdout.write(`${JSON.stringify({ running: true, responsive: true, ...status })}\n`);
     return 0;
   }
   process.stdout.write(
@@ -520,13 +470,5 @@ export async function daemonStatus(json: boolean): Promise<number> {
     );
   for (const intent of status.intents)
     process.stdout.write(`  ${intent.task}\tintent in progress\n`);
-  if (handoff) {
-    process.stdout.write(
-      `Daemon handoff ${handoff.status} for build ${handoff.desiredBuildId.slice(0, 8)}.\n`,
-    );
-    for (const blocker of handoff.blockers)
-      process.stdout.write(`  ${blocker.task ? `${blocker.task}\t` : ""}${blocker.detail}\n`);
-    if (handoff.lastError) process.stdout.write(`  ${handoff.lastError}\n`);
-  }
   return 0;
 }

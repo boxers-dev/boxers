@@ -1,7 +1,7 @@
 import type { StreamingCommandOptions } from "../process.ts";
 import type { TaskManifest } from "../types.ts";
 import { registeredRuntimes, runtimeForTask, runtimeHandleForTask } from "./registry.ts";
-import type { RuntimeGitStatus, RuntimeHandle, RuntimeInfo } from "./types.ts";
+import type { RuntimeGitStatus, RuntimeHandle, RuntimeInfo, RuntimeJobRequest } from "./types.ts";
 
 export type TaskRuntimeInfo = RuntimeInfo;
 export type TaskGitStatusObservation = RuntimeGitStatus;
@@ -114,24 +114,12 @@ export function runTaskShellStreamingAt(
   return runtimeForTask(task).executeStreamingAt(task, directory, script, options);
 }
 
-export function prepareTaskCheckWorkspace(
-  task: TaskManifest,
-  base: string,
-  targetOid: string,
-  candidateTreeOid: string,
-  candidatePatch: string,
-) {
-  return runtimeForTask(task).prepareCheckWorkspace(
-    task,
-    base,
-    targetOid,
-    candidateTreeOid,
-    candidatePatch,
-  );
-}
-
 export function taskWorkspaceTreeAt(task: TaskManifest, directory: string): string {
   return runtimeForTask(task).workspaceTreeAt(task, directory);
+}
+
+export function taskWorkspacePath(task: TaskManifest): string {
+  return runtimeForTask(task).workspacePath(task);
 }
 
 export function runTaskSetupStreaming(
@@ -142,16 +130,32 @@ export function runTaskSetupStreaming(
   return runtimeForTask(task).runSetup(task, command, options);
 }
 
-export function startTaskPreview(task: TaskManifest, run: string): void {
-  runtimeForTask(task).startPreview(task, run);
+export function startTaskJob(task: TaskManifest, request: RuntimeJobRequest): void {
+  runtimeForTask(task).startJob(task, request);
 }
 
-export function stopTaskPreview(task: TaskManifest): void {
-  runtimeForTask(task).stopPreview(task);
+export function inspectTaskJob(task: TaskManifest, jobId: string) {
+  return runtimeForTask(task).inspectJob(task, jobId);
 }
 
-export function taskPreviewLogs(task: TaskManifest) {
-  return runtimeForTask(task).previewLogs(task);
+export function taskJobLogs(task: TaskManifest, jobId: string) {
+  return runtimeForTask(task).jobLogs(task, jobId);
+}
+
+export function cancelTaskJob(task: TaskManifest, jobId: string): boolean {
+  return runtimeForTask(task).cancelJob(task, jobId);
+}
+
+export function startTaskPreview(task: TaskManifest, run: string) {
+  return runtimeForTask(task).startPreview(task, run);
+}
+
+export function stopTaskPreview(task: TaskManifest, jobId: string): boolean {
+  return runtimeForTask(task).stopPreview(task, jobId);
+}
+
+export function taskPreviewLogs(task: TaskManifest, jobId: string) {
+  return runtimeForTask(task).previewLogs(task, jobId);
 }
 
 export function openTaskShell(task: TaskManifest): number {

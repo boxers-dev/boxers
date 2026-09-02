@@ -26,8 +26,7 @@ import {
 } from "./paths.ts";
 import { withPidFileLock } from "./lock.ts";
 import { command, requireSuccess } from "./process.ts";
-import { readTaskState, recordTaskSnapshot } from "./state.ts";
-import { settlementPublicationAllowed } from "./settlement-publication.ts";
+import { recordTaskSnapshot } from "./state.ts";
 import { notifyDaemonStateChanged } from "./daemon-client.ts";
 import { defaultRuntime, runtimeHandleForTask } from "./runtime/registry.ts";
 import type {
@@ -526,8 +525,6 @@ export function updateTask(
     const current = readJson<TaskManifest>(manifestPath);
     if (current.id !== task.id || current.projectId !== project.id)
       throw new Error(`Task manifest identity changed at ${manifestPath}.`);
-    if (!settlementPublicationAllowed(task.id, readTaskState(project, current)))
-      return { task: current, manifestChanged: false };
     const mergedSnapshot = mergeTaskSnapshot(
       current.lastSnapshot ?? { phase: "idle", agent: current.agent },
       task.lastSnapshot,

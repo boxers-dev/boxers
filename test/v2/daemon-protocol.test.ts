@@ -106,10 +106,10 @@ describe("daemon wire protocol", () => {
         encodeMessage({
           type: "shutdown_blocked",
           requestId: "shutdown-1",
-          blockers: [{ kind: "working", task: "task-a", detail: "still working" }],
+          blockers: [{ kind: "busy", detail: "already stopping" }],
         }).trim(),
       ),
-    ).toMatchObject({ type: "shutdown_blocked", blockers: [{ kind: "working" }] });
+    ).toMatchObject({ type: "shutdown_blocked", blockers: [{ kind: "busy" }] });
   });
 
   it("rejects malformed or unrecognized lines instead of throwing", () => {

@@ -93,7 +93,7 @@ vi.mock("../../src/v2/daemon-commands.ts", () => ({
   daemonStart: vi.fn(() => 0),
   daemonStatus: vi.fn(() => 0),
   daemonStop: vi.fn(() => 0),
-  runUpdateHandoffWorker: vi.fn(() => 0),
+  runDaemonReplacement: vi.fn(() => 0),
   runDaemonForeground: vi.fn(() => 0),
 }));
 
@@ -355,8 +355,8 @@ describe("v2 CLI", () => {
 
     await dispatch(["__update-continue"]);
     expect(fleetRelease.updateFleetRelease).toHaveBeenLastCalledWith({ skipRegistry: true });
-    await dispatch(["__update-handoff", "a".repeat(64)]);
-    expect(daemonCommands.runUpdateHandoffWorker).toHaveBeenCalledWith("a".repeat(64));
+    await dispatch(["__daemon-replace", "a".repeat(64)]);
+    expect(daemonCommands.runDaemonReplacement).toHaveBeenCalledWith("a".repeat(64));
   });
 
   it("parses reciprocal fleet connection, administration, and private synchronization", async () => {

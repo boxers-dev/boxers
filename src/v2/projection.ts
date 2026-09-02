@@ -1,7 +1,7 @@
 import { basename } from "node:path";
 import { readVersion } from "../core/version.ts";
 import { listProjects, listTasks, localMachineIdentity } from "./registry.ts";
-import { readTaskState, updateTaskState } from "./state.ts";
+import { readTaskState } from "./state.ts";
 import type {
   ProjectManifest,
   RemoteSnapshot,
@@ -13,29 +13,16 @@ import type {
 } from "./types.ts";
 import { readHostStatus } from "./host-status.ts";
 import { fleetReleaseIsAcknowledged, readFleetUpdateState } from "./fleet-update.ts";
-import { readDaemonHandoffState } from "./daemon-handoff.ts";
 import { deriveTaskView } from "./task-view.ts";
-import { readTaskIntentOperations } from "./leases.ts";
 
 function projectionPhase(snapshot: TaskSnapshot, state: TaskState): TaskProjectionPhase {
   if (state.agentTurnState === "working") return "working";
-  const settlement = state.settlement;
-  if (settlement) {
-    if (settlement.phase === "queued") return "settling";
-    if (
-      ["refreshing", "reconciling", "capturing", "checking", "generating"].includes(
-        settlement.phase,
-      )
-    )
-      return settlement.phase as TaskProjectionPhase;
-    if (settlement.phase === "failed") return "settlement_failed";
-    if (settlement.phase === "needs_input") return "awaiting_input";
-    if (settlement.phase === "ready")
-      return state.check?.status === "failed" ? "check_failed" : "ready";
-    if (settlement.phase === "cancelled") return "cancelled";
-  }
   if (state.failure) return "failed";
-  if (state.agentTurnState === "awaiting_input") return "awaiting_input";
+  if (state.agentTurnState === "awaiting_input") {
+    if (state.check?.status === "failed") return "check_failed";
+    if (state.baseOid && state.candidateTreeOid && state.check?.status === "passed") return "ready";
+    return "awaiting_input";
+  }
   return snapshot.phase;
 }
 
@@ -43,40 +30,12 @@ export function projectTaskView(
   project: ProjectManifest,
   task: TaskManifest,
   recordedState = readTaskState(project, task),
-  options: { ignoreOperationKind?: string } = {},
+  _options: { ignoreOperationKind?: string } = {},
 ): TaskView {
-  let state = recordedState;
+  const state = recordedState;
   const setupConfigured = state.setupConfigured ?? Boolean(state.setup);
-  const checksConfigured = state.checksConfigured ?? Boolean(state.check || state.checkProgress);
+  const checksConfigured = state.checksConfigured ?? Boolean(state.check);
   const checkConfigHash = state.checkConfigHash;
-  const recordedOperations = readTaskIntentOperations(task.name.toLowerCase());
-  const recordedOperation = recordedOperations.find((operation) => operation.state === "running");
-  if (
-    state.checkProgress &&
-    recordedOperation?.kind !== "running_checks" &&
-    state.settlement?.phase !== "checking"
-  )
-    state = updateTaskState(
-      project,
-      task,
-      {
-        checkProgress: null,
-        failure: "The recorded check worker is no longer active.",
-      },
-      "daemon",
-    );
-  let ignoredRunningOperation = false;
-  const operations = recordedOperations.filter((operation) => {
-    if (
-      !ignoredRunningOperation &&
-      operation.kind === options.ignoreOperationKind &&
-      operation.state === "running"
-    ) {
-      ignoredRunningOperation = true;
-      return false;
-    }
-    return true;
-  });
   return deriveTaskView({
     name: task.name,
     state,
@@ -85,7 +44,6 @@ export function projectTaskView(
     ...(checkConfigHash ? { checkConfigHash } : {}),
     ...(task.lastSnapshot?.preview ? { preview: task.lastSnapshot.preview } : {}),
     ...(task.lastSnapshot?.runtimeState ? { runtimeState: task.lastSnapshot.runtimeState } : {}),
-    ...(operations.length ? { operations } : {}),
   });
 }
 
@@ -98,7 +56,6 @@ export function captureStateProjection(): RemoteSnapshot {
   const localUpdate = update.acknowledgements.find(
     (acknowledgement) => acknowledgement.body.hostId === localId,
   );
-  const handoff = readDaemonHandoffState();
   const servedAt = new Date().toISOString();
   let observedAt = servedAt;
   const tasks = projects.flatMap((project) =>
@@ -139,32 +96,12 @@ export function captureStateProjection(): RemoteSnapshot {
             desiredBuildId: update.desired.body.release.buildId,
             desiredVersion: update.desired.body.release.packageVersion,
             status:
-              localUpdate?.body.status === "failed" ||
-              (handoff?.desiredBuildId === update.desired.body.release.buildId &&
-                handoff.status === "failed")
+              localUpdate?.body.status === "failed"
                 ? ("failed" as const)
-                : fleetReleaseIsAcknowledged(localId, update) &&
-                    !(
-                      handoff?.desiredBuildId === update.desired.body.release.buildId &&
-                      ["waiting", "restarting"].includes(handoff.status)
-                    )
+                : fleetReleaseIsAcknowledged(localId, update)
                   ? ("current" as const)
                   : ("pending" as const),
-            ...(handoff?.desiredBuildId === update.desired.body.release.buildId
-              ? {
-                  activation: handoff.status,
-                  ...(handoff.blockers.length ? { blockers: handoff.blockers } : {}),
-                  ...(handoff.lastError
-                    ? { detail: handoff.lastError }
-                    : handoff.blockers.length
-                      ? { detail: handoff.blockers.map((blocker) => blocker.detail).join("; ") }
-                      : localUpdate?.body.detail
-                        ? { detail: localUpdate.body.detail }
-                        : {}),
-                }
-              : localUpdate?.body.detail
-                ? { detail: localUpdate.body.detail }
-                : {}),
+            ...(localUpdate?.body.detail ? { detail: localUpdate.body.detail } : {}),
           },
         }
       : {}),

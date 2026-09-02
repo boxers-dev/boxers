@@ -84,20 +84,7 @@ export function parseRemoteSnapshot(text: string): RemoteSnapshot {
       typeof snapshot.boxersUpdate.desiredVersion !== "string" ||
       !["current", "pending", "failed"].includes(snapshot.boxersUpdate.status) ||
       (snapshot.boxersUpdate.detail !== undefined &&
-        typeof snapshot.boxersUpdate.detail !== "string") ||
-      (snapshot.boxersUpdate.activation !== undefined &&
-        !["waiting", "restarting", "active", "failed"].includes(
-          snapshot.boxersUpdate.activation,
-        )) ||
-      (snapshot.boxersUpdate.blockers !== undefined &&
-        (!Array.isArray(snapshot.boxersUpdate.blockers) ||
-          snapshot.boxersUpdate.blockers.some(
-            (blocker) =>
-              !blocker ||
-              typeof blocker.kind !== "string" ||
-              typeof blocker.detail !== "string" ||
-              (blocker.task !== undefined && typeof blocker.task !== "string"),
-          ))))
+        typeof snapshot.boxersUpdate.detail !== "string"))
   )
     throw new Error("Remote returned an invalid Boxers update observation.");
   for (const task of snapshot.tasks) {

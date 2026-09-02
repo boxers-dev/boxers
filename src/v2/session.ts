@@ -68,7 +68,7 @@ export function repairAgentArguments(
 export function runRepairAgent(task: TaskManifest, prompt: string): CommandResult {
   const workspace = sandboxWorkspace(task);
   // Keep the provider subprocess bounded even though the surrounding daemon
-  // settlement worker deliberately serializes workspace access for the task.
+  // post-turn worker deliberately serializes workspace access for the task.
   return runtimeForTask(task).execute(task, [
     "timeout",
     "--signal=TERM",

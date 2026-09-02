@@ -6,7 +6,6 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -28,13 +27,10 @@ import {
   daemonPidPath,
   daemonSocketPath,
   fleetPath,
-  taskMutationBarrierPath,
-  taskIntentLeasePath,
 } from "../../src/v2/paths.ts";
 import { listProjects, listTasks } from "../../src/v2/registry.ts";
-import { readTaskState, recordLifecycleEvent, updateTaskState } from "../../src/v2/state.ts";
+import { readTaskState, recordLifecycleEvent } from "../../src/v2/state.ts";
 import { encodeLifecycleWakeFrame } from "../../src/v2/pty-control.ts";
-import { readTaskIntentOperations } from "../../src/v2/leases.ts";
 
 const cleanupDirs: string[] = [];
 let daemon: DaemonHandle | undefined;
@@ -242,7 +238,7 @@ describe("daemon session lifecycle", () => {
     });
   });
 
-  it("returns a structured blocker for a provider turn that is working", async () => {
+  it("treats a working provider PTY as disposable during shutdown", async () => {
     const state = useTemporaryState();
     registerTask(state, "working", "runtime-working");
     const project = listProjects()[0]!;
@@ -280,14 +276,81 @@ describe("daemon session lifecycle", () => {
     const control = await connectClient(socketPath);
     control.send({ type: "prepare_shutdown", requestId: "working-stop", reason: "restart" });
     await expect(
-      control.next((message) => message.type === "shutdown_blocked"),
+      control.next((message) => message.type === "shutdown_started"),
     ).resolves.toMatchObject({
-      type: "shutdown_blocked",
-      blockers: [{ kind: "working", task: "working" }],
+      type: "shutdown_started",
+      requestId: "working-stop",
     });
   });
 
-  it("drains a lifecycle wake and starts one settlement for a duplicate Stop", async () => {
+  it("stops the provider runtime when disposing a daemon-owned PTY", async () => {
+    const state = useTemporaryState();
+    registerTask(state, "disposable", "runtime-disposable");
+    const project = listProjects()[0]!;
+    const task = listTasks(project)[0]!;
+    const stopped: string[] = [];
+    const socketPath = tempSocketPath();
+    daemon = runDaemon(socketPath, {
+      ingestLifecycle: async () => [],
+      stopTaskRuntime: (candidate) => stopped.push(candidate.runtime.id),
+    });
+    const viewer = await connectClient(socketPath);
+    viewer.send({
+      type: "attach",
+      sessionId: "runtime-disposable",
+      taskName: "disposable",
+      command: process.execPath,
+      args: ["-e", ECHO_SCRIPT],
+      cols: 80,
+      rows: 24,
+    });
+    await viewer.next((message) => message.type === "output" || message.type === "replay");
+
+    viewer.socket.destroy();
+    await new Promise((resolve) => setImmediate(resolve));
+    await daemon.close();
+    daemon = undefined;
+
+    expect(stopped).toEqual(["runtime-disposable"]);
+    expect(readTaskState(project, task).agentTurnState).toBe("exited");
+  });
+
+  it("stops an orphaned provider runtime during startup recovery", async () => {
+    const state = useTemporaryState();
+    registerTask(state, "orphan", "runtime-orphan");
+    const project = listProjects()[0]!;
+    const task = listTasks(project)[0]!;
+    recordLifecycleEvent(project, task, {
+      version: 1,
+      sequence: 1,
+      event: {
+        version: 1,
+        kind: "user_prompt",
+        provider: "codex",
+        providerSessionId: "session",
+        providerTurnId: "turn",
+        prompt: "work",
+        recordedAt: "2030-01-01T00:00:00.000Z",
+      },
+      source: { provider: "codex", hookEvent: "UserPromptSubmit", rawBytes: 20 },
+    });
+    const stopped: string[] = [];
+    daemon = runDaemon(tempSocketPath(), {
+      startupInventory: async () => [
+        { kind: "docker-sandboxes", id: "runtime-orphan", state: "running" },
+      ],
+      ingestLifecycle: async () => [],
+      stopTaskRuntime: (candidate) => stopped.push(candidate.runtime.id),
+    });
+
+    for (let attempt = 0; attempt < 50 && !stopped.length; attempt++)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(stopped).toEqual(["runtime-orphan"]);
+    expect(readTaskState(project, task).agentTurnState).toBe("exited");
+  });
+
+  it("drains a lifecycle wake and starts one post-turn job for a duplicate Stop", async () => {
     const token = "0123456789abcdef0123456789abcdef";
     const frame = encodeLifecycleWakeFrame(token, 7);
     const starts: number[] = [];
@@ -300,7 +363,7 @@ describe("daemon session lifecycle", () => {
         ingested.push(through);
         return through === undefined ? [] : [{ sequence: 7, kind: "turn_finished" }];
       },
-      executeSettlement: async (_task, sequence) => {
+      executePostTurn: async (_task, sequence) => {
         starts.push(sequence);
         return {};
       },
@@ -331,7 +394,7 @@ describe("daemon session lifecycle", () => {
         'Received attach command for sandbox "lifecycle-task".',
         'Polling lifecycle events for sandbox "lifecycle-task" because the provider signaled a lifecycle change (through sequence 7).',
         'Agent finished generating on sandbox "lifecycle-task".',
-        'Queued post-turn processing on sandbox "lifecycle-task".',
+        'Started post-turn processing on sandbox "lifecycle-task".',
         'Finished post-turn processing on sandbox "lifecycle-task".',
       ]),
     );
@@ -345,7 +408,7 @@ describe("daemon session lifecycle", () => {
     daemon = runDaemon(socketPath, {
       ingestLifecycle: async (_task, through) =>
         through === 3 ? [{ sequence: 3, kind: "turn_finished" }] : [],
-      executeSettlement: async () => {
+      executePostTurn: async () => {
         settled = true;
         return {};
       },
@@ -370,7 +433,7 @@ describe("daemon session lifecycle", () => {
     await waitUntil(() => settled);
   });
 
-  it("resumes an eligible deferred settlement from the setup completion event", async () => {
+  it("reruns deferred post-turn work from the setup completion event", async () => {
     const stateDir = useTemporaryState();
     registerTask(stateDir, "setup-deferred", "runtime-setup-deferred");
     const project = listProjects()[0]!;
@@ -394,7 +457,7 @@ describe("daemon session lifecycle", () => {
     daemon = runDaemon(socketPath, {
       ingestLifecycle: async (_task, through) =>
         through === 4 ? [{ sequence: 4, kind: "turn_finished" }] : [],
-      executeSettlement: async () => {
+      executePostTurn: async () => {
         starts++;
         return starts === 1 ? { deferred: true } : {};
       },
@@ -417,73 +480,16 @@ describe("daemon session lifecycle", () => {
     await waitUntil(() => starts === 2);
   });
 
-  it("resumes an unfinished persisted settlement at bounded startup recovery", async () => {
-    const state = useTemporaryState();
-    registerTask(state, "startup-recovery", "runtime-startup-recovery");
-    const project = listProjects()[0]!;
-    const task = listTasks(project)[0]!;
-    recordLifecycleEvent(project, task, {
-      version: 1,
-      sequence: 7,
-      event: {
-        version: 1,
-        kind: "turn_finished",
-        provider: "codex",
-        providerSessionId: "session",
-        providerTurnId: "turn-7",
-        recordedAt: "2030-01-01T00:00:00.000Z",
-      },
-      source: { provider: "codex", hookEvent: "Stop", rawBytes: 20 },
-    });
-    updateTaskState(project, task, {
-      settlement: {
-        runId: "interrupted-run",
-        phase: "checking",
-        triggerSequence: 7,
-        startedAt: "2030-01-01T00:00:01.000Z",
-        updatedAt: "2030-01-01T00:00:02.000Z",
-      },
-    });
-
-    let launches = 0;
-    let ready!: () => void;
-    const completed = new Promise<void>((resolve) => (ready = resolve));
-    daemon = runDaemon(tempSocketPath(), {
-      startupInventory: async () => [
-        {
-          kind: "docker-sandboxes",
-          id: "runtime-startup-recovery",
-          state: "running",
-        },
-      ],
-      ingestLifecycle: async () => [],
-      executeSettlement: async (_taskName, triggerSequence) => {
-        launches++;
-        expect(triggerSequence).toBe(7);
-        return {};
-      },
-      onSettlementTransition(snapshot) {
-        if (snapshot.triggerSequence === 7 && snapshot.phase === "ready") ready();
-      },
-    });
-    await completed;
-    expect(launches).toBe(1);
-    expect(readTaskState(project, task).settlement).toMatchObject({
-      triggerSequence: 7,
-      phase: "ready",
-    });
-  });
-
-  it("does not cancel settlement when a viewer attaches without input", async () => {
+  it("does not cancel post-turn work when a viewer attaches without input", async () => {
     const token = "fedcba9876543210fedcba9876543210";
     const frame = encodeLifecycleWakeFrame(token, 9);
-    let settlementSignal: AbortSignal | undefined;
+    let postTurnSignal: AbortSignal | undefined;
     const socketPath = tempSocketPath();
     daemon = runDaemon(socketPath, {
       ingestLifecycle: async (_task, through) =>
         through === 9 ? [{ sequence: 9, kind: "turn_finished" }] : [],
-      executeSettlement: async (_task, _sequence, _runId, signal) => {
-        settlementSignal = signal;
+      executePostTurn: async (_task, _sequence, signal) => {
+        postTurnSignal = signal;
         await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve()));
         return {};
       },
@@ -501,7 +507,7 @@ describe("daemon session lifecycle", () => {
       rows: 24,
     });
     await first.next((message) => message.type === "session_started");
-    await waitUntil(() => settlementSignal !== undefined);
+    await waitUntil(() => postTurnSignal !== undefined);
     const viewer = await connectClient(socketPath);
     viewer.send({
       type: "attach",
@@ -522,10 +528,10 @@ describe("daemon session lifecycle", () => {
       (message) => message.type === "hello" && message.requestId === "attached-without-input",
     );
     await new Promise((resolve) => setTimeout(resolve, 25));
-    expect(settlementSignal?.aborted).toBe(false);
+    expect(postTurnSignal?.aborted).toBe(false);
   });
 
-  it("restarts the still-awaiting generation after a successful strong intent", async () => {
+  it("cancels post-turn work before a strong intent without restarting it", async () => {
     const state = useTemporaryState();
     registerTask(state, "strong-restart", "runtime-strong-restart");
     const project = listProjects()[0]!;
@@ -550,7 +556,7 @@ describe("daemon session lifecycle", () => {
       debug: (message) => debug.push(message),
       ingestLifecycle: async () => [],
       executeIntent: async () => 0,
-      executeSettlement: async (_taskName, _sequence, _runId, signal) => {
+      executePostTurn: async (_taskName, _sequence, signal) => {
         launches++;
         if (launches === 1)
           await new Promise<void>((resolve) =>
@@ -571,8 +577,7 @@ describe("daemon session lifecycle", () => {
     await client.next(
       (message) => message.type === "intent_exited" && message.intentId === "strong-review",
     );
-    await waitUntil(() => launches === 2);
-    await waitUntil(() => readTaskState(project, task).settlement?.phase === "ready");
+    await new Promise((resolve) => setTimeout(resolve, 25));
     expect(debug).toEqual(
       expect.arrayContaining([
         'Received "review" command for sandbox "strong-restart".',
@@ -580,13 +585,10 @@ describe("daemon session lifecycle", () => {
         'Finished "review" command on sandbox "strong-restart" with status 0.',
       ]),
     );
-    expect(readTaskState(project, task).settlement).toMatchObject({
-      triggerSequence: 3,
-      phase: "ready",
-    });
+    expect(launches).toBe(1);
   });
 
-  it("does not restart completed settlement after a successful refresh", async () => {
+  it("does not restart completed post-turn work after a successful refresh", async () => {
     const state = useTemporaryState();
     registerTask(state, "settled-refresh", "runtime-settled-refresh");
     const project = listProjects()[0]!;
@@ -609,14 +611,14 @@ describe("daemon session lifecycle", () => {
     daemon = runDaemon(socketPath, {
       ingestLifecycle: async () => [],
       executeIntent: async () => 0,
-      executeSettlement: async () => {
+      executePostTurn: async () => {
         launches++;
         return {};
       },
     });
     const client = await connectClient(socketPath);
     client.send({ type: "setup_completed", taskName: task.name });
-    await waitUntil(() => readTaskState(project, task).settlement?.phase === "ready");
+    await waitUntil(() => launches === 1);
     expect(launches).toBe(1);
     client.send({
       type: "run_intent",
@@ -630,10 +632,9 @@ describe("daemon session lifecycle", () => {
     );
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(launches).toBe(1);
-    expect(readTaskState(project, task).settlement?.phase).toBe("ready");
   });
 
-  it("cancels settlement before forwarding the first raw input", async () => {
+  it("cancels post-turn work before forwarding the first raw input", async () => {
     const token = "00112233445566778899aabbccddeeff";
     const frame = encodeLifecycleWakeFrame(token, 11);
     let aborted = false;
@@ -642,7 +643,7 @@ describe("daemon session lifecycle", () => {
     daemon = runDaemon(socketPath, {
       ingestLifecycle: async (_task, through) =>
         through === 11 ? [{ sequence: 11, kind: "turn_finished" }] : [],
-      executeSettlement: async (_task, _sequence, _runId, signal) => {
+      executePostTurn: async (_task, _sequence, signal) => {
         started = true;
         await new Promise<void>((resolve) =>
           signal.addEventListener("abort", () => {
@@ -933,7 +934,7 @@ describe("daemon session lifecycle", () => {
     }
   });
 
-  it("runs accepted intents for the same task in request order", async () => {
+  it("rejects a second intent while the same task is busy", async () => {
     useTemporaryState();
     const marker = join(cleanupDirs.at(-1) as string, "intent-order");
     const socketPath = tempSocketPath();
@@ -957,18 +958,13 @@ describe("daemon session lifecycle", () => {
       task: "ordered",
       intent: { kind: "check" },
     });
-    await waitUntil(() => readTaskIntentOperations("ordered").length === 2);
-    expect(readTaskIntentOperations("ordered")).toMatchObject([
-      { intentId: "first", kind: "reviewing", state: "running", startedAt: expect.any(String) },
-      { intentId: "second", kind: "running_checks", state: "queued" },
-    ]);
+    await expect(
+      client.next((message) => message.type === "error" && message.intentId === "second"),
+    ).resolves.toMatchObject({ message: expect.stringContaining("operation in progress") });
     await client.next(
       (message) => message.type === "intent_exited" && message.intentId === "first",
     );
-    await client.next(
-      (message) => message.type === "intent_exited" && message.intentId === "second",
-    );
-    expect(readFileSync(marker, "utf8")).toBe("first\nsecond\n");
+    expect(readFileSync(marker, "utf8")).toBe("first\n");
   });
 
   it("does not block agent input while checks run", async () => {
@@ -1020,89 +1016,6 @@ describe("daemon session lifecycle", () => {
       Buffer.from((output as { dataBase64: string }).dataBase64, "base64").toString(),
     ).toContain("allowed");
     await operation.next((message) => message.type === "intent_exited");
-  });
-
-  it("buffers input only while the workspace mutation barrier is active", async () => {
-    const state = useTemporaryState();
-    registerTask(state, "buffered", "runtime-buffered");
-    const socketPath = tempSocketPath();
-    daemon = runDaemon(socketPath);
-    const viewer = await connectClient(socketPath);
-    viewer.send({
-      type: "attach",
-      sessionId: "runtime-buffered",
-      command: process.execPath,
-      args: ["-e", ECHO_SCRIPT],
-      cols: 80,
-      rows: 24,
-    });
-    await viewer.next((message) => message.type === "output" || message.type === "replay");
-
-    const barrier = taskMutationBarrierPath("buffered");
-    atomicWriteJson(barrier, { version: 1, task: "buffered", pid: process.pid });
-    const started = Date.now();
-    viewer.send({
-      type: "input",
-      sessionId: "runtime-buffered",
-      dataBase64: Buffer.from("held\n").toString("base64"),
-    });
-    setTimeout(() => unlinkSync(barrier), 100);
-    const output = await viewer.next(
-      (message) =>
-        message.type === "output" &&
-        Buffer.from(message.dataBase64, "base64").toString().includes("held"),
-    );
-    expect(Date.now() - started).toBeGreaterThanOrEqual(75);
-    expect(
-      Buffer.from((output as { dataBase64: string }).dataBase64, "base64").toString(),
-    ).toContain("held");
-  });
-
-  it("honors a durable intent lease while its child worker is alive", async () => {
-    const state = useTemporaryState();
-    registerTask(state, "recovered-lease", "runtime-recovered");
-    const project = listProjects()[0]!;
-    const task = listTasks(project)[0]!;
-    atomicWriteJson(taskIntentLeasePath("recovered-lease"), {
-      version: 1,
-      task: "recovered-lease",
-      daemonPid: 2_147_483_647,
-      childPid: process.pid,
-      intentId: "previous-intent",
-      updatedAt: new Date().toISOString(),
-    });
-    const socketPath = tempSocketPath();
-    daemon = runDaemon(socketPath);
-    const client = await connectClient(socketPath);
-    client.send({
-      type: "run_intent",
-      intentId: "new-intent",
-      task: "recovered-lease",
-      intent: { kind: "review" },
-    });
-    await expect(client.next((message) => message.type === "error")).resolves.toMatchObject({
-      message: expect.stringContaining("intent owned by another daemon"),
-    });
-    expect(readTaskState(project, task)).not.toHaveProperty("operation");
-  });
-
-  it("recovers a durable intent lease after its child worker exits", () => {
-    const state = useTemporaryState();
-    registerTask(state, "stale-intent", "runtime-stale");
-    const project = listProjects()[0]!;
-    const task = listTasks(project)[0]!;
-    atomicWriteJson(taskIntentLeasePath(task.name), {
-      version: 1,
-      task: task.name,
-      daemonPid: process.pid,
-      childPid: 2_147_483_647,
-      intentId: "stale",
-      updatedAt: new Date().toISOString(),
-    });
-
-    daemon = runDaemon(tempSocketPath());
-    expect(readTaskState(project, task)).not.toHaveProperty("operation");
-    expect(existsSync(taskIntentLeasePath(task.name))).toBe(false);
   });
 
   it("keeps an intent alive after its requesting client disconnects", async () => {
@@ -1255,7 +1168,7 @@ describe("daemon session lifecycle", () => {
     const first = await connectClient(socketPath);
     first.send({
       type: "attach",
-      sessionId: "writer-handoff",
+      sessionId: "writer-replacement",
       command: process.execPath,
       args: [
         "-e",
@@ -1269,7 +1182,7 @@ describe("daemon session lifecycle", () => {
     const second = await connectClient(socketPath);
     second.send({
       type: "attach",
-      sessionId: "writer-handoff",
+      sessionId: "writer-replacement",
       command: "unused",
       args: [],
       cols: 30,
@@ -1298,7 +1211,7 @@ describe("daemon session lifecycle", () => {
     ).toContain("size:100x40");
     first.send({
       type: "input",
-      sessionId: "writer-handoff",
+      sessionId: "writer-replacement",
       dataBase64: Buffer.from("from-first-again\\n").toString("base64"),
     });
     const echoed = await first.next(

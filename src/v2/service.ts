@@ -11,7 +11,7 @@ import {
 import { homedir, platform } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { command, requireSuccess } from "./process.ts";
-import { daemonHealthPath, daemonPidPath, readJson } from "./paths.ts";
+import { boxersHome, daemonHealthPath, daemonPidPath, readJson } from "./paths.ts";
 
 export interface DaemonServiceStatus {
   supported: boolean;
@@ -188,16 +188,20 @@ export function installDaemonService(executable: string): DaemonServiceStatus {
   const node = executableFile(process.execPath);
   if (!node) throw new Error("The Boxers service requires an absolute Node.js executable.");
   // Preserve an explicitly supplied stable symlink. Resolving it here would pin
-  // the service manager to one content-addressed release and defeat safe handoff.
+  // the service manager to one content-addressed release and defeat replacement.
   const launcher = executable;
   if (platform() === "linux") {
     const path = systemdUnitPath();
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     const escapedNode = node.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
     const escaped = launcher.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+    const escapedHome = boxersHome()
+      .replaceAll("\\", "\\\\")
+      .replaceAll('"', '\\"')
+      .replaceAll("%", "%%");
     writeFileSync(
       path,
-      `[Unit]\nDescription=Boxers task daemon\n\n[Service]\nType=simple\nExecStart="${escapedNode}" "${escaped}" __daemon-run\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n`,
+      `[Unit]\nDescription=Boxers task daemon\n\n[Service]\nType=simple\nEnvironment="BOXERS_HOME=${escapedHome}"\nExecStart="${escapedNode}" "${escaped}" __daemon-run\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n`,
       { mode: 0o600 },
     );
     requireSuccess(command("systemctl", ["--user", "daemon-reload"]), "Could not reload systemd");
@@ -212,7 +216,7 @@ export function installDaemonService(executable: string): DaemonServiceStatus {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     writeFileSync(
       path,
-      `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>io.boxers.daemon</string><key>ProgramArguments</key><array><string>${xml(node)}</string><string>${xml(launcher)}</string><string>__daemon-run</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n`,
+      `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>io.boxers.daemon</string><key>EnvironmentVariables</key><dict><key>BOXERS_HOME</key><string>${xml(boxersHome())}</string></dict><key>ProgramArguments</key><array><string>${xml(node)}</string><string>${xml(launcher)}</string><string>__daemon-run</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n`,
       { mode: 0o600 },
     );
     // A lazily started daemon may already own durable PTYs. Install the

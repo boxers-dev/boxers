@@ -26,7 +26,7 @@ describe("lifecycle hook recorder", () => {
       script.indexOf('sync -f "$ready/$sequence.json"'),
     );
     expect(script).toContain("flock -w 2");
-    expect(script).toContain("mutation.json");
+    expect(script).not.toContain("mutation.json");
     expect(script).not.toContain("git diff");
     expect(script).not.toContain("transcript_path");
   });

@@ -6,7 +6,6 @@ import type {
   ObservationSource,
   CandidateCommitMessage,
   CheckRun,
-  CheckProgress,
   DeliveryRecord,
   ProjectManifest,
   SetupStatus,
@@ -14,10 +13,8 @@ import type {
   TaskSnapshot,
   TaskState,
   WorkspaceRelation,
-  PersistedSettlementState,
 } from "./types.ts";
 import type { ConversationEventRecord } from "./conversation.ts";
-import { settlementPublicationAllowed } from "./settlement-publication.ts";
 
 function observation<T>(
   value: T,
@@ -82,18 +79,27 @@ function validSetup(value: unknown): value is SetupStatus {
       "command",
       "startedAt",
       "finishedAt",
-      "pid",
       "exitCode",
       "logPath",
+      "jobId",
+      "configHash",
+      "observedAt",
+      "source",
       "attempt",
       "maxAttempts",
     ]) &&
-    ["running", "passed", "failed", "timed_out"].includes(String(setup.state)) &&
+    ["running", "passed", "failed", "timed_out", "interrupted", "stale"].includes(
+      String(setup.state),
+    ) &&
     typeof setup.command === "string" &&
     typeof setup.startedAt === "string" &&
     typeof setup.logPath === "string" &&
+    typeof setup.jobId === "string" &&
+    typeof setup.configHash === "string" &&
+    (setup.observedAt === undefined || typeof setup.observedAt === "string") &&
+    (setup.source === undefined ||
+      ["command", "daemon", "worker", "git", "initial"].includes(String(setup.source))) &&
     (setup.finishedAt === undefined || typeof setup.finishedAt === "string") &&
-    (setup.pid === undefined || typeof setup.pid === "number") &&
     (setup.exitCode === undefined || typeof setup.exitCode === "number") &&
     (setup.attempt === undefined ||
       (Number.isSafeInteger(setup.attempt) && Number(setup.attempt) > 0)) &&
@@ -102,41 +108,26 @@ function validSetup(value: unknown): value is SetupStatus {
   );
 }
 
-function validCheckProgress(value: unknown): value is CheckProgress {
-  if (!value || typeof value !== "object") return false;
-  const progress = value as Record<string, unknown>;
-  return (
-    hasOnlyKeys(progress, [
-      "targetOid",
-      "candidateTreeOid",
-      "configHash",
-      "total",
-      "completed",
-      "current",
-      "startedAt",
-    ]) &&
-    typeof progress.targetOid === "string" &&
-    typeof progress.candidateTreeOid === "string" &&
-    typeof progress.configHash === "string" &&
-    Number.isSafeInteger(progress.total) &&
-    Number(progress.total) >= 0 &&
-    Number.isSafeInteger(progress.completed) &&
-    Number(progress.completed) >= 0 &&
-    Number(progress.completed) <= Number(progress.total) &&
-    (progress.current === undefined || typeof progress.current === "string") &&
-    typeof progress.startedAt === "string"
-  );
-}
-
 function validCheck(value: unknown): value is CheckRun {
   if (!value || typeof value !== "object") return false;
   const check = value as Record<string, unknown>;
   return (
-    hasOnlyKeys(check, ["status", "targetOid", "candidateTreeOid", "configHash", "results"]) &&
+    hasOnlyKeys(check, [
+      "status",
+      "targetOid",
+      "candidateTreeOid",
+      "configHash",
+      "observedAt",
+      "source",
+      "results",
+    ]) &&
     (check.status === "passed" || check.status === "failed") &&
     typeof check.targetOid === "string" &&
     typeof check.candidateTreeOid === "string" &&
     typeof check.configHash === "string" &&
+    (check.observedAt === undefined || typeof check.observedAt === "string") &&
+    (check.source === undefined ||
+      ["command", "daemon", "worker", "git", "initial"].includes(String(check.source))) &&
     Array.isArray(check.results) &&
     check.results.every((result) => {
       if (!result || typeof result !== "object") return false;
@@ -206,7 +197,6 @@ export function isTaskState(value: unknown, taskId: string): value is TaskState 
       "providerTurnId",
       "lastLifecycleEventKind",
       "lastLifecycleEventAt",
-      "settlement",
       "lifecycleDiagnostic",
       "hasUnmergedChanges",
       "baseOid",
@@ -214,7 +204,6 @@ export function isTaskState(value: unknown, taskId: string): value is TaskState 
       "lastDelivery",
       "setup",
       "check",
-      "checkProgress",
       "checksConfigured",
       "checkConfigHash",
       "setupConfigured",
@@ -247,7 +236,6 @@ export function isTaskState(value: unknown, taskId: string): value is TaskState 
     (state.lastLifecycleEventKind === undefined ||
       state.lastLifecycleEventKind === "user_prompt" ||
       state.lastLifecycleEventKind === "turn_finished") &&
-    (state.settlement === undefined || validSettlement(state.settlement)) &&
     validObservation(
       state.hasUnmergedChanges,
       (candidate): candidate is boolean | "unknown" =>
@@ -255,7 +243,6 @@ export function isTaskState(value: unknown, taskId: string): value is TaskState 
     ) &&
     (state.setup === undefined || validSetup(state.setup)) &&
     (state.check === undefined || validCheck(state.check)) &&
-    (state.checkProgress === undefined || validCheckProgress(state.checkProgress)) &&
     (state.checksConfigured === undefined || typeof state.checksConfigured === "boolean") &&
     (state.checkConfigHash === undefined || typeof state.checkConfigHash === "string") &&
     (state.setupConfigured === undefined || typeof state.setupConfigured === "boolean") &&
@@ -289,48 +276,6 @@ export function isTaskState(value: unknown, taskId: string): value is TaskState 
   );
 }
 
-function validSettlement(value: unknown): value is PersistedSettlementState {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const settlement = value as Record<string, unknown>;
-  return (
-    hasOnlyKeys(settlement, [
-      "runId",
-      "phase",
-      "triggerSequence",
-      "startedAt",
-      "updatedAt",
-      "targetOid",
-      "candidateTreeOid",
-      "finishedAt",
-      "failure",
-    ]) &&
-    typeof settlement.runId === "string" &&
-    [
-      "none",
-      "queued",
-      "refreshing",
-      "reconciling",
-      "capturing",
-      "checking",
-      "generating",
-      "ready",
-      "needs_input",
-      "cancelled",
-      "failed",
-    ].includes(String(settlement.phase)) &&
-    Number.isSafeInteger(settlement.triggerSequence) &&
-    Number(settlement.triggerSequence) > 0 &&
-    typeof settlement.startedAt === "string" &&
-    typeof settlement.updatedAt === "string" &&
-    [
-      settlement.targetOid,
-      settlement.candidateTreeOid,
-      settlement.finishedAt,
-      settlement.failure,
-    ].every((candidate) => candidate === undefined || typeof candidate === "string")
-  );
-}
-
 function withTaskStateLock<T>(path: string, action: () => T): T {
   return withPidFileLock(`${path}.lock`, action);
 }
@@ -361,14 +306,12 @@ export interface TaskStateUpdate {
   candidateTreeOid?: string | null;
   setup?: TaskSnapshot["setup"] | null;
   check?: TaskSnapshot["check"] | null;
-  checkProgress?: CheckProgress | null;
   checksConfigured?: boolean;
   checkConfigHash?: string | null;
   setupConfigured?: boolean;
   summary?: string | null;
   failure?: string | null;
   lastDelivery?: DeliveryRecord | { ref: string; oid: string; subject: string };
-  settlement?: PersistedSettlementState | null;
   lifecycleDiagnostic?: string | null;
   promotionConversationCheckpoint?: number;
 }
@@ -385,7 +328,6 @@ export function updateTaskState(
     const previous = existsSync(path)
       ? readTaskState(project, task)
       : initialTaskState(project, task);
-    if (!settlementPublicationAllowed(task.id, previous)) return previous;
     const state: TaskState = {
       ...previous,
       revision: previous.revision + 1,
@@ -422,13 +364,11 @@ export function updateTaskState(
       ["candidateTreeOid", update.candidateTreeOid],
       ["setup", update.setup],
       ["check", update.check],
-      ["checkProgress", update.checkProgress],
       ["checksConfigured", update.checksConfigured],
       ["checkConfigHash", update.checkConfigHash],
       ["setupConfigured", update.setupConfigured],
       ["summary", update.summary],
       ["failure", update.failure],
-      ["settlement", update.settlement],
       ["lifecycleDiagnostic", update.lifecycleDiagnostic],
       ["promotionConversationCheckpoint", update.promotionConversationCheckpoint],
     ] as const) {
@@ -459,7 +399,6 @@ export function recordCandidateCommitMessage(
     const previous = existsSync(path)
       ? readTaskState(project, task)
       : initialTaskState(project, task);
-    if (!settlementPublicationAllowed(task.id, previous)) return false;
     if (
       previous.baseOid !== message.targetOid ||
       previous.candidateTreeOid !== message.candidateTreeOid ||

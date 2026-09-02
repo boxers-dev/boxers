@@ -30,15 +30,6 @@ const AGENT_LABEL = {
   unknown: "Activity unknown",
 } as const;
 
-const operationForSettlement = {
-  queued: ["capturing_changes", "queued"],
-  refreshing: ["refreshing_target", "running"],
-  reconciling: ["reconciling", "running"],
-  capturing: ["capturing_changes", "running"],
-  checking: ["running_checks", "running"],
-  generating: ["generating_metadata", "running"],
-} as const;
-
 function action(
   kind: TaskActionView["kind"],
   label: string,
@@ -69,10 +60,7 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
       ? state.lastDelivery.value
       : undefined;
   const setup = setupView(state.setup, input.setupConfigured === true);
-  const settlement = state.settlement;
-  const recordedConflict = /Reconciliation conflicts:\s*(.+)$/i.exec(
-    settlement?.failure ?? state.failure ?? "",
-  )?.[1];
+  const recordedConflict = /Reconciliation conflicts:\s*(.+)$/i.exec(state.failure ?? "")?.[1];
   const conflicts = [
     ...(input.reconciliationConflicts ?? []),
     ...(recordedConflict
@@ -82,10 +70,7 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
           .filter(Boolean)
       : []),
   ];
-  const conflicted =
-    conflicts.length > 0 ||
-    settlement?.phase === "needs_input" ||
-    /conflict/i.test(settlement?.failure ?? state.failure ?? "");
+  const conflicted = conflicts.length > 0 || /conflict/i.test(state.failure ?? "");
 
   const automatic: OperationView[] = [];
   if (state.setup?.state === "running")
@@ -95,39 +80,31 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
       startedAt: state.setup.startedAt,
       detail: state.setup.command,
     });
-  const settlementOperation =
-    settlement && operationForSettlement[settlement.phase as keyof typeof operationForSettlement];
-  if (settlementOperation)
-    automatic.push({
-      kind: settlementOperation[0],
-      state: settlementOperation[1],
-      startedAt: settlement?.startedAt,
-    });
   const operations = [...(input.operations ?? []), ...automatic].filter(
     (candidate, index, all) =>
       all.findIndex((other) => other.kind === candidate.kind && other.state === candidate.state) ===
       index,
   );
+  const reconciliationOperation = operations.find((operation) =>
+    ["refreshing_target", "reconciling"].includes(operation.kind),
+  );
+  const captureOperation = operations.find((operation) => operation.kind === "capturing_changes");
 
   const reconciliation: TaskView["reconciliation"] = conflicted
     ? { state: "conflicted", ...(conflicts.length ? { conflicts } : {}) }
     : setup.state === "running" || setup.state === "retrying"
       ? { state: "awaiting_setup" }
-      : settlement?.phase === "queued"
-        ? { state: "queued" }
-        : settlement?.phase === "refreshing" || settlement?.phase === "reconciling"
-          ? { state: "running" }
-          : settlement?.phase === "failed"
-            ? { state: "failed" }
-            : state.baseOid
-              ? { state: "current" }
-              : { state: "not_needed" };
+      : reconciliationOperation
+        ? { state: reconciliationOperation.state === "queued" ? "queued" : "running" }
+        : state.baseOid
+          ? { state: "current" }
+          : { state: "not_needed" };
 
   const changes: TaskView["changes"] = conflicted
     ? { state: "conflicted", observedAt: state.hasUnmergedChanges.observedAt }
-    : settlement?.phase === "reconciling"
+    : reconciliationOperation?.kind === "reconciling"
       ? { state: "reconciling", observedAt: state.hasUnmergedChanges.observedAt }
-      : settlement?.phase === "refreshing" || settlement?.phase === "capturing"
+      : reconciliationOperation?.kind === "refreshing_target" || captureOperation
         ? { state: "capturing", observedAt: state.hasUnmergedChanges.observedAt }
         : state.hasUnmergedChanges.value === "unknown"
           ? { state: "unknown", observedAt: state.hasUnmergedChanges.observedAt }
@@ -136,14 +113,14 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
             : { state: "none", observedAt: state.hasUnmergedChanges.observedAt };
 
   const currentCheck = exactCheck(state, input.checkConfigHash);
-  const checksConfigured =
-    input.checksConfigured === true || Boolean(state.check || state.checkProgress);
-  const checks: TaskView["checks"] = state.checkProgress
-    ? { state: "running", progress: state.checkProgress }
-    : setup.state === "running" ||
-        setup.state === "retrying" ||
-        setup.state === "failed" ||
-        setup.state === "timed_out"
+  const checksConfigured = input.checksConfigured === true || Boolean(state.check);
+  const checks: TaskView["checks"] =
+    setup.state === "running" ||
+    setup.state === "retrying" ||
+    setup.state === "failed" ||
+    setup.state === "timed_out" ||
+    setup.state === "interrupted" ||
+    setup.state === "stale"
       ? { state: "awaiting_setup" }
       : ["queued", "running", "conflicted"].includes(reconciliation.state)
         ? { state: "awaiting_reconciliation" }
@@ -169,7 +146,7 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
                     : { state: "not_run" };
 
   const issues: TaskIssue[] = [];
-  if (setup.state === "failed" || setup.state === "timed_out") {
+  if (["failed", "timed_out", "interrupted", "stale"].includes(setup.state)) {
     const retry = action(
       "retry_setup",
       "Retry setup",
@@ -177,12 +154,16 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
       `boxers ${name} setup`,
     );
     issues.push({
-      code: setup.state === "failed" ? "setup_failed" : "setup_timed_out",
+      code: setup.state === "timed_out" ? "setup_timed_out" : "setup_failed",
       source: "setup",
       message:
         setup.state === "failed"
           ? `Setup failed${setup.attempt ? ` after ${setup.attempt} attempt${setup.attempt === 1 ? "" : "s"}` : ""}.`
-          : "Setup timed out.",
+          : setup.state === "timed_out"
+            ? "Setup timed out."
+            : setup.state === "stale"
+              ? "Setup result is stale for the current configuration."
+              : "Setup was interrupted and can be retried.",
       owner: "agent",
       ...(setup.logPath ? { logPath: setup.logPath } : {}),
       remediation: retry,
@@ -194,7 +175,7 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
       source: "reconciliation",
       message: conflicts.length
         ? `Reconciliation conflicts: ${conflicts.join(", ")}`
-        : (settlement?.failure ?? state.failure ?? "Reconciliation has unresolved conflicts."),
+        : (state.failure ?? "Reconciliation has unresolved conflicts."),
       owner: "agent",
       remediation: action(
         "resolve_conflicts",
@@ -247,13 +228,6 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
       message: state.failure,
       owner: "boxers",
     });
-  else if (settlement?.phase === "failed")
-    issues.push({
-      code: "operation_failed",
-      source: "daemon",
-      message: settlement.failure ?? "Automatic task settlement failed.",
-      owner: "boxers",
-    });
   if (input.runtimeState === "missing")
     issues.push({
       code: "runtime_unavailable",
@@ -299,7 +273,7 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
         `boxers ${name} attach`,
       ),
     );
-  else if (setup.state === "failed" || setup.state === "timed_out") {
+  else if (["failed", "timed_out", "interrupted", "stale"].includes(setup.state)) {
     actions.push(
       action(
         "retry_setup",
@@ -543,6 +517,8 @@ export function isTaskView(value: unknown): value is TaskView {
       "passed",
       "failed",
       "timed_out",
+      "interrupted",
+      "stale",
     ]) &&
     view.reconciliation &&
     typeof view.reconciliation === "object" &&
@@ -626,7 +602,11 @@ export function isTaskView(value: unknown): value is TaskView {
         oneOf(view.delivery.checks, ["passed", "skipped", "not_configured"]))) &&
     (view.preview === undefined ||
       (oneOf(view.preview.state, ["stopped", "starting", "running", "failed"]) &&
-        (view.preview.pid === undefined || typeof view.preview.pid === "number") &&
+        (view.preview.jobId === undefined || typeof view.preview.jobId === "string") &&
+        (view.preview.configHash === undefined || typeof view.preview.configHash === "string") &&
+        (view.preview.observedAt === undefined || typeof view.preview.observedAt === "string") &&
+        (view.preview.source === undefined ||
+          oneOf(view.preview.source, ["command", "daemon", "worker", "git", "initial"])) &&
         (view.preview.urls === undefined ||
           (Array.isArray(view.preview.urls) &&
             view.preview.urls.every((url) => typeof url === "string"))) &&
@@ -675,7 +655,6 @@ function checksLabel(view: TaskView): string {
     return `Failed - ${failed} of ${view.checks.results?.length ?? 0} failed`;
   }
   if (view.checks.state === "passed") return "All checks passed for the current changes";
-  if (view.checks.state === "running" && view.checks.progress)
-    return `Running - ${view.checks.progress.completed} of ${view.checks.progress.total} complete${view.checks.progress.current ? ` (${view.checks.progress.current})` : ""}`;
+  if (view.checks.state === "running") return "Running";
   return title(view.checks.state);
 }

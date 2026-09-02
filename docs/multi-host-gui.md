@@ -46,12 +46,10 @@ fleet without copying `BOXERS_HOME` or introducing a central database.
 The GUI should consume daemon snapshots and subscriptions rather than polling
 CLI output. Typed intents should mirror the public task lifecycle:
 
-Fleet snapshot protocol 2 exposes `activity` as the explicit provider turn
-state (`not_started`, `working`, `awaiting_input`, `exited`, or `unknown`) and
-includes durable settlement progress in task state. Attention is derived from
-`awaiting_input` or failure. PTY output must never synthesize an activity
-transition; `checking` and `generating` are settlement progress for an awaiting
-task, not provider turn states.
+Fleet snapshots expose the explicit provider turn state (`not_started`,
+`working`, `awaiting_input`, `exited`, or `unknown`) and timestamped cached
+observations. Attention is derived from `awaiting_input` or failure. PTY output
+must never synthesize an activity transition.
 
 - create and attach to a durable task;
 - read recorded status or request an explicit strong refresh;
@@ -60,8 +58,9 @@ task, not provider turn states.
 - open an explicitly labeled debug shell.
 
 Interactive channels need input, output, resize, detach, reconnect, and replay.
-The daemon already owns durable PTYs and per-task intent leases, so the GUI
-must use those semantics rather than create another session coordinator.
+The owning-host daemon multiplexes each live PTY and accepts at most one
+explicit task operation at a time. Those are disposable live resources; the GUI
+must use the daemon protocol rather than create another session coordinator.
 
 Task runtime details remain behind `TaskRuntime`. A GUI action never addresses
 Docker Sandboxes or another provider directly. Host Git credentials and branch

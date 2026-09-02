@@ -15,8 +15,7 @@ Core Boxers and the provider harness layer own these invariants:
 - networked Git authentication and branch advancement remain on the host;
 - provider lifecycle hooks, native resume arguments, and auxiliary provider
   invocations are independent of Docker runtime mechanics;
-- task operations are serialized and live-workspace mutation is protected by
-  matching host and Sandbox-visible barriers;
+- checks run read-only against an exact live-workspace tree identity;
 - a runtime that lacks a required safety capability is unsupported rather than
   routed through a second execution architecture.
 
@@ -31,5 +30,6 @@ Older or incomplete records are rejected rather than migrated.
 
 User commands describe task lifecycle. Provider hooks author the explicit turn
 state, while runtime suspension is not a provider activity signal. The
-supported lifecycle is creation, durable agent work, event-driven settlement,
-integration, and discard.
+supported lifecycle is creation, durable agent work, disposable post-turn
+observation, integration, and discard. Detached setup/check/preview jobs retain
+their status and logs in Sandbox operational state independently of the daemon.

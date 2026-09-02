@@ -12,7 +12,6 @@ import {
   daemonLockPath,
   daemonPidPath,
   daemonSocketPath,
-  taskIntentLeasePath,
 } from "./paths.ts";
 import {
   DAEMON_PROTOCOL_VERSION,
@@ -23,6 +22,7 @@ import {
   type ServerMessage,
   type PrepareShutdownRequest,
   type ShutdownReason,
+  type ShutdownBlocker,
 } from "./daemon-protocol.ts";
 import { readVersion } from "../core/version.ts";
 import type { OutputSink } from "../core/output.ts";
@@ -34,54 +34,37 @@ import {
   findTaskRuntime,
   isRuntimeRunning,
   runtimeInventoryAsync,
+  suspendTaskEnvironment,
   taskRuntimeId,
 } from "./runtime/task.ts";
 import type { RuntimeInfo } from "./runtime/types.ts";
 import { gossipFleetMembership } from "./fleet-connect.ts";
-import { fleetReleaseNeedsDaemonHandoff, reconcileFleetRelease } from "./fleet-release.ts";
+import { fleetReleaseNeedsDaemonReplacement, reconcileFleetRelease } from "./fleet-release.ts";
 import { activeManagedBuildId, activeReleaseBuildId } from "./release.ts";
-import { taskIntentLeaseActive } from "./leases.ts";
-import { recoverTaskMutationBarrier, taskMutationBarrierActiveAsync } from "./mutation.ts";
 import {
   executeIntentDirect,
   executeIntentInWorker,
   ingestLifecycleInWorker,
-  settlementInWorker,
+  postTurnInWorker,
 } from "./daemon-worker.ts";
 import { processIsBoxersDaemon } from "./daemon-identity.ts";
 import { PtyControlParser } from "./pty-control.ts";
-import {
-  SettlementCoordinator,
-  type SettlementRunContext,
-  type SettlementRunSnapshot,
-} from "./settlement.ts";
 import { debugValue, writeDaemonDebug } from "./daemon-debug.ts";
-import type { RecordedTaskOperation, TaskOperationKind } from "./types.ts";
-import { restartBoundary, type RestartBlocker } from "./restart-boundary.ts";
-import { readDaemonHandoffState, recordDaemonHandoff } from "./daemon-handoff.ts";
 
 const REPLAY_BUFFER_BYTES = 200_000;
 const MAX_VIEWER_BUFFER_BYTES = 1_000_000;
-interface TaskIntentLease {
-  version: 1;
-  task: string;
-  daemonPid: number;
-  childPid?: number;
-  operations: RecordedTaskOperation[];
-  updatedAt: string;
-}
-const SETTLEMENT_ACTIVITY: Record<SettlementRunSnapshot["phase"], string> = {
-  queued: "Queued post-turn processing",
+const POST_TURN_ACTIVITY = {
   refreshing: "Checking for updated Git targets",
   reconciling: "Reconciling with the updated Git target",
   capturing: "Capturing the sandbox candidate",
   checking: "Running checks",
-  generating: "Generating commit metadata",
-  ready: "Finished post-turn processing",
-  needs_input: "Post-turn processing needs input",
-  cancelled: "Cancelled post-turn processing",
-  failed: "Post-turn processing failed",
 };
+
+interface PostTurnJob {
+  sequence: number;
+  abort: AbortController;
+  completion: Promise<void>;
+}
 
 interface ViewerState {
   cols: number;
@@ -119,15 +102,11 @@ export interface DaemonOptions {
     taskName: string,
     throughSequence?: number,
   ) => Promise<{ sequence: number; kind: "user_prompt" | "turn_finished" }[]>;
-  executeSettlement?: (
+  executePostTurn?: (
     taskName: string,
     triggerSequence: number,
-    runId: string,
     signal: AbortSignal,
-    onProgress: (
-      phase: "refreshing" | "reconciling" | "capturing" | "checking" | "generating",
-    ) => void,
-    onIdentity: (targetOid: string, candidateTreeOid: string) => void,
+    onProgress: (phase: "refreshing" | "reconciling" | "capturing" | "checking") => void,
   ) => Promise<
     | {
         targetOid?: string;
@@ -137,13 +116,12 @@ export interface DaemonOptions {
       }
     | undefined
   >;
-  onSettlementTransition?: (snapshot: Readonly<SettlementRunSnapshot>) => void;
   peerObserverFactory?: (
     onChanged: () => void,
     debug: (message: string) => void,
   ) => PeerObserverHandle;
   startupInventory?: () => Promise<RuntimeInfo[]>;
-  onUpdateHandoff?: () => void;
+  stopTaskRuntime?: (task: import("./types.ts").TaskManifest) => void;
   onPreparedShutdown?: (reason: ShutdownReason) => void;
 }
 
@@ -263,10 +241,13 @@ export function runDaemon(
   let closing = false;
   const busyTaskNames = new Set<string>();
   const intentTails = new Map<string, Promise<void>>();
+  const intentControllers = new Map<string, AbortController>();
   const lifecycleTails = new Map<string, Promise<void>>();
-  const settlementDebugPhases = new Map<string, SettlementRunSnapshot["phase"]>();
+  const postTurnJobs = new Map<string, PostTurnJob>();
+  const postTurnHighWater = new Map<string, number>();
+  const deferredPostTurns = new Set<string>();
   let peerObservers: PeerObserverHandle | undefined;
-  let updateHandoffRequested = false;
+  let updateReplacementRequested = false;
   let draining = false;
   let shutdownPreparation = false;
   const debug =
@@ -281,55 +262,53 @@ export function runDaemon(
         send(subscriber, { type: "state_changed", epoch, revision });
   };
 
-  const persistSettlement = (snapshot: Readonly<SettlementRunSnapshot>): void => {
-    if (settlementDebugPhases.get(snapshot.runId) !== snapshot.phase) {
-      debug(
-        `${SETTLEMENT_ACTIVITY[snapshot.phase]} on sandbox ${debugValue(snapshot.taskKey)}${snapshot.failure ? `: ${debugValue(snapshot.failure)}.` : "."}`,
-      );
-      settlementDebugPhases.set(snapshot.runId, snapshot.phase);
-    }
-    if (["ready", "needs_input", "cancelled", "failed"].includes(snapshot.phase))
-      settlementDebugPhases.delete(snapshot.runId);
-    options.onSettlementTransition?.(snapshot);
-    for (const project of listProjects()) {
-      const task = listTasks(project).find(
-        (candidate) => candidate.name.toLowerCase() === snapshot.taskKey,
-      );
-      if (!task) continue;
-      const { taskKey: _taskKey, ...settlement } = snapshot;
-      updateTaskState(project, task, { settlement }, "daemon");
-      publishChange();
+  const abortPostTurn = (taskName: string): Promise<void> => {
+    const job = postTurnJobs.get(taskName.toLowerCase());
+    if (!job) return Promise.resolve();
+    job.abort.abort();
+    return job.completion;
+  };
+
+  const startPostTurn = (taskName: string, sequence: number, resumeDeferred = false): void => {
+    if (closing) return;
+    const key = taskName.toLowerCase();
+    if (
+      (postTurnHighWater.get(key) ?? 0) >= sequence &&
+      !(resumeDeferred && deferredPostTurns.has(key))
+    )
       return;
-    }
-  };
-  const settlements = new SettlementCoordinator({ onTransition: persistSettlement });
-
-  const settlementWork =
-    (taskName: string, sequence: number) => async (context: SettlementRunContext) => {
-      const result = await (options.executeSettlement ?? settlementInWorker)(
-        taskName,
-        sequence,
-        context.runId,
-        context.signal,
-        (phase) => context.transition(phase),
-        (targetOid, candidateTreeOid) => context.identify(targetOid, candidateTreeOid),
-      );
-      if (result?.targetOid && result.candidateTreeOid)
-        context.identify(result.targetOid, result.candidateTreeOid);
-      if (result?.deferred) context.defer();
-      if (result?.needsInput) context.needsInput(result.needsInput);
-    };
-
-  const startSettlement = (taskName: string, sequence: number, resume = false): void => {
-    if (closing) return;
-    const launch = settlementWork(taskName, sequence);
-    if (resume) settlements.resume(taskName, sequence, launch);
-    else settlements.start(taskName, sequence, launch);
-  };
-
-  const restartSettlement = (taskName: string, sequence: number): void => {
-    if (closing) return;
-    settlements.restart(taskName, sequence, settlementWork(taskName, sequence));
+    postTurnHighWater.set(key, sequence);
+    deferredPostTurns.delete(key);
+    const previous = postTurnJobs.get(key);
+    if (previous?.sequence === sequence) return;
+    previous?.abort.abort();
+    const abort = new AbortController();
+    const job = { sequence, abort, completion: Promise.resolve() } satisfies PostTurnJob;
+    job.completion = Promise.resolve()
+      .then(async () => {
+        debug(`Started post-turn processing on sandbox ${debugValue(taskName)}.`);
+        const result = await (options.executePostTurn ?? postTurnInWorker)(
+          taskName,
+          sequence,
+          abort.signal,
+          (phase) => debug(`${POST_TURN_ACTIVITY[phase]} on sandbox ${debugValue(taskName)}.`),
+        );
+        if (!abort.signal.aborted) {
+          if (result?.deferred) deferredPostTurns.add(key);
+          else debug(`Finished post-turn processing on sandbox ${debugValue(taskName)}.`);
+        }
+      })
+      .catch((error) => {
+        if (!abort.signal.aborted)
+          debug(
+            `Post-turn processing failed on sandbox ${debugValue(taskName)}: ${debugValue(error instanceof Error ? error.message : String(error))}.`,
+          );
+      })
+      .finally(() => {
+        if (postTurnJobs.get(key) === job) postTurnJobs.delete(key);
+        publishChange();
+      });
+    postTurnJobs.set(key, job);
   };
 
   const acceptLifecycle = (
@@ -339,10 +318,10 @@ export function runDaemon(
     for (const lifecycle of events) {
       if (lifecycle.kind === "user_prompt") {
         debug(`Agent started generating on sandbox ${debugValue(taskName)}.`);
-        settlements.cancel(taskName);
+        void abortPostTurn(taskName);
       } else {
         debug(`Agent finished generating on sandbox ${debugValue(taskName)}.`);
-        startSettlement(taskName, lifecycle.sequence);
+        startPostTurn(taskName, lifecycle.sequence);
       }
     }
   };
@@ -400,8 +379,6 @@ export function runDaemon(
   for (const project of listProjects())
     for (const task of listTasks(project)) {
       ensureTaskState(project, task);
-      taskIntentLeaseActive(task.name);
-      recoverTaskMutationBarrier(task);
     }
 
   const onSessionEvent = (
@@ -417,7 +394,7 @@ export function runDaemon(
     if (event === "exited") {
       const taskName = sessions.get(sessionId)?.taskName;
       debug(`Agent session exited on sandbox ${debugValue(taskName ?? sessionId)}.`);
-      settlements.cancel(taskName ?? sessionId);
+      void abortPostTurn(taskName ?? sessionId);
       if (taskName)
         for (const project of listProjects()) {
           const task = listTasks(project).find(
@@ -442,14 +419,48 @@ export function runDaemon(
     return undefined;
   };
 
+  const registeredTaskForSession = (session: Session) => {
+    for (const project of listProjects()) {
+      const task = listTasks(project).find(
+        (candidate) =>
+          candidate.name.toLowerCase() === session.taskName?.toLowerCase() ||
+          taskRuntimeId(candidate) === session.id ||
+          candidate.id === session.id,
+      );
+      if (task) return { project, task };
+    }
+    return undefined;
+  };
+
+  const stopOwnedProvider = (session: Session): void => {
+    if (session.state !== "running") return;
+    const registered = registeredTaskForSession(session);
+    session.proc.kill();
+    if (!registered) return;
+    try {
+      const stopTaskRuntime =
+        options.stopTaskRuntime ??
+        (socketPath === daemonSocketPath() ? suspendTaskEnvironment : undefined);
+      stopTaskRuntime?.(registered.task);
+      recordAgentExited(registered.project, registered.task);
+      debug(
+        `Stopped provider runtime for sandbox ${debugValue(registered.task.name)} while disposing its daemon PTY.`,
+      );
+    } catch (error) {
+      debug(
+        `Could not stop provider runtime for sandbox ${debugValue(registered.task.name)}: ${debugValue(error instanceof Error ? error.message : String(error))}. Startup recovery will retry before the next attach.`,
+      );
+    }
+  };
+
   const prepareShutdown = async (
     request: PrepareShutdownRequest,
     socket?: Socket,
   ): Promise<void> => {
     if (shutdownPreparation || closing) {
-      const blockers: RestartBlocker[] = [
+      const blockers: ShutdownBlocker[] = [
         {
-          kind: "background_work",
+          kind: "busy",
           detail: "The daemon is already preparing another shutdown.",
         },
       ];
@@ -459,7 +470,7 @@ export function runDaemon(
     }
     shutdownPreparation = true;
     draining = true;
-    const blockers: RestartBlocker[] = [];
+    const blockers: ShutdownBlocker[] = [];
     try {
       if (
         request.reason === "update" &&
@@ -471,55 +482,10 @@ export function runDaemon(
           detail: `Update ${request.expectedBuildId.slice(0, 8)} is no longer the active managed build.`,
         });
 
-      const liveSessions = [...sessions.values()].filter((session) => session.state === "running");
-      await Promise.all([...lifecycleTails.values()].map((tail) => tail.catch(() => undefined)));
-      await Promise.all(
-        liveSessions.flatMap((session) => {
-          const taskName = session.taskName ?? taskNameForSession(session.id);
-          return taskName
-            ? [ingestLifecycle(taskName, undefined, "the daemon is preparing to shut down")]
-            : [];
-        }),
-      );
-
-      for (const session of liveSessions) {
-        const taskName = session.taskName ?? taskNameForSession(session.id);
-        if (!taskName) {
-          blockers.push({
-            kind: "unknown_activity",
-            detail: `Session ${session.id} cannot be mapped to a registered task.`,
-          });
-          continue;
-        }
-        let matched = false;
-        for (const project of listProjects()) {
-          const task = listTasks(project).find(
-            (candidate) => candidate.name.toLowerCase() === taskName.toLowerCase(),
-          );
-          if (!task) continue;
-          matched = true;
-          const boundary = restartBoundary(task.name, readTaskState(project, task), session);
-          if (!boundary.safe) blockers.push(boundary.blocker);
-          break;
-        }
-        if (!matched)
-          blockers.push({
-            kind: "unknown_activity",
-            task: taskName,
-            detail: `Session ${session.id} references an unregistered task ${taskName}.`,
-          });
-      }
-      for (const task of intentTails.keys())
-        blockers.push({
-          kind: "active_intent",
-          task,
-          detail: `Task ${task} has an active daemon intent.`,
-        });
-      if (settlements.hasActiveRuns())
-        blockers.push({
-          kind: "background_work",
-          detail: "The daemon has active post-turn settlement work.",
-        });
+      // Provider PTYs are deliberately disposable. A daemon replacement stops
+      // their task runtimes during close(); the next attach uses the provider's
+      // native resume path. Do not hold a release hostage to an interactive
+      // session or attempt to preserve an in-memory PTY across daemon versions.
       if (
         request.reason === "update" &&
         request.expectedBuildId !== undefined &&
@@ -532,23 +498,16 @@ export function runDaemon(
         });
 
       if (blockers.length) {
-        if (request.reason === "update" && request.expectedBuildId)
-          recordDaemonHandoff(request.expectedBuildId, "waiting", blockers);
         if (socket)
           send(socket, { type: "shutdown_blocked", requestId: request.requestId, blockers });
         draining = false;
         return;
       }
 
-      if (request.reason === "update" && request.expectedBuildId)
-        recordDaemonHandoff(request.expectedBuildId, "restarting");
       if (socket)
         send(socket, { type: "shutdown_started", requestId: request.requestId, pid: process.pid });
       const commit =
         options.onPreparedShutdown ??
-        (request.reason === "update" && options.onUpdateHandoff
-          ? () => options.onUpdateHandoff?.()
-          : undefined) ??
         ((reason: ShutdownReason) => {
           if (reason === "update") process.exitCode = 75;
           setTimeout(() => process.kill(process.pid, "SIGTERM"), 0);
@@ -556,9 +515,7 @@ export function runDaemon(
       commit(request.reason);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      const failure: RestartBlocker = { kind: "lifecycle_failure", detail };
-      if (request.reason === "update" && request.expectedBuildId)
-        recordDaemonHandoff(request.expectedBuildId, "waiting", [failure]);
+      const failure: ShutdownBlocker = { kind: "failure", detail };
       if (socket)
         send(socket, {
           type: "shutdown_blocked",
@@ -575,12 +532,8 @@ export function runDaemon(
     session.inputFlushTimer = undefined;
     if (session.inputFlushPending) return;
     session.inputFlushPending = true;
-    const task = session.taskName
-      ? listProjects()
-          .flatMap((project) => listTasks(project))
-          .find((candidate) => candidate.name.toLowerCase() === session.taskName?.toLowerCase())
-      : undefined;
-    const blocked = task ? await taskMutationBarrierActiveAsync(task) : false;
+    if (session.taskName) await abortPostTurn(session.taskName);
+    const blocked = session.taskName ? busyTaskNames.has(session.taskName.toLowerCase()) : false;
     session.inputFlushPending = false;
     if (blocked) {
       const timer = setTimeout(() => void flushSessionInput(session), 25);
@@ -605,7 +558,7 @@ export function runDaemon(
     socket: Socket,
     message: ClientMessage & { type: "run_intent" },
     onWorkerSpawn: (pid: number) => void,
-    resumeSettlement: boolean,
+    signal: AbortSignal,
   ): Promise<void> => {
     const forward = (stream: "stdout" | "stderr", chunk: string): void => {
       send(socket, {
@@ -633,6 +586,7 @@ export function runDaemon(
               output,
               undefined,
               onWorkerSpawn,
+              signal,
             )
           : await executeIntentDirect(message.task, message.intent, output);
     } catch (error) {
@@ -647,30 +601,6 @@ export function runDaemon(
       }
       forward("stderr", `${failure}\n`);
     }
-    if (["refresh", "sync", "review", "check"].includes(message.intent.kind))
-      for (const project of listProjects()) {
-        const task = listTasks(project).find(
-          (candidate) => candidate.name.toLowerCase() === message.task.toLowerCase(),
-        );
-        if (!task) continue;
-        const state = readTaskState(project, task);
-        const completedPassage =
-          code === 0 ||
-          (message.intent.kind === "check" && state.check?.status === "failed" && !state.failure);
-        const unsettledCandidate =
-          state.hasUnmergedChanges.value === true &&
-          (state.settlement?.phase !== "ready" ||
-            state.settlement.targetOid !== state.baseOid ||
-            state.settlement.candidateTreeOid !== state.candidateTreeOid);
-        if (
-          completedPassage &&
-          (resumeSettlement || unsettledCandidate) &&
-          state.agentTurnState === "awaiting_input" &&
-          state.conversationHighWaterSequence > 0
-        )
-          restartSettlement(task.name, state.conversationHighWaterSequence);
-        break;
-      }
     send(socket, { type: "intent_exited", intentId: message.intentId, code });
     debug(
       `Finished ${debugValue(message.intent.kind)} command on sandbox ${debugValue(message.task)} with status ${code}.`,
@@ -683,134 +613,26 @@ export function runDaemon(
     debug(
       `Received ${debugValue(message.intent.kind)} command for sandbox ${debugValue(message.task)}.`,
     );
-    if (
-      taskIntentLeaseActive(taskKey) &&
-      !busyTaskNames.has(taskKey) &&
-      !intentTails.has(taskKey)
-    ) {
+    if (intentTails.has(taskKey)) {
       send(socket, {
         type: "error",
         intentId: message.intentId,
-        message: `Task ${message.task} has an intent owned by another daemon process.`,
+        message: `Task ${message.task} already has an operation in progress; retry after it finishes.`,
       });
       return;
     }
-    const intentOperation: TaskOperationKind | undefined = (() => {
-      switch (message.intent.kind) {
-        case "refresh":
-          return "refreshing_target";
-        case "sync":
-          return "reconciling";
-        case "review":
-          return "reviewing";
-        case "check":
-          return "running_checks";
-        case "promote":
-          return "promoting";
-        case "discard":
-          return "discarding";
-        case "setup":
-          return "setup";
-        case "preview":
-          return message.intent.action === "start" || message.intent.action === "restart"
-            ? "starting_preview"
-            : undefined;
+    const running = (async () => {
+      await abortPostTurn(taskKey);
+      const intentController = new AbortController();
+      intentControllers.set(taskKey, intentController);
+      busyTaskNames.add(taskKey);
+      try {
+        await runIntent(socket, message, () => undefined, intentController.signal);
+      } finally {
+        if (intentControllers.get(taskKey) === intentController) intentControllers.delete(taskKey);
+        busyTaskNames.delete(taskKey);
       }
-    })();
-    const leasePath = taskIntentLeasePath(taskKey);
-    const readLease = (): TaskIntentLease => {
-      if (existsSync(leasePath)) {
-        try {
-          const current = readJson<TaskIntentLease>(leasePath);
-          if (current.daemonPid === process.pid && Array.isArray(current.operations))
-            return current;
-        } catch {
-          // The current daemon replaces its own malformed lease below.
-        }
-      }
-      return {
-        version: 1,
-        task: message.task,
-        daemonPid: process.pid,
-        operations: [],
-        updatedAt: new Date().toISOString(),
-      };
-    };
-    const writeLease = (update: (lease: TaskIntentLease) => TaskIntentLease): void =>
-      atomicWriteJson(leasePath, update(readLease()));
-    if (intentOperation)
-      writeLease((lease) => ({
-        ...lease,
-        operations: [
-          ...lease.operations,
-          { kind: intentOperation, state: "queued", intentId: message.intentId },
-        ],
-        updatedAt: new Date().toISOString(),
-      }));
-    else if (!existsSync(leasePath)) atomicWriteJson(leasePath, readLease());
-    const previous = intentTails.get(taskKey) ?? Promise.resolve();
-    const running = previous
-      .catch(() => undefined)
-      .then(async () => {
-        const currentSettlement = settlements.current(taskKey);
-        let resumeSettlement = Boolean(currentSettlement && currentSettlement.phase !== "ready");
-        if (!currentSettlement)
-          for (const project of listProjects()) {
-            const task = listTasks(project).find(
-              (candidate) => candidate.name.toLowerCase() === taskKey,
-            );
-            if (!task) continue;
-            const state = readTaskState(project, task);
-            resumeSettlement = state.settlement
-              ? state.settlement.phase !== "ready"
-              : state.conversationHighWaterSequence > state.promotionConversationCheckpoint;
-            break;
-          }
-        await settlements.cancelAndWait(taskKey);
-        busyTaskNames.add(taskKey);
-        writeLease((lease) => ({
-          ...lease,
-          operations: lease.operations.map((operation) =>
-            operation.intentId === message.intentId
-              ? { ...operation, state: "running", startedAt: new Date().toISOString() }
-              : operation,
-          ),
-          updatedAt: new Date().toISOString(),
-        }));
-        try {
-          await runIntent(
-            socket,
-            message,
-            (childPid) => {
-              writeLease((lease) => ({
-                ...lease,
-                childPid,
-                updatedAt: new Date().toISOString(),
-              }));
-            },
-            resumeSettlement,
-          );
-        } finally {
-          busyTaskNames.delete(taskKey);
-          const lease = readLease();
-          const operations = lease.operations.filter(
-            (operation) => operation.intentId !== message.intentId,
-          );
-          if (operations.length)
-            atomicWriteJson(leasePath, {
-              ...lease,
-              operations,
-              childPid: undefined,
-              updatedAt: new Date().toISOString(),
-            });
-          else
-            try {
-              unlinkSync(leasePath);
-            } catch {
-              // Discard may already have removed task-owned state.
-            }
-        }
-      })
+    })()
       .catch((error) => {
         send(socket, {
           type: "error",
@@ -884,8 +706,7 @@ export function runDaemon(
               viewers: session.viewers.size,
             })),
             intents: [...intentTails.keys()].map((task) => ({ task })),
-            backgroundWork:
-              intentTails.size + lifecycleTails.size + (settlements.hasActiveRuns() ? 1 : 0),
+            backgroundWork: intentTails.size + lifecycleTails.size + postTurnJobs.size,
           });
           return;
         }
@@ -952,7 +773,7 @@ export function runDaemon(
               state.agentTurnState === "awaiting_input" &&
               state.conversationHighWaterSequence > 0
             )
-              startSettlement(task.name, state.conversationHighWaterSequence, true);
+              startPostTurn(task.name, state.conversationHighWaterSequence, true);
             break;
           }
           publishChange();
@@ -1032,7 +853,7 @@ export function runDaemon(
             return;
           }
           session.uncommittedInput = true;
-          if (session.taskName) settlements.cancel(session.taskName);
+          if (session.taskName) void abortPostTurn(session.taskName);
           writeSessionInput(session, Buffer.from(message.dataBase64, "base64").toString("utf8"));
           return;
         }
@@ -1097,17 +918,21 @@ export function runDaemon(
             debug(
               `Fleet release reconciliation is ${release.status}: ${debugValue(release.detail)}.`,
             );
-          if (!updateHandoffRequested && fleetReleaseNeedsDaemonHandoff() && !shutdownPreparation) {
+          if (
+            !updateReplacementRequested &&
+            fleetReleaseNeedsDaemonReplacement() &&
+            !shutdownPreparation
+          ) {
             const desiredBuildId = activeManagedBuildId();
             if (desiredBuildId) {
-              updateHandoffRequested = true;
+              updateReplacementRequested = true;
               void prepareShutdown({
                 type: "prepare_shutdown",
                 requestId: randomUUID(),
                 reason: "update",
                 expectedBuildId: desiredBuildId,
               }).finally(() => {
-                if (!closing && !draining) updateHandoffRequested = false;
+                if (!closing && !draining) updateReplacementRequested = false;
               });
             }
           }
@@ -1148,22 +973,23 @@ export function runDaemon(
                 if (!isRuntimeRunning(findTaskRuntime(inventory, task))) continue;
                 await ingestLifecycle(task.name, undefined, "startup found the sandbox running");
                 const state = readTaskState(project, task);
-                const recoverable =
-                  !state.settlement ||
-                  [
-                    "queued",
-                    "refreshing",
-                    "reconciling",
-                    "capturing",
-                    "checking",
-                    "generating",
-                  ].includes(state.settlement.phase);
+                const stopTaskRuntime =
+                  options.stopTaskRuntime ??
+                  (socketPath === daemonSocketPath() ? suspendTaskEnvironment : undefined);
                 if (
-                  recoverable &&
-                  state.agentTurnState === "awaiting_input" &&
-                  state.conversationHighWaterSequence > 0
-                )
-                  startSettlement(task.name, state.conversationHighWaterSequence);
+                  stopTaskRuntime &&
+                  (state.agentTurnState === "working" || state.agentTurnState === "awaiting_input")
+                ) {
+                  stopTaskRuntime(task);
+                  recordAgentExited(project, task);
+                  debug(
+                    `Stopped orphaned provider runtime for sandbox ${debugValue(task.name)} during daemon startup recovery.`,
+                  );
+                  continue;
+                }
+                // Post-turn work is recomputable and is not recovered from
+                // daemon memory. The next lifecycle event, explicit command,
+                // or refresh converges the observation.
               }
           })
           .catch((error) =>
@@ -1189,13 +1015,13 @@ export function runDaemon(
     peerObservers?.close();
     for (const session of sessions.values()) {
       if (session.inputFlushTimer) clearTimeout(session.inputFlushTimer);
-      session.proc.kill();
+      stopOwnedProvider(session);
     }
+    for (const job of postTurnJobs.values()) job.abort.abort();
+    for (const controller of intentControllers.values()) controller.abort();
     sessions.clear();
     return startupRecovery
-      .then(() =>
-        Promise.all([settlements.close(), ...intentTails.values(), ...lifecycleTails.values()]),
-      )
+      .then(() => Promise.all([...intentTails.values(), ...lifecycleTails.values()]))
       .then(() => new Promise((resolve) => server.close(() => resolve())));
   };
 
@@ -1263,10 +1089,6 @@ export function daemonMain(): boolean {
     ...(activeReleaseBuildId() ? { boxersBuildId: activeReleaseBuildId() } : {}),
     startedAt: new Date().toISOString(),
   });
-  const activeBuildId = activeReleaseBuildId();
-  const pendingHandoff = readDaemonHandoffState();
-  if (activeBuildId && pendingHandoff?.desiredBuildId === activeBuildId)
-    recordDaemonHandoff(activeBuildId, "active");
   const shutdown = (): void => {
     void close().then(() => {
       try {

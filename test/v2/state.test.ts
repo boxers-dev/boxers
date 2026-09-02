@@ -15,16 +15,11 @@ import {
   recordTaskSnapshot,
   updateTaskState,
 } from "../../src/v2/state.ts";
-import {
-  beginSettlementPublicationGuard,
-  endSettlementPublicationGuard,
-} from "../../src/v2/settlement-publication.ts";
 
 const cleanup: string[] = [];
 const oldHome = process.env.BOXERS_HOME;
 
 afterEach(() => {
-  endSettlementPublicationGuard();
   vi.restoreAllMocks();
   if (oldHome === undefined) delete process.env.BOXERS_HOME;
   else process.env.BOXERS_HOME = oldHome;
@@ -224,53 +219,6 @@ describe("durable task state", () => {
     expect(readTaskState(project, task).commitMessage?.subject).toBe("Describe candidate B");
   });
 
-  it("rejects every late publication after a settlement is cancelled", () => {
-    const { project, task } = fixture();
-    updateTaskState(project, task, {
-      settlement: {
-        runId: "run-a",
-        phase: "checking",
-        triggerSequence: 4,
-        startedAt: "2030-01-01T00:00:00.000Z",
-        updatedAt: "2030-01-01T00:00:01.000Z",
-      },
-    });
-    beginSettlementPublicationGuard({ taskId: task.id, runId: "run-a", triggerSequence: 4 });
-    updateTaskState(project, task, {
-      settlement: {
-        runId: "run-a",
-        phase: "cancelled",
-        triggerSequence: 4,
-        startedAt: "2030-01-01T00:00:00.000Z",
-        updatedAt: "2030-01-01T00:00:02.000Z",
-        finishedAt: "2030-01-01T00:00:02.000Z",
-      },
-    });
-    // Cancellation is published by the daemon, which is a different process
-    // and therefore has no worker-local publication guard.
-    endSettlementPublicationGuard();
-    updateTaskState(project, task, {
-      settlement: {
-        runId: "run-a",
-        phase: "cancelled",
-        triggerSequence: 4,
-        startedAt: "2030-01-01T00:00:00.000Z",
-        updatedAt: "2030-01-01T00:00:02.000Z",
-        finishedAt: "2030-01-01T00:00:02.000Z",
-      },
-    });
-    beginSettlementPublicationGuard({ taskId: task.id, runId: "run-a", triggerSequence: 4 });
-    const before = readTaskState(project, task);
-    updateTaskState(project, task, { baseOid: "late-base", candidateTreeOid: "late-tree" });
-    const manifest = updateTask(project, task, {
-      ...task.lastSnapshot!,
-      phase: "reviewed",
-      candidateTreeOid: "late-tree",
-    });
-    expect(readTaskState(project, task)).toEqual(before);
-    expect(manifest.lastSnapshot?.candidateTreeOid).toBeUndefined();
-  });
-
   it("merges stale manifest writers by owned snapshot dimension", () => {
     const { project, task } = fixture();
     const setup = {
@@ -280,6 +228,8 @@ describe("durable task state", () => {
       finishedAt: "2030-01-01T00:00:01.000Z",
       exitCode: 0,
       logPath: "/tmp/setup.log",
+      jobId: "setup-job",
+      configHash: "setup-config",
     };
     updateTask(project, task, { ...task.lastSnapshot!, setup }, undefined, "worker");
     updateTask(project, task, {
@@ -318,7 +268,7 @@ describe("durable task state", () => {
     expect(output).toContain("Changes: Unmerged changes can be promoted");
   });
 
-  it("projects provider turns and settlement outcomes as distinct phases", () => {
+  it("projects provider turns and check outcomes as distinct phases", () => {
     const { project, task } = fixture();
     recordLifecycleEvent(project, task, {
       version: 1,
@@ -337,24 +287,6 @@ describe("durable task state", () => {
       internal: { phase: "awaiting_input" },
     });
     updateTaskState(project, task, {
-      settlement: {
-        runId: "run",
-        phase: "checking",
-        triggerSequence: 1,
-        startedAt: "2030-01-01T00:00:01.000Z",
-        updatedAt: "2030-01-01T00:00:02.000Z",
-      },
-    });
-    expect(captureStateProjection().tasks[0]?.internal?.phase).toBe("checking");
-    updateTaskState(project, task, {
-      settlement: {
-        runId: "run",
-        phase: "ready",
-        triggerSequence: 1,
-        startedAt: "2030-01-01T00:00:01.000Z",
-        updatedAt: "2030-01-01T00:00:03.000Z",
-        finishedAt: "2030-01-01T00:00:03.000Z",
-      },
       check: {
         status: "failed",
         targetOid: "base",

@@ -14,6 +14,7 @@ import { withPidFileLock } from "./lock.ts";
 import {
   atomicWriteText,
   authorizedKeysLockPath,
+  boxersHome,
   managedSshDir,
   managedSshLockPath,
   managedSshPrivateKeyPath,
@@ -128,6 +129,10 @@ function marker(hostId: string): string {
   return `# boxers-managed ${hostId}`;
 }
 
+function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
 function withoutManagedEntry(text: string, hostId: string): string[] {
   const lines = text.split("\n");
   const result: string[] = [];
@@ -164,7 +169,7 @@ export function authorizeManagedPeer(hostId: string, publicKey: string, executab
     const key = canonicalSshPublicKey(publicKey, `boxers:${hostId}`);
     lines.push(
       marker(hostId),
-      `command="${executable} remote gateway ${hostId}",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc ${key}`,
+      `command="env BOXERS_HOME=${shellSingleQuote(boxersHome())} ${executable} remote gateway ${hostId}",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc ${key}`,
     );
     atomicWriteText(path, `${lines.join("\n")}\n`, 0o600);
   });

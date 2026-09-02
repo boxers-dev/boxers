@@ -25,7 +25,7 @@ import {
   sync,
 } from "../../src/v2/commands.ts";
 import { createTaskManifest, initProject, requireTask, updateTask } from "../../src/v2/registry.ts";
-import { atomicWriteJson, taskDir, taskIntentLeasePath } from "../../src/v2/paths.ts";
+import { taskDir } from "../../src/v2/paths.ts";
 import { suspendTaskEnvironment } from "../../src/v2/runtime/task.ts";
 import { advanceNativeWorkspace, nativeWorkspacePatch } from "../../src/v2/sandbox.ts";
 import { readTaskState, recordLifecycleEvent, recordTaskSnapshot } from "../../src/v2/state.ts";
@@ -88,7 +88,13 @@ case "$command_name" in
     esac
     ;;
   exec)
-    if [ "$1" = "-d" ]; then shift; fi
+    if [ "$1" = "-d" ]; then
+      shift
+      shift
+      cd "$FAKE_WORKSPACE"
+      "$@" >/dev/null 2>&1 </dev/null &
+      exit 0
+    fi
     shift
     cd "$FAKE_WORKSPACE"
     exec "$@"
@@ -113,7 +119,49 @@ function useFakeRuntime(
 }
 
 describe("native review, promotion, and preview", () => {
-  it("checks the captured candidate after the live workspace advances", async () => {
+  it("refuses to certify a check that modifies the live workspace", async () => {
+    const root = mkdtempSync(join(tmpdir(), "boxers-readonly-check-root-"));
+    const state = mkdtempSync(join(tmpdir(), "boxers-readonly-check-state-"));
+    const workspace = mkdtempSync(join(tmpdir(), "boxers-readonly-check-workspace-"));
+    const bin = mkdtempSync(join(tmpdir(), "boxers-readonly-check-bin-"));
+    cleanup.push(root, state, workspace, bin);
+    process.env["BOXERS_HOME"] = state;
+    process.env["FAKE_WORKSPACE"] = workspace;
+    process.chdir(root);
+
+    git(root, "init", "-q", "-b", "main");
+    git(root, "config", "user.name", "Test User");
+    git(root, "config", "user.email", "test@example.invalid");
+    mkdirSync(join(root, ".boxers"));
+    writeFileSync(
+      join(root, ".boxers", "config.yml"),
+      "version: 3\ncheck:\n  commands:\n    mutating:\n      run: printf 'changed by check\\n' > tracked.txt\n      timeout: 10s\n",
+    );
+    writeFileSync(join(root, "tracked.txt"), "base\n");
+    git(root, "add", ".");
+    git(root, "commit", "-q", "-m", "base");
+    const project = initProject({ integration: "local", base: "main", cwd: root });
+    git(workspace, "clone", "-q", project.seedPath, ".");
+    installFakeSbx(bin);
+
+    const task = createTaskManifest(project, "readonly", "codex");
+    useFakeRuntime(task);
+    updateTask(project, task, {
+      phase: "active",
+      agent: "codex",
+      targetOid: git(root, "rev-parse", "HEAD"),
+    });
+    writeFileSync(join(workspace, "tracked.txt"), "candidate\n");
+    vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    vi.spyOn(process.stderr, "write").mockReturnValue(true);
+
+    await expect(check("readonly")).rejects.toThrow(
+      "Check command modified tracked content. Checks must be read-only",
+    );
+    expect(requireTask(project, "readonly").lastSnapshot?.check).toBeUndefined();
+  });
+
+  it("invalidates a captured check when the live workspace advances", async () => {
     const root = mkdtempSync(join(tmpdir(), "boxers-exact-check-root-"));
     const state = mkdtempSync(join(tmpdir(), "boxers-exact-check-state-"));
     const workspace = mkdtempSync(join(tmpdir(), "boxers-exact-check-workspace-"));
@@ -162,34 +210,11 @@ check:
     expect(captured).toMatch(/^[0-9a-f]{40}$/);
 
     writeFileSync(join(workspace, "tracked.txt"), "newer live edit\n");
-    const checking = refreshAutomaticCheck("native");
-    for (let attempt = 0; attempt < 100 && !existsSync(delayedMarker); attempt++)
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(existsSync(delayedMarker)).toBe(true);
-    const runningCheckState = readTaskState(project, requireTask(project, "native"));
-    expect(runningCheckState.check).toBeUndefined();
-    expect(runningCheckState).toMatchObject({
-      checkProgress: {
-        targetOid: expect.any(String),
-        candidateTreeOid: captured,
-        total: 2,
-        completed: 1,
-        current: "delayed",
-        startedAt: expect.any(String),
-      },
-    });
-    await expect(checking).resolves.toMatchObject({
+    await expect(refreshAutomaticCheck("native")).resolves.toMatchObject({
       candidateTreeOid: captured,
-      check: {
-        status: "passed",
-        candidateTreeOid: captured,
-        results: [
-          { name: "exact", status: "passed" },
-          { name: "delayed", status: "passed" },
-        ],
-      },
     });
-    expect(readTaskState(project, requireTask(project, "native")).checkProgress).toBeUndefined();
+    expect(existsSync(delayedMarker)).toBe(false);
+    expect(requireTask(project, "native").lastSnapshot?.check).toBeUndefined();
     expect(readFileSync(join(workspace, "tracked.txt"), "utf8")).toBe("newer live edit\n");
   });
 
@@ -564,35 +589,13 @@ exec "$FAKE_REAL_GIT" "$@"
     );
 
     const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-    atomicWriteJson(taskIntentLeasePath(task.name), {
-      version: 1,
-      task: task.name,
-      daemonPid: process.pid,
-      operations: [
-        { kind: "refreshing_target", state: "running", intentId: "self-refresh" },
-        { kind: "refreshing_target", state: "queued", intentId: "queued-refresh" },
-        { kind: "reviewing", state: "queued", intentId: "queued-review" },
-      ],
-      updatedAt: new Date().toISOString(),
-    });
     await expect(status("native", true, true)).resolves.toBe(0);
     const refreshed = JSON.parse(String(stdout.mock.calls.at(-1)?.[0]));
-    expect(refreshed.view.operations).toEqual([
-      { kind: "refreshing_target", state: "queued", intentId: "queued-refresh" },
-      { kind: "reviewing", state: "queued", intentId: "queued-review" },
-    ]);
-    atomicWriteJson(taskIntentLeasePath(task.name), {
-      version: 1,
-      task: task.name,
-      daemonPid: process.pid,
-      operations: [{ kind: "refreshing_target", state: "running", intentId: "self-refresh" }],
-      updatedAt: new Date().toISOString(),
-    });
+    expect(refreshed.view.operations).toEqual([]);
     await expect(status("native", false, true)).resolves.toBe(0);
     const refreshedText = String(stdout.mock.calls.at(-1)?.[0]);
     expect(refreshedText).not.toContain("Operations:");
     expect(refreshedText).not.toContain("  Wait");
-    unlinkSync(taskIntentLeasePath(task.name));
     suspendTaskEnvironment(task);
     const stopped = requireTask(project, "native");
     expect(readTaskState(project, stopped).hasUnmergedChanges.value).toBe(false);
@@ -909,7 +912,7 @@ preview:
     expect(promotionSandboxLog).not.toContain("ls <--json>");
     expect(promotionSandboxLog).not.toContain("<git> <diff>");
     expect(sandboxLogAfterPromotion).toContain("<--model> <gpt-5.6-luna>");
-    expect(sandboxLogAfterPromotion.split("test -f untracked.txt")).toHaveLength(2);
+    expect(sandboxLogAfterPromotion.match(/test -f untracked\.txt/g)).toHaveLength(2);
     expect(readFileSync(join(root, "tracked.txt"), "utf8")).toBe("after\n");
     expect(readFileSync(join(root, "untracked.txt"), "utf8")).toBe("new\n");
     expect([...readFileSync(join(root, "binary.bin"))]).toEqual([0, 1, 2, 255]);
@@ -994,8 +997,9 @@ check:
       state: "running" as const,
       command: "npm ci",
       startedAt: setupStartedAt,
-      pid: process.pid,
       logPath: setupLog,
+      jobId: "setup-job",
+      configHash: "setup-config",
     };
     writeFileSync(setupPath, JSON.stringify(runningSetup));
     const beforeSetup = requireTask(project, "failed-gate");

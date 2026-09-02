@@ -3,6 +3,7 @@ import { deriveTaskView, formatTaskView } from "../../src/v2/task-view.ts";
 import type { TaskState } from "../../src/v2/types.ts";
 
 const now = "2030-01-01T00:00:00.000Z";
+const setupIdentity = { jobId: "setup-job", configHash: "setup-config" };
 
 function state(overrides: Partial<TaskState> = {}): TaskState {
   return {
@@ -26,6 +27,7 @@ describe("structured task view", () => {
       input: state({
         agentTurnState: "working",
         setup: {
+          ...setupIdentity,
           state: "running",
           command: "npm ci",
           startedAt: now,
@@ -48,6 +50,7 @@ describe("structured task view", () => {
         baseOid: "base",
         candidateTreeOid: "tree",
         setup: {
+          ...setupIdentity,
           state: "passed",
           command: "npm ci",
           startedAt: now,
@@ -81,7 +84,13 @@ describe("structured task view", () => {
       input: state({
         baseOid: "base",
         candidateTreeOid: "tree",
-        setup: { state: "passed", command: "npm ci", startedAt: now, logPath: "/setup.log" },
+        setup: {
+          ...setupIdentity,
+          state: "passed",
+          command: "npm ci",
+          startedAt: now,
+          logPath: "/setup.log",
+        },
         hasUnmergedChanges: {
           value: true,
           observedAt: now,
@@ -117,6 +126,7 @@ describe("structured task view", () => {
       name: "failed setup has a precise retry",
       input: state({
         setup: {
+          ...setupIdentity,
           state: "failed",
           command: "npm ci",
           startedAt: now,
@@ -137,21 +147,20 @@ describe("structured task view", () => {
     {
       name: "conflicts belong to reconciliation",
       input: state({
-        setup: { state: "passed", command: "npm ci", startedAt: now, logPath: "/setup.log" },
+        setup: {
+          ...setupIdentity,
+          state: "passed",
+          command: "npm ci",
+          startedAt: now,
+          logPath: "/setup.log",
+        },
         hasUnmergedChanges: {
           value: true,
           observedAt: now,
           source: "git",
           conversationSequence: 4,
         },
-        settlement: {
-          runId: "run",
-          phase: "needs_input",
-          triggerSequence: 4,
-          startedAt: now,
-          updatedAt: now,
-          failure: "Conflicts: src/a.ts",
-        },
+        failure: "Reconciliation conflicts: src/a.ts",
       }),
       expected: {
         agent: "Ready for input",
@@ -165,7 +174,13 @@ describe("structured task view", () => {
       name: "delivered clean work can be discarded",
       input: state({
         baseOid: "delivered",
-        setup: { state: "passed", command: "npm ci", startedAt: now, logPath: "/setup.log" },
+        setup: {
+          ...setupIdentity,
+          state: "passed",
+          command: "npm ci",
+          startedAt: now,
+          logPath: "/setup.log",
+        },
         hasUnmergedChanges: {
           value: false,
           observedAt: now,
@@ -246,7 +261,13 @@ describe("structured task view", () => {
     const view = deriveTaskView({
       name: "task",
       state: state({
-        setup: { state: "failed", command: "npm ci", startedAt: now, logPath: "/setup.log" },
+        setup: {
+          ...setupIdentity,
+          state: "failed",
+          command: "npm ci",
+          startedAt: now,
+          logPath: "/setup.log",
+        },
         check: {
           status: "failed",
           targetOid: "old",

@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,11 +10,16 @@ import {
 } from "../../src/core/ansi.ts";
 import {
   createSandbox,
+  cancelSandboxJob,
+  inspectSandboxJob,
   parseSandboxList,
   publishPorts,
   publishedUrls,
   runSandboxSetupStreaming,
+  sandboxJobLogs,
+  startSandboxJob,
 } from "../../src/v2/sandbox.ts";
+import type { RuntimeJobRequest, RuntimeJobStatus } from "../../src/v2/runtime/types.ts";
 import {
   agentArguments,
   repairAgentArguments,
@@ -29,6 +34,7 @@ afterEach(() => {
   delete process.env.SBX_ARGS;
   delete process.env.SBX_ACTIVITY;
   delete process.env.SBX_PORT_STATE;
+  delete process.env.SBX_FAKE_HOME;
   for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
@@ -69,6 +75,142 @@ describe("terminal cleanup", () => {
 });
 
 describe("Sandbox adapter", () => {
+  function jobTask(): TaskManifest {
+    return {
+      version: 3,
+      id: "task-id",
+      projectId: "project-id",
+      name: "task",
+      runtime: { kind: "docker-sandboxes", id: "boxers-project-task" },
+      agent: "codex",
+      sessionMode: "native",
+      lifecycleBridgeToken: "0123456789abcdef0123456789abcdef",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+  }
+
+  function installDetachedSbx(): { home: string; calls: string } {
+    const bin = mkdtempSync(join(tmpdir(), "boxers-sbx-jobs-bin-"));
+    const home = join(bin, "home");
+    const calls = join(bin, "calls");
+    cleanup.push(bin);
+    writeFileSync(
+      join(bin, "sbx"),
+      `#!/bin/bash
+set -eu
+printf '%s\n' "$*" >> "$SBX_ARGS"
+test "$1" = exec
+shift
+detached=false
+if test "\${1:-}" = -d; then detached=true; shift; fi
+shift
+export HOME="$SBX_FAKE_HOME"
+mkdir -p "$HOME"
+if test "$detached" = true; then
+  nohup "$@" >/dev/null 2>&1 </dev/null &
+  exit 0
+fi
+exec "$@"
+`,
+    );
+    chmodSync(join(bin, "sbx"), 0o755);
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    process.env.SBX_ARGS = calls;
+    process.env.SBX_FAKE_HOME = home;
+    return { home, calls };
+  }
+
+  function jobRequest(
+    directory: string,
+    jobId: string,
+    command: string,
+    timeoutMs = 2_000,
+  ): RuntimeJobRequest {
+    return {
+      version: 1,
+      jobId,
+      taskId: "task-id",
+      kind: "check",
+      semanticKey: `semantic-${jobId}`,
+      conversationSequence: 7,
+      targetOid: "a".repeat(40),
+      workspaceTreeOid: "b".repeat(40),
+      configHash: "c".repeat(64),
+      command,
+      directory,
+      timeoutMs,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+  }
+
+  async function waitForTerminalJob(task: TaskManifest, jobId: string): Promise<RuntimeJobStatus> {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const status = inspectSandboxJob(task, jobId);
+      if (status && !["queued", "running"].includes(status.state)) return status;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(`Timed out waiting for fake Sandbox job ${jobId}.`);
+  }
+
+  it("runs detached jobs with durable atomic results and separate logs", async () => {
+    const { home, calls } = installDetachedSbx();
+    const workspace = home;
+    const task = jobTask();
+    const request = jobRequest(workspace, "job-pass", "printf 'stdout\\n'; printf 'stderr\\n' >&2");
+
+    startSandboxJob(task, request);
+    await expect(waitForTerminalJob(task, request.jobId)).resolves.toMatchObject({
+      jobId: request.jobId,
+      state: "passed",
+      exitCode: 0,
+    });
+    expect(sandboxJobLogs(task, request.jobId)).toEqual({
+      stdout: "stdout\n",
+      stderr: "stderr\n",
+    });
+    expect(readFileSync(calls, "utf8")).toContain("exec -d boxers-project-task");
+    const jobDirectory = join(home, ".boxers", "jobs", task.id, request.jobId);
+    expect(JSON.parse(readFileSync(join(jobDirectory, "request.json"), "utf8"))).toEqual(request);
+    expect(JSON.parse(readFileSync(join(jobDirectory, "result.json"), "utf8"))).toMatchObject({
+      state: "passed",
+    });
+    expect(readdirSync(jobDirectory).some((name) => name.includes(".tmp."))).toBe(false);
+
+    startSandboxJob(task, request);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(inspectSandboxJob(task, request.jobId)?.state).toBe("passed");
+  });
+
+  it("reports missing jobs, cancellation, and timeouts", async () => {
+    const { home } = installDetachedSbx();
+    const workspace = home;
+    const task = jobTask();
+
+    expect(inspectSandboxJob(task, "missing")).toBeUndefined();
+    expect(sandboxJobLogs(task, "missing")).toBeUndefined();
+    expect(cancelSandboxJob(task, "missing")).toBe(false);
+
+    const cancelled = jobRequest(workspace, "job-cancel", "sleep 30", 0);
+    startSandboxJob(task, cancelled);
+    const cancelDeadline = Date.now() + 2_000;
+    while (inspectSandboxJob(task, cancelled.jobId)?.state !== "running") {
+      if (Date.now() >= cancelDeadline) throw new Error("Fake cancellation job did not start.");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(cancelSandboxJob(task, cancelled.jobId)).toBe(true);
+    await expect(waitForTerminalJob(task, cancelled.jobId)).resolves.toMatchObject({
+      state: "interrupted",
+    });
+
+    const timedOut = jobRequest(workspace, "job-timeout", "sleep 2", 50);
+    startSandboxJob(task, timedOut);
+    await expect(waitForTerminalJob(task, timedOut.jobId)).resolves.toMatchObject({
+      state: "timed_out",
+      exitCode: 124,
+    });
+  });
+
   it("reuses a published preview mapping and preserves its reported host", () => {
     const bin = mkdtempSync(join(tmpdir(), "boxers-sbx-ports-bin-"));
     const state = join(bin, "published");

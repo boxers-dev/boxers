@@ -64,7 +64,9 @@ describe("managed Boxers SSH identity", () => {
     const installed = readFileSync(authorizedKeys, "utf8");
     expect(installed).toContain("Other personal");
     expect(installed.match(/# boxers-managed peer-id/g)).toHaveLength(1);
-    expect(installed).toContain('command="/opt/boxers/bin/boxers remote gateway peer-id"');
+    expect(installed).toContain(
+      `command="env BOXERS_HOME='${localHome}' /opt/boxers/bin/boxers remote gateway peer-id"`,
+    );
     expect(installed).toContain(
       "no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc",
     );

@@ -225,7 +225,7 @@ describe("fleet release distribution", () => {
         buildId: desired.desired!.body.release.buildId,
         packageVersion: desired.desired!.body.release.packageVersion,
         runtimeInstalled: true,
-        daemonHandoffRequired: false,
+        daemonReplacementRequired: false,
         update: secondState,
       }),
     );

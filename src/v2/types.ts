@@ -35,13 +35,16 @@ export interface ProjectConfig {
 }
 
 export interface SetupStatus {
-  state: "running" | "passed" | "failed" | "timed_out";
+  state: "running" | "passed" | "failed" | "timed_out" | "interrupted" | "stale";
   command: string;
   startedAt: string;
   finishedAt?: string;
-  pid?: number;
   exitCode?: number;
   logPath: string;
+  jobId: string;
+  configHash: string;
+  observedAt?: string;
+  source?: ObservationSource;
   attempt?: number;
   maxAttempts?: number;
 }
@@ -60,17 +63,9 @@ export interface CheckRun {
   targetOid: string;
   candidateTreeOid: string;
   configHash: string;
+  observedAt?: string;
+  source?: ObservationSource;
   results: CheckResult[];
-}
-
-export interface CheckProgress {
-  targetOid: string;
-  candidateTreeOid: string;
-  configHash: string;
-  total: number;
-  completed: number;
-  current?: string;
-  startedAt: string;
 }
 
 export interface DeliveryRecord {
@@ -92,47 +87,14 @@ export interface CandidateCommitMessage {
 
 export type AgentTurnState = "not_started" | "working" | "awaiting_input" | "exited" | "unknown";
 
-export type SettlementPhase =
-  | "none"
-  | "queued"
-  | "refreshing"
-  | "reconciling"
-  | "capturing"
-  | "checking"
-  | "generating"
-  | "ready"
-  | "needs_input"
-  | "cancelled"
-  | "failed";
-
-export type TaskProjectionPhase =
-  | TaskPhase
-  | "awaiting_input"
-  | "settling"
-  | "queued"
-  | "refreshing"
-  | "capturing"
-  | "generating"
-  | "ready"
-  | "cancelled"
-  | "check_failed"
-  | "settlement_failed";
-
-export interface PersistedSettlementState {
-  runId: string;
-  phase: SettlementPhase;
-  triggerSequence: number;
-  startedAt: string;
-  updatedAt: string;
-  targetOid?: string;
-  candidateTreeOid?: string;
-  finishedAt?: string;
-  failure?: string;
-}
+export type TaskProjectionPhase = TaskPhase | "awaiting_input" | "ready" | "check_failed";
 
 export interface PreviewStatus {
   state: "stopped" | "starting" | "running" | "failed";
-  pid?: number | undefined;
+  jobId?: string | undefined;
+  configHash?: string | undefined;
+  observedAt?: string | undefined;
+  source?: ObservationSource | undefined;
   urls?: string[] | undefined;
   failure?: string | undefined;
 }
@@ -209,7 +171,15 @@ export interface TaskView {
   agent: { state: AgentTurnState; label: string };
   operations: OperationView[];
   setup: {
-    state: "not_configured" | "running" | "retrying" | "passed" | "failed" | "timed_out";
+    state:
+      | "not_configured"
+      | "running"
+      | "retrying"
+      | "passed"
+      | "failed"
+      | "timed_out"
+      | "interrupted"
+      | "stale";
     command?: string;
     startedAt?: string;
     finishedAt?: string;
@@ -245,7 +215,6 @@ export interface TaskView {
       | "failed"
       | "stale";
     results?: CheckResult[];
-    progress?: CheckProgress;
   };
   delivery?: DeliveryRecord;
   removal: {
@@ -282,7 +251,6 @@ export interface TaskState {
   providerTurnId?: string | undefined;
   lastLifecycleEventKind?: "user_prompt" | "turn_finished" | undefined;
   lastLifecycleEventAt?: string | undefined;
-  settlement?: PersistedSettlementState | undefined;
   lifecycleDiagnostic?: string | undefined;
   hasUnmergedChanges: Observation<boolean | "unknown">;
   baseOid?: string | undefined;
@@ -290,7 +258,6 @@ export interface TaskState {
   lastDelivery?: Observation<DeliveryRecord> | undefined;
   setup?: SetupStatus | undefined;
   check?: CheckRun | undefined;
-  checkProgress?: CheckProgress | undefined;
   checksConfigured?: boolean | undefined;
   checkConfigHash?: string | undefined;
   setupConfigured?: boolean | undefined;
@@ -445,8 +412,6 @@ export interface RemoteSnapshot {
         desiredVersion: string;
         status: "current" | "pending" | "failed";
         detail?: string;
-        activation?: "waiting" | "restarting" | "active" | "failed";
-        blockers?: import("./restart-boundary.ts").RestartBlocker[];
       }
     | undefined;
   tasks: RemoteTaskSnapshot[];

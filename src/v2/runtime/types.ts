@@ -38,14 +38,62 @@ export interface RuntimeGitStatus {
   committedBehind: number;
 }
 
-export interface RuntimeCheckWorkspace {
-  path: string;
-  candidateTreeOid: string;
-}
-
 export interface RuntimeReconciliationResult {
   status: "clean" | "conflicted";
   conflicts: string[];
+}
+
+export type RuntimeJobKind = "setup" | "check" | "preview-action";
+
+export type RuntimeJobState =
+  | "queued"
+  | "running"
+  | "passed"
+  | "failed"
+  | "timed_out"
+  | "stale"
+  | "interrupted";
+
+/**
+ * Durable, task-local work submitted to a Sandbox. The identity fields are
+ * deliberately explicit so callers can decide whether a completed result is
+ * reusable without consulting daemon memory.
+ */
+export interface RuntimeJobRequest {
+  version: 1;
+  jobId: string;
+  taskId: string;
+  kind: RuntimeJobKind;
+  semanticKey: string;
+  conversationSequence: number;
+  targetOid: string;
+  workspaceTreeOid: string;
+  configHash: string;
+  command: string;
+  directory: string;
+  timeoutMs: number;
+  createdAt: string;
+}
+
+export interface RuntimeJobStatus {
+  version: 1;
+  jobId: string;
+  state: RuntimeJobState;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  pid?: number;
+  exitCode?: number;
+}
+
+export interface RuntimeJobLogs {
+  stdout: string;
+  stderr: string;
+}
+
+export interface RuntimePreviewHandle {
+  jobId: string;
+  configHash: string;
 }
 
 export interface RuntimeDiagnostic {
@@ -102,17 +150,14 @@ export interface TaskRuntime {
     command: string,
     options?: StreamingCommandOptions,
   ): Promise<StreamingCommandResult>;
+  startJob(task: TaskManifest, request: RuntimeJobRequest): void;
+  inspectJob(task: TaskManifest, jobId: string): RuntimeJobStatus | undefined;
+  jobLogs(task: TaskManifest, jobId: string): RuntimeJobLogs | undefined;
+  cancelJob(task: TaskManifest, jobId: string): boolean;
   publishPorts(task: TaskManifest, ports: readonly number[]): string[];
   publishedUrls(task: TaskManifest): string[];
   workspacePatch(task: TaskManifest, targetOid: string): string;
   gitStatus(task: TaskManifest, base: string, targetOid: string): Promise<RuntimeGitStatus>;
-  prepareCheckWorkspace(
-    task: TaskManifest,
-    base: string,
-    targetOid: string,
-    candidateTreeOid: string,
-    candidatePatch: string,
-  ): RuntimeCheckWorkspace;
   workspaceTreeAt(task: TaskManifest, directory: string): string;
   conflictPaths(task: TaskManifest): string[];
   reconcileWorkspace(
@@ -124,9 +169,9 @@ export interface TaskRuntime {
   ): RuntimeReconciliationResult;
   advanceWorkspace(task: TaskManifest, base: string, integratedCommit: string): boolean;
   runShell(task: TaskManifest, script: string): CommandResult;
-  startPreview(task: TaskManifest, run: string): void;
-  stopPreview(task: TaskManifest): void;
-  previewLogs(task: TaskManifest): CommandResult;
+  startPreview(task: TaskManifest, run: string): RuntimePreviewHandle;
+  stopPreview(task: TaskManifest, jobId: string): boolean;
+  previewLogs(task: TaskManifest, jobId: string): RuntimeJobLogs | undefined;
   openShell(task: TaskManifest): number;
   suspend(task: TaskManifest): void;
   assertAgentCredential(task: TaskManifest): void;

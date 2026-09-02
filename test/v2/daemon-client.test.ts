@@ -16,12 +16,12 @@ import { join } from "node:path";
 
 describe("interactive daemon client input", () => {
   it("launches a managed daemon through its authoritative executable", () => {
-    expect(daemonSpawnCommand("/old/release/dist/index.mjs", "/home/user/.local/bin/boxers")).toEqual(
-      {
-        command: "/home/user/.local/bin/boxers",
-        args: ["__daemon-run"],
-      },
-    );
+    expect(
+      daemonSpawnCommand("/old/release/dist/index.mjs", "/home/user/.local/bin/boxers"),
+    ).toEqual({
+      command: "/home/user/.local/bin/boxers",
+      args: ["__daemon-run"],
+    });
   });
 
   it("keeps source development launches on the TypeScript runner", () => {
@@ -115,7 +115,7 @@ describe("interactive daemon client input", () => {
     expect(input.pauses).toBe(1);
   });
 
-  it("makes an installed CLI/daemon handoff mismatch explicit", () => {
+  it("makes an installed CLI/daemon version mismatch explicit", () => {
     expect(() => assertDaemonVersion(readVersion())).not.toThrow();
     expect(() => assertDaemonVersion("0.0.0-stale")).toThrow(
       /daemon 0\.0\.0-stale does not match CLI/,
