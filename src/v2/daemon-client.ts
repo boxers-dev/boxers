@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, openSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
+import { dirname } from "node:path";
 import { colorEnabled, resetTerminalInputModes } from "../core/ansi.ts";
 import { readVersion } from "../core/version.ts";
 import { daemonLogPath, daemonSocketPath } from "./paths.ts";
@@ -109,10 +110,37 @@ function wait(ms: number): Promise<void> {
 }
 
 /** `tsx`-run sources can't be handed to a plain `node` child; match how "dev" launches. */
-function daemonSpawnCommand(): { command: string; args: string[] } {
-  const entry = process.argv[1] ?? "";
+export function daemonSpawnCommand(
+  entry = process.argv[1] ?? "",
+  managedExecutable = process.env["BOXERS_EXECUTABLE"],
+): { command: string; args: string[] } {
+  // Fleet bootstrap records the authoritative launcher explicitly. Preserve
+  // that boundary instead of assuming it is JavaScript for this Node runtime.
+  if (managedExecutable)
+    return { command: managedExecutable, args: ["__daemon-run"] };
   if (entry.endsWith(".ts")) return { command: "npx", args: ["tsx", entry, "__daemon-run"] };
   return { command: process.execPath, args: [entry, "__daemon-run"] };
+}
+
+const DAEMON_ERROR_LOG_BYTES = 8 * 1024;
+
+export function daemonStartupError(logPath: string, launchFailure?: string): Error {
+  let recent = "";
+  try {
+    const contents = readFileSync(logPath);
+    recent = contents.subarray(Math.max(0, contents.length - DAEMON_ERROR_LOG_BYTES)).toString();
+  } catch {
+    // The launch failure below is still more useful than masking it with a log read error.
+  }
+  const detail = [
+    launchFailure,
+    recent.trim() ? `Recent daemon output:\n${recent.trimEnd()}` : undefined,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join("\n");
+  return new Error(
+    `Could not start the boxers daemon (see ${logPath}).${detail ? `\n${detail}` : ""}`,
+  );
 }
 
 async function ensureDaemonRunning(socketPath: string): Promise<Socket> {
@@ -122,10 +150,20 @@ async function ensureDaemonRunning(socketPath: string): Promise<Socket> {
     // No daemon listening yet; spawn one below.
   }
   const logPath = daemonLogPath();
+  mkdirSync(dirname(logPath), { recursive: true, mode: 0o700 });
   const logFd = openSync(logPath, "a");
+  let launchFailure: string | undefined;
   try {
     const { command, args } = daemonSpawnCommand();
-    spawn(command, args, { detached: true, stdio: ["ignore", logFd, logFd] }).unref();
+    const child = spawn(command, args, { detached: true, stdio: ["ignore", logFd, logFd] });
+    child.once("error", (error) => {
+      launchFailure = `Daemon launch failed: ${error.message}`;
+    });
+    child.once("exit", (code, signal) => {
+      if (code === 0 && !signal) return;
+      launchFailure = `Daemon launch exited ${signal ? `after ${signal}` : `with status ${code ?? 1}`}.`;
+    });
+    child.unref();
   } finally {
     closeSync(logFd);
   }
@@ -137,7 +175,7 @@ async function ensureDaemonRunning(socketPath: string): Promise<Socket> {
       continue;
     }
   }
-  throw new Error(`Could not start the boxers daemon (see ${logPath}).`);
+  throw daemonStartupError(logPath, launchFailure);
 }
 
 /** Ensure the durable session and lifecycle-event daemon is available. */

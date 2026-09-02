@@ -2,14 +2,38 @@ import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 import {
   assertDaemonVersion,
+  daemonSpawnCommand,
+  daemonStartupError,
   detachKeyIndex,
   parseDaemonIntent,
   releaseTerminalInput,
   TerminalOutputPump,
 } from "../../src/v2/daemon-client.ts";
 import { readVersion } from "../../src/core/version.ts";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 describe("interactive daemon client input", () => {
+  it("launches a managed daemon through its authoritative executable", () => {
+    expect(daemonSpawnCommand("/old/release/dist/index.mjs", "/home/user/.local/bin/boxers")).toEqual(
+      {
+        command: "/home/user/.local/bin/boxers",
+        args: ["__daemon-run"],
+      },
+    );
+  });
+
+  it("includes recent daemon output in an auto-start failure", () => {
+    const directory = mkdtempSync(join(tmpdir(), "boxers-daemon-client-"));
+    const log = join(directory, "daemon.log");
+    writeFileSync(log, "startup context\nfatal detail\n");
+
+    expect(daemonStartupError(log, "Daemon launch exited with status 1.").message).toContain(
+      "Daemon launch exited with status 1.\nRecent daemon output:\nstartup context\nfatal detail",
+    );
+  });
+
   it("parses setup recovery as a typed intent", () => {
     expect(parseDaemonIntent(["task", "setup"])).toEqual({
       task: "task",
