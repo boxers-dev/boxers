@@ -59,6 +59,18 @@ describe("daemon doctor checks", () => {
     expect(protocol?.remediation?.value).toContain("boxers daemon stop");
   });
 
+  it("reports an exact managed-build mismatch even when version and protocol match", () => {
+    const checks = daemonDoctorChecks(
+      { ...current, boxersBuildId: "a".repeat(64) },
+      "1.2.3",
+      "b".repeat(64),
+    );
+    const protocol = checks.find((check) => check.name === "daemon protocol");
+
+    expect(protocol).toMatchObject({ ok: false });
+    expect(protocol?.detail).toContain("daemon build aaaaaaaa; active build bbbbbbbb");
+  });
+
   it("explains automatic startup while leaving protocol remediation quiet when inactive", () => {
     const checks = daemonDoctorChecks(
       {

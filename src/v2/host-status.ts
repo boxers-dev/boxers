@@ -7,6 +7,7 @@ import { command } from "./process.ts";
 import { defaultRuntime } from "./runtime/registry.ts";
 import type { RuntimeDiagnostic, RuntimeDiagnosticOptions } from "./runtime/types.ts";
 import { daemonServiceStatus, type DaemonServiceStatus } from "./service.ts";
+import { activeManagedBuildId } from "./release.ts";
 import type {
   Agent,
   AuthenticationStatus,
@@ -17,12 +18,18 @@ import type {
 export function daemonStatusChecks(
   service: DaemonServiceStatus,
   cliVersion = readVersion(),
+  managedBuildId: string | null | undefined = activeManagedBuildId(),
 ): HostStatusCheck[] {
   const serviceReady = !service.supported || (service.installed && service.enabled);
+  const buildReady =
+    managedBuildId === null ||
+    managedBuildId === undefined ||
+    service.boxersBuildId === managedBuildId;
   const protocolReady =
     service.active &&
     service.protocolVersion === DAEMON_PROTOCOL_VERSION &&
-    service.boxersVersion === cliVersion;
+    service.boxersVersion === cliVersion &&
+    buildReady;
   return [
     {
       id: "daemon.process",
@@ -54,7 +61,7 @@ export function daemonStatusChecks(
       category: "health",
       status: service.active ? (protocolReady ? "ok" : "failed") : "unknown",
       detail: service.active
-        ? `protocol ${service.protocolVersion ?? "unknown"}; daemon ${service.boxersVersion ?? "unknown"}; CLI ${cliVersion}`
+        ? `protocol ${service.protocolVersion ?? "unknown"}; daemon ${service.boxersVersion ?? "unknown"}; CLI ${cliVersion}${managedBuildId && service.boxersBuildId !== managedBuildId ? `; daemon build ${service.boxersBuildId?.slice(0, 8) ?? "unknown"}; active build ${managedBuildId.slice(0, 8)}` : ""}`
         : "unavailable while daemon is inactive",
       ...(service.active && !protocolReady
         ? {

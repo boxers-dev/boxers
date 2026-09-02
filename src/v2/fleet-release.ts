@@ -16,6 +16,7 @@ import {
   type FleetUpdateState,
 } from "./fleet-update.ts";
 import {
+  activeManagedBuildId,
   activeReleaseBuildId,
   cachedReleaseCapsule,
   createReleaseCapsule,
@@ -78,17 +79,35 @@ function finalizeManagedActivation(packageVersion: string, buildId: string): boo
   }
 }
 
-function scheduleDaemonReplacement(buildId: string): void {
-  const child = spawn(stableExecutablePath(), ["__daemon-replace", buildId], {
-    detached: true,
-    stdio: "ignore",
-    env: { ...process.env, BOXERS_HOME: boxersHome() },
+function replaceDaemon(buildId: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(stableExecutablePath(), ["__daemon-replace", buildId], {
+      detached: true,
+      stdio: ["ignore", "ignore", "pipe"],
+      env: { ...process.env, BOXERS_HOME: boxersHome() },
+    });
+    let stderr = "";
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve();
+    };
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => (stderr += chunk));
+    child.once("error", (error) => finish(error));
+    child.once("close", (code) =>
+      finish(
+        code === 0
+          ? undefined
+          : new Error(stderr.trim() || `Replacing the Boxers daemon exited ${code ?? 1}.`),
+      ),
+    );
   });
-  child.on("error", () => undefined);
-  child.unref();
 }
 
-function activateDesiredRelease(capsule: Buffer): RemoteReleaseResult {
+async function activateDesiredRelease(capsule: Buffer): Promise<RemoteReleaseResult> {
   const state = readFleetUpdateState();
   const desired = state.desired;
   if (!desired) throw new Error("The fleet has no desired Boxers release.");
@@ -107,7 +126,15 @@ function activateDesiredRelease(capsule: Buffer): RemoteReleaseResult {
     installed.manifest.packageVersion,
     installed.manifest.buildId,
   );
-  if (daemonReplacementRequired) scheduleDaemonReplacement(installed.manifest.buildId);
+  if (daemonReplacementRequired) await replaceDaemon(installed.manifest.buildId);
+  const currentDesired = readFleetUpdateState().desired;
+  if (
+    currentDesired?.body.release.buildId !== installed.manifest.buildId ||
+    activeManagedBuildId() !== installed.manifest.buildId
+  )
+    throw new Error(
+      `Boxers release ${installed.manifest.buildId.slice(0, 8)} was superseded before activation completed.`,
+    );
   const update = acknowledgeFleetRelease();
   return {
     version: 1,
@@ -120,13 +147,13 @@ function activateDesiredRelease(capsule: Buffer): RemoteReleaseResult {
   };
 }
 
-export function acceptFleetRelease(
+export async function acceptFleetRelease(
   encodedState: string,
   capsule: Buffer = readFileSync(0),
-): RemoteReleaseResult {
+): Promise<RemoteReleaseResult> {
   mergeFleetUpdateState(decodeUpdateState(encodedState));
   try {
-    return activateDesiredRelease(capsule);
+    return await activateDesiredRelease(capsule);
   } catch (error) {
     try {
       recordFleetReleaseFailure(error instanceof Error ? error.message : String(error));
@@ -208,7 +235,7 @@ export async function reconcileFleetRelease(): Promise<{
     for (const source of sources) {
       try {
         const capsule = await fetchFleetRelease(source, desired.body.release.buildId);
-        activateDesiredRelease(capsule);
+        await activateDesiredRelease(capsule);
         status = "updated";
         state = readFleetUpdateState();
         break;
@@ -577,7 +604,7 @@ export async function updateFleetRelease(
   }
   const local = installReleaseCapsule(capsule);
   if (finalizeManagedActivation(local.manifest.packageVersion, local.manifest.buildId))
-    scheduleDaemonReplacement(local.manifest.buildId);
+    await replaceDaemon(local.manifest.buildId);
   process.stdout.write(
     `Local machine is up to date with Boxers ${local.manifest.packageVersion} (${local.manifest.buildId.slice(0, 8)}).\n`,
   );
@@ -611,7 +638,7 @@ export async function updateFleetRelease(
     if ("result" in item) {
       const suffix = [
         item.result.runtimeInstalled ? "installed native runtime" : undefined,
-        item.result.daemonReplacementRequired ? "daemon replacement scheduled" : undefined,
+        item.result.daemonReplacementRequired ? "daemon replaced" : undefined,
       ]
         .filter(Boolean)
         .join("; ");

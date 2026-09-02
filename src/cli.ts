@@ -699,7 +699,7 @@ export async function dispatch(argv: string[]): Promise<number> {
     if (command === "install-release") {
       if (args.length !== 1)
         throw new UsageError("remote install-release requires one fleet state payload.");
-      process.stdout.write(`${JSON.stringify(acceptFleetRelease(args[0] as string))}\n`);
+      process.stdout.write(`${JSON.stringify(await acceptFleetRelease(args[0] as string))}\n`);
       return 0;
     }
     if (command === "export-release") {

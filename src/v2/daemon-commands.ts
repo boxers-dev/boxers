@@ -3,6 +3,7 @@ import { connect } from "node:net";
 import { daemonMain } from "./daemon.ts";
 import { ensureDaemonReady } from "./daemon-client.ts";
 import {
+  DAEMON_PROTOCOL_VERSION,
   encodeMessage,
   LineDecoder,
   parseServerMessage,
@@ -12,6 +13,7 @@ import {
 import { daemonLockPath, daemonLogPath, daemonPidPath, daemonSocketPath } from "./paths.ts";
 import { daemonProcessCommandLine, isBoxersDaemonCommand } from "./daemon-identity.ts";
 import { activeManagedBuildId } from "./release.ts";
+import { daemonServiceStatus, type DaemonServiceStatus } from "./service.ts";
 
 export { isBoxersDaemonCommand } from "./daemon-identity.ts";
 
@@ -293,28 +295,45 @@ export async function runDaemonReplacement(
   expectedBuildId: string,
   activatedBuildId: () => string | undefined = activeManagedBuildId,
   dependencies: {
-    requestShutdown?: (
-      reason: ShutdownReason,
-      expectedBuildId?: string,
-    ) => Promise<PreparedShutdownResult>;
+    status?: () => DaemonServiceStatus;
+    stop?: () => Promise<number>;
     start?: () => Promise<number>;
-    waitForExit?: (pid: number) => Promise<void>;
   } = {},
 ): Promise<number> {
   if (!/^[a-f0-9]{64}$/.test(expectedBuildId))
     throw new Error("Invalid Boxers replacement build ID.");
   if (activatedBuildId() !== expectedBuildId) return 0;
-  const requestShutdown = dependencies.requestShutdown ?? requestPreparedShutdown;
+  const status = dependencies.status ?? daemonServiceStatus;
+  const stop = dependencies.stop ?? (() => daemonStop(true));
   const start = dependencies.start ?? daemonStart;
-  const waitForExit = dependencies.waitForExit ?? waitForProcessExit;
-  const result = await requestShutdown("update", expectedBuildId);
-  if (result.status === "blocked") {
-    if (result.blockers.some((blocker) => blocker.kind === "superseded")) return 0;
-    throw new Error(result.blockers.map((blocker) => blocker.detail).join("; "));
-  }
-  await waitForExit(result.pid);
+
+  const running = status();
+  if (
+    running.active &&
+    running.boxersBuildId === expectedBuildId &&
+    running.protocolVersion === DAEMON_PROTOCOL_VERSION
+  )
+    return 0;
+
+  // An update explicitly replaces daemon-owned PTYs and recomputable host
+  // orchestration. Do not ask the daemon being superseded to approve that
+  // policy: an older protocol or build may reject the request using obsolete
+  // blocker rules. The force path still verifies the recorded PID belongs to
+  // Boxers, sends SIGTERM first, and uses SIGKILL only after the bounded grace
+  // period expires.
+  if (running.active) await stop();
   if (activatedBuildId() !== expectedBuildId) return 0;
   await start();
+  if (activatedBuildId() !== expectedBuildId) return 0;
+  const replacement = status();
+  if (
+    !replacement.active ||
+    replacement.boxersBuildId !== expectedBuildId ||
+    replacement.protocolVersion !== DAEMON_PROTOCOL_VERSION
+  )
+    throw new Error(
+      `The replacement daemon did not start the activated Boxers build ${expectedBuildId.slice(0, 8)} (protocol ${DAEMON_PROTOCOL_VERSION}).`,
+    );
   return 0;
 }
 

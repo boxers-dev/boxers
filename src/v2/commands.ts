@@ -156,8 +156,9 @@ export interface DoctorResult {
 export function daemonDoctorChecks(
   service: DaemonServiceStatus,
   cliVersion = readVersion(),
+  managedBuildId: string | null = null,
 ): DoctorResult["checks"] {
-  return daemonStatusChecks(service, cliVersion).map((check) => ({
+  return daemonStatusChecks(service, cliVersion, managedBuildId).map((check) => ({
     name: check.id.replaceAll(".", " "),
     ok: check.status === "ok",
     detail: check.detail,

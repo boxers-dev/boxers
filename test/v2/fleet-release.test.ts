@@ -103,7 +103,7 @@ describe("fleet release distribution", () => {
     );
   });
 
-  it("rejects a signed desired manifest that differs from the streamed capsule", () => {
+  it("rejects a signed desired manifest that differs from the streamed capsule", async () => {
     const state = directory("boxers-release-mismatch-state-");
     const userHome = directory("boxers-release-mismatch-home-");
     const data = directory("boxers-release-mismatch-data-");
@@ -120,11 +120,11 @@ describe("fleet release distribution", () => {
     });
     const encoded = Buffer.from(JSON.stringify(desired), "utf8").toString("base64url");
 
-    expect(() => acceptFleetRelease(encoded, capsule)).toThrow("desired manifest");
+    await expect(acceptFleetRelease(encoded, capsule)).rejects.toThrow("desired manifest");
     expect(readFleetUpdateState().acknowledgements[0]?.body.status).toBe("failed");
   });
 
-  it("independently refuses an unconfirmed fleet downgrade", () => {
+  it("independently refuses an unconfirmed fleet downgrade", async () => {
     const state = directory("boxers-release-downgrade-state-");
     process.env.BOXERS_HOME = state;
     process.env.BOXERS_AUTHORIZED_KEYS = join(state, "authorized_keys");
@@ -133,7 +133,7 @@ describe("fleet release distribution", () => {
     const desired = createFleetReleaseIntent(decodeReleaseCapsule(capsule).manifest);
     const encoded = Buffer.from(JSON.stringify(desired), "utf8").toString("base64url");
 
-    expect(() => acceptFleetRelease(encoded, capsule)).toThrow("Refusing to downgrade");
+    await expect(acceptFleetRelease(encoded, capsule)).rejects.toThrow("Refusing to downgrade");
     expect(readFleetUpdateState().acknowledgements[0]?.body.status).toBe("failed");
   });
 

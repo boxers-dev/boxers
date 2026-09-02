@@ -9,7 +9,6 @@ import {
   daemonStatus,
   daemonStop,
   isBoxersDaemonCommand,
-  type PreparedShutdownResult,
   runDaemonReplacement,
   tailDaemonLog,
   waitForProcessExit,
@@ -20,7 +19,7 @@ import {
   daemonPidPath,
   daemonSocketPath,
 } from "../../src/v2/paths.ts";
-import type { ShutdownReason } from "../../src/v2/daemon-protocol.ts";
+import { DAEMON_PROTOCOL_VERSION } from "../../src/v2/daemon-protocol.ts";
 
 const previousHome = process.env.BOXERS_HOME;
 let home: string | undefined;
@@ -95,27 +94,89 @@ describe("daemon lifecycle safety", () => {
     expect(kill).not.toHaveBeenCalled();
   });
 
-  it("performs one bounded stop and start for the activated build", async () => {
+  it("force-replaces a daemon from an older protocol and verifies the activated build", async () => {
     const buildId = "a".repeat(64);
-    const requests: string[] = [];
-    const requestShutdown = vi.fn(
-      async (reason: ShutdownReason): Promise<PreparedShutdownResult> => {
-        requests.push(reason);
-        return { status: "started", pid: 424_242 };
-      },
-    );
+    let replaced = false;
+    const stop = vi.fn(async () => {
+      replaced = true;
+      return 0;
+    });
     const start = vi.fn(async () => 0);
+    const status = vi.fn(() => ({
+      supported: true,
+      installed: true,
+      enabled: true,
+      active: true,
+      protocolVersion: replaced ? DAEMON_PROTOCOL_VERSION : DAEMON_PROTOCOL_VERSION - 1,
+      boxersBuildId: replaced ? buildId : "b".repeat(64),
+      platform: "test",
+      detail: "test daemon",
+    }));
 
     await expect(
       runDaemonReplacement(buildId, () => buildId, {
-        requestShutdown,
-        waitForExit: async () => undefined,
+        status,
+        stop,
         start,
       }),
     ).resolves.toBe(0);
 
-    expect(requests).toEqual(["update"]);
+    expect(stop).toHaveBeenCalledOnce();
     expect(start).toHaveBeenCalledOnce();
+  });
+
+  it("does not disturb a daemon already running the exact activated build", async () => {
+    const buildId = "a".repeat(64);
+    const stop = vi.fn(async () => 0);
+    const start = vi.fn(async () => 0);
+
+    await expect(
+      runDaemonReplacement(buildId, () => buildId, {
+        status: () => ({
+          supported: true,
+          installed: true,
+          enabled: true,
+          active: true,
+          protocolVersion: DAEMON_PROTOCOL_VERSION,
+          boxersBuildId: buildId,
+          platform: "test",
+          detail: "test daemon",
+        }),
+        stop,
+        start,
+      }),
+    ).resolves.toBe(0);
+
+    expect(stop).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("force-replaces a different build even when its protocol number matches", async () => {
+    const buildId = "a".repeat(64);
+    let replaced = false;
+    const stop = vi.fn(async () => {
+      replaced = true;
+      return 0;
+    });
+
+    await expect(
+      runDaemonReplacement(buildId, () => buildId, {
+        status: () => ({
+          supported: true,
+          installed: true,
+          enabled: true,
+          active: true,
+          protocolVersion: DAEMON_PROTOCOL_VERSION,
+          boxersBuildId: replaced ? buildId : "b".repeat(64),
+          platform: "test",
+          detail: "test daemon",
+        }),
+        stop,
+        start: async () => 0,
+      }),
+    ).resolves.toBe(0);
+
+    expect(stop).toHaveBeenCalledOnce();
   });
 
   it("keeps a service waiter alive until the existing daemon exits", async () => {
