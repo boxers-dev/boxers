@@ -35,6 +35,8 @@ import {
 } from "./runtime/task.ts";
 import type { RuntimeInfo } from "./runtime/types.ts";
 import { gossipFleetMembership } from "./fleet-connect.ts";
+import { fleetReleaseNeedsDaemonHandoff, reconcileFleetRelease } from "./fleet-release.ts";
+import { activeReleaseBuildId } from "./release.ts";
 import { taskIntentLeaseActive } from "./leases.ts";
 import { recoverTaskMutationBarrier, taskMutationBarrierActiveAsync } from "./mutation.ts";
 import {
@@ -122,6 +124,7 @@ export interface DaemonOptions {
   >;
   onSettlementTransition?: (snapshot: Readonly<SettlementRunSnapshot>) => void;
   startupInventory?: () => Promise<RuntimeInfo[]>;
+  onUpdateHandoff?: () => void;
 }
 
 function cleanEnv(env: NodeJS.ProcessEnv): Record<string, string> {
@@ -242,6 +245,7 @@ export function runDaemon(
   const lifecycleTails = new Map<string, Promise<void>>();
   const settlementDebugPhases = new Map<string, SettlementRunSnapshot["phase"]>();
   let peerObservers: PeerObserverHandle | undefined;
+  let updateHandoffRequested = false;
   const debug =
     options.debug ?? (socketPath === daemonSocketPath() ? writeDaemonDebug : () => undefined);
 
@@ -620,6 +624,8 @@ export function runDaemon(
               viewers: session.viewers.size,
             })),
             intents: [...busyTaskNames].map((task) => ({ task })),
+            backgroundWork:
+              intentTails.size + lifecycleTails.size + (settlements.hasActiveRuns() ? 1 : 0),
           });
           return;
         }
@@ -794,10 +800,49 @@ export function runDaemon(
     fleetGossip = setTimeout(() => {
       debug("Polling fleet peers because the scheduled synchronization is due.");
       void gossipFleetMembership()
-        .then((summary) => {
+        .then(async (summary) => {
           debug(
             `Fleet synchronization contacted ${summary.attempted} peer${summary.attempted === 1 ? "" : "s"}; ${summary.failures.length} failed.`,
           );
+          const release = await reconcileFleetRelease();
+          if (release.status === "updated") debug("Installed the fleet's desired Boxers release.");
+          if (release.detail)
+            debug(
+              `Fleet release reconciliation is ${release.status}: ${debugValue(release.detail)}.`,
+            );
+          const sessionsSafe = [...sessions.values()].every((session) => {
+            if (session.state === "exited") return true;
+            if (!session.taskName) return false;
+            for (const project of listProjects()) {
+              const task = listTasks(project).find(
+                (candidate) => candidate.name.toLowerCase() === session.taskName?.toLowerCase(),
+              );
+              if (task) return readTaskState(project, task).agentTurnState === "awaiting_input";
+            }
+            return false;
+          });
+          if (
+            !updateHandoffRequested &&
+            fleetReleaseNeedsDaemonHandoff() &&
+            sessionsSafe &&
+            !busyTaskNames.size &&
+            !intentTails.size &&
+            !lifecycleTails.size &&
+            !settlements.hasActiveRuns()
+          ) {
+            updateHandoffRequested = true;
+            debug(
+              "The desired Boxers release is installed and daemon work is at a safe handoff boundary.",
+            );
+            if (options.onUpdateHandoff) options.onUpdateHandoff();
+            else if (socketPath === daemonSocketPath())
+              setTimeout(() => {
+                // systemd uses Restart=on-failure so normal `daemon stop`
+                // remains stopped while an update handoff is restarted.
+                process.exitCode = 75;
+                process.kill(process.pid, "SIGTERM");
+              }, 0);
+          }
           const nextFailures = summary.failures.length ? failedAttempts + 1 : 0;
           const nextDelay = summary.failures.length
             ? Math.min(5 * 60_000, 15_000 * 2 ** Math.min(nextFailures, 4))
@@ -932,6 +977,7 @@ export function daemonMain(): boolean {
     pid: process.pid,
     protocolVersion: DAEMON_PROTOCOL_VERSION,
     boxersVersion: readVersion(),
+    ...(activeReleaseBuildId() ? { boxersBuildId: activeReleaseBuildId() } : {}),
     startedAt: new Date().toISOString(),
   });
   const shutdown = (): void => {
@@ -941,7 +987,7 @@ export function daemonMain(): boolean {
       } catch {
         // Another startup safely handles a stale lock if shutdown is interrupted.
       }
-      process.exit(0);
+      process.exit(process.exitCode ?? 0);
     });
   };
   process.on("SIGTERM", shutdown);

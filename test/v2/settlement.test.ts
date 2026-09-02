@@ -125,8 +125,10 @@ describe("task settlement coordinator", () => {
     const deferredRun = coordinator.start("task", 5, async (context) => {
       context.defer();
     });
+    expect(coordinator.hasActiveRuns()).toBe(true);
     await deferredRun.completion;
     expect(coordinator.current("task")?.phase).toBe("queued");
+    expect(coordinator.hasActiveRuns()).toBe(false);
     expect(coordinator.start("task", 5, async () => undefined).status).toBe("duplicate");
     let resumed = false;
     const run = coordinator.resume("task", 5, async () => {

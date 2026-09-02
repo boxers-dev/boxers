@@ -139,6 +139,14 @@ export function fleetAdminStateLockPath(): string {
   return join(boxersHome(), "fleet-admin.lock");
 }
 
+export function fleetUpdatePath(): string {
+  return join(boxersHome(), "fleet-update.json");
+}
+
+export function fleetUpdateLockPath(): string {
+  return join(boxersHome(), "fleet-update.lock");
+}
+
 export function atomicWriteJson(path: string, value: unknown): void {
   atomicWriteText(path, `${JSON.stringify(value, null, 2)}\n`, 0o600);
 }

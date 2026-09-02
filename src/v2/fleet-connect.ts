@@ -17,6 +17,11 @@ import { isMachineSetupComplete } from "./machine-setup.ts";
 import { localMachineIdentity } from "./registry.ts";
 import { listRemoteMachines, queryRemoteMachine, type RemoteMachine } from "./machines.ts";
 import type { FleetMember, FleetRemoval, PeerRole } from "./types.ts";
+import {
+  mergeFleetUpdateState,
+  readFleetUpdateState,
+  type FleetUpdateState,
+} from "./fleet-update.ts";
 import type { RuntimeDiagnostic } from "./runtime/types.ts";
 import { installDaemonService } from "./service.ts";
 import {
@@ -347,17 +352,20 @@ export interface FleetSyncPayload {
   fleetId: string;
   members: FleetMember[];
   removedMembers: FleetRemoval[];
+  update?: FleetUpdateState | undefined;
   sentAt: string;
 }
 
 export function currentFleetSyncPayload(): FleetSyncPayload | undefined {
   const fleet = readFleet();
   if (!fleet) return undefined;
+  const update = readFleetUpdateState();
   return {
     version: 1,
     fleetId: fleet.fleetId,
     members: fleet.members,
     removedMembers: fleet.removedMembers ?? [],
+    ...(update.desired ? { update } : {}),
     sentAt: new Date().toISOString(),
   };
 }
@@ -392,6 +400,7 @@ export function acceptFleetSync(encoded: string): FleetSyncPayload {
 
 function acceptFleetSyncPayload(payload: FleetSyncPayload): FleetSyncPayload {
   mergeFleetSnapshot(payload.fleetId, payload.members, payload.removedMembers);
+  mergeFleetUpdateState(payload.update);
   const current = currentFleetSyncPayload() as FleetSyncPayload;
   reconcileManagedPeerAuthorizations(current.members, current.removedMembers);
   return current;
@@ -412,11 +421,12 @@ export async function gossipFleetMembership(): Promise<{
   const results = await Promise.all(
     machines.map(async (machine) => {
       try {
-        await runManagedSshCaptured(
+        const response = await runManagedSshCaptured(
           machine.sshHost,
           ["remote", "sync-fleet", encodeFleetSync(payload)],
           CONNECT_TIMEOUT_MS,
         );
+        if (response.trim()) acceptFleetSyncResponse(response);
         return undefined;
       } catch (error) {
         return {

@@ -132,6 +132,7 @@ export interface SessionsMessage {
   pid: number;
   sessions: SessionInfo[];
   intents: { task: string }[];
+  backgroundWork: number;
 }
 export interface ErrorMessage {
   type: "error";

@@ -54,7 +54,12 @@ vi.mock("../../src/v2/fleet.ts", () => ({
 vi.mock("../../src/v2/fleet-admin.ts", () => ({
   acceptManagedUpdate: vi.fn(() => ({ version: "1.2.3", executable: "boxers" })),
   doctorFleet: vi.fn(() => 0),
-  updateFleet: vi.fn(() => 0),
+}));
+
+vi.mock("../../src/v2/fleet-release.ts", () => ({
+  acceptFleetRelease: vi.fn(() => ({ version: 1, buildId: "build" })),
+  exportFleetRelease: vi.fn(() => Buffer.from("capsule")),
+  updateFleetRelease: vi.fn(() => 0),
 }));
 
 vi.mock("../../src/v2/service.ts", () => ({
@@ -87,6 +92,7 @@ vi.mock("../../src/v2/daemon-commands.ts", () => ({
   daemonStart: vi.fn(() => 0),
   daemonStatus: vi.fn(() => 0),
   daemonStop: vi.fn(() => 0),
+  runUpdateHandoffWorker: vi.fn(() => 0),
   runDaemonForeground: vi.fn(() => 0),
 }));
 
@@ -94,6 +100,7 @@ import { dispatch, UsageError } from "../../src/cli.ts";
 import * as commands from "../../src/v2/commands.ts";
 import * as daemonCommands from "../../src/v2/daemon-commands.ts";
 import * as fleetAdmin from "../../src/v2/fleet-admin.ts";
+import * as fleetRelease from "../../src/v2/fleet-release.ts";
 import * as fleetConnect from "../../src/v2/fleet-connect.ts";
 import * as machines from "../../src/v2/machines.ts";
 import * as service from "../../src/v2/service.ts";
@@ -113,6 +120,8 @@ describe("v2 CLI", () => {
     expect(output).toContain("boxers [<machine>/]<task> discard");
     expect(output).toContain("boxers debug shell <task>");
     expect(output).toContain("boxers debug daemon");
+    expect(output).toContain("boxers update");
+    expect(output).not.toContain("boxers update (--host");
     expect(output).toContain("boxers daemon install");
     expect(output).toContain("boxers daemon start");
     expect(output).toContain("boxers daemon restart [--force]");
@@ -327,6 +336,11 @@ describe("v2 CLI", () => {
     await dispatch(["__daemon-run"]);
     expect(daemonCommands.runDaemonForeground).toHaveBeenLastCalledWith();
     await expect(dispatch(["debug", "daemon", "extra"])).rejects.toBeInstanceOf(UsageError);
+
+    await dispatch(["__update-continue"]);
+    expect(fleetRelease.updateFleetRelease).toHaveBeenLastCalledWith({ skipRegistry: true });
+    await dispatch(["__update-handoff", "a".repeat(64)]);
+    expect(daemonCommands.runUpdateHandoffWorker).toHaveBeenCalledWith("a".repeat(64));
   });
 
   it("parses reciprocal fleet connection, administration, and private synchronization", async () => {
@@ -361,13 +375,20 @@ describe("v2 CLI", () => {
       },
     );
 
-    await dispatch(["update", "--all", "--to", "1.2.3"]);
-    expect(fleetAdmin.updateFleet).toHaveBeenCalledWith({ all: true, version: "1.2.3" });
+    await dispatch(["update"]);
+    expect(fleetRelease.updateFleetRelease).toHaveBeenLastCalledWith();
+    await expect(dispatch(["update", "--all"])).rejects.toBeInstanceOf(UsageError);
 
     const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
     await dispatch(["remote", "sync-fleet", "payload"]);
     expect(fleetConnect.acceptFleetSync).toHaveBeenCalledWith("payload");
     expect(write).toHaveBeenCalledWith(expect.stringContaining('"fleetId":"fleet"'));
+
+    await dispatch(["remote", "install-release", "signed-state"]);
+    expect(fleetRelease.acceptFleetRelease).toHaveBeenCalledWith("signed-state");
+    await dispatch(["remote", "export-release", "a".repeat(64)]);
+    expect(fleetRelease.exportFleetRelease).toHaveBeenCalledWith("a".repeat(64));
+    expect(write).toHaveBeenCalledWith(Buffer.from("capsule"));
     write.mockRestore();
   });
 

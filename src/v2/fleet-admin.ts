@@ -18,6 +18,8 @@ import {
 } from "./paths.ts";
 import { withPidFileLock } from "./lock.ts";
 import { managedSshArgs } from "./ssh-transport.ts";
+import { reconcileManagedPeerAuthorizations } from "./ssh-identity.ts";
+import { stableExecutablePath } from "./release.ts";
 
 interface AdminRequestBody {
   fleetId: string;
@@ -198,6 +200,13 @@ export function acceptManagedUpdate(encoded: string): {
   const executable = join(installRoot, "node_modules", ".bin", "boxers");
   const stable = join(homedir(), ".local", "bin", "boxers");
   activateManagedExecutable(executable, request.version, stable);
+  const fleet = readFleet();
+  if (fleet)
+    reconcileManagedPeerAuthorizations(
+      fleet.members,
+      fleet.removedMembers ?? [],
+      stableExecutablePath(),
+    );
   return {
     version: request.version,
     executable: stable,
@@ -230,65 +239,6 @@ export function activateManagedExecutable(
   } finally {
     if (existsSync(temporary)) unlinkSync(temporary);
   }
-}
-
-export async function updateFleet(options: {
-  host?: string;
-  all: boolean;
-  version?: string;
-}): Promise<number> {
-  const version = options.version ?? readVersion();
-  const normalized = options.host?.toLowerCase();
-  const machines = listRemoteMachines().filter(
-    (machine) =>
-      options.all ||
-      (normalized !== undefined &&
-        (machine.id.toLowerCase() === normalized ||
-          machine.name.toLowerCase() === normalized ||
-          machine.sshHost.toLowerCase() === normalized)),
-  );
-  if (!machines.length)
-    throw new Error(
-      options.all ? "No remote fleet hosts are registered." : `Unknown host "${options.host}".`,
-    );
-  const request = encodeAdminRequest(version);
-  const results = await Promise.all(
-    machines.map(async (machine) => {
-      try {
-        const result = JSON.parse(await sshCaptured(machine, ["remote", "update", request])) as {
-          version?: unknown;
-          executable?: unknown;
-          daemonRestartRequired?: unknown;
-        };
-        if (
-          result.version !== version ||
-          typeof result.executable !== "string" ||
-          (result.daemonRestartRequired !== undefined &&
-            typeof result.daemonRestartRequired !== "boolean")
-        )
-          throw new Error("Remote returned an invalid update result.");
-        return {
-          machine,
-          ok: true as const,
-          executable: result.executable,
-          daemonRestartRequired: result.daemonRestartRequired === true,
-        };
-      } catch (error) {
-        return {
-          machine,
-          ok: false as const,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
-    }),
-  );
-  for (const result of results)
-    process.stdout.write(
-      result.ok
-        ? `Updated ${result.machine.name} to Boxers ${version}${result.daemonRestartRequired ? "; daemon restart deferred until active sessions are safe to hand off" : ""}.\n`
-        : `FAILED  ${result.machine.name}: ${result.error}\n`,
-    );
-  return results.every((result) => result.ok) ? 0 : 1;
 }
 
 export async function doctorFleet(

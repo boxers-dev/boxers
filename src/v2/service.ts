@@ -21,20 +21,27 @@ export interface DaemonServiceStatus {
   pid?: number;
   protocolVersion?: number;
   boxersVersion?: string;
+  boxersBuildId?: string;
   startedAt?: string;
   platform: string;
   detail: string;
 }
 
-function daemonHealth(
-  pid: number,
-): { protocolVersion: number; boxersVersion: string; startedAt?: string } | undefined {
+function daemonHealth(pid: number):
+  | {
+      protocolVersion: number;
+      boxersVersion: string;
+      boxersBuildId?: string;
+      startedAt?: string;
+    }
+  | undefined {
   try {
     const value = readJson<{
       version: number;
       pid: number;
       protocolVersion: number;
       boxersVersion: string;
+      boxersBuildId?: string;
       startedAt?: string;
     }>(daemonHealthPath());
     return value.version === 1 &&
@@ -44,6 +51,9 @@ function daemonHealth(
       ? {
           protocolVersion: value.protocolVersion,
           boxersVersion: value.boxersVersion,
+          ...(typeof value.boxersBuildId === "string"
+            ? { boxersBuildId: value.boxersBuildId }
+            : {}),
           ...(typeof value.startedAt === "string" ? { startedAt: value.startedAt } : {}),
         }
       : undefined;
@@ -172,13 +182,16 @@ export function daemonServiceStatus(): DaemonServiceStatus {
 }
 
 export function installDaemonService(executable: string): DaemonServiceStatus {
-  const resolved = isAbsolute(executable) ? executableFile(executable) : undefined;
-  if (!resolved)
+  const validated = isAbsolute(executable) ? executableFile(executable) : undefined;
+  if (!validated)
     throw new Error("The Boxers service requires an absolute path to an executable file.");
+  // Preserve an explicitly supplied stable symlink. Resolving it here would pin
+  // the service manager to one content-addressed release and defeat safe handoff.
+  const launcher = executable;
   if (platform() === "linux") {
     const path = systemdUnitPath();
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    const escaped = resolved.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+    const escaped = launcher.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
     writeFileSync(
       path,
       `[Unit]\nDescription=Boxers task daemon\n\n[Service]\nType=simple\nExecStart="${escaped}" __daemon-run\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n`,
@@ -196,7 +209,7 @@ export function installDaemonService(executable: string): DaemonServiceStatus {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     writeFileSync(
       path,
-      `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>io.boxers.daemon</string><key>ProgramArguments</key><array><string>${xml(resolved)}</string><string>__daemon-run</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n`,
+      `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>io.boxers.daemon</string><key>ProgramArguments</key><array><string>${xml(launcher)}</string><string>__daemon-run</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n`,
       { mode: 0o600 },
     );
     // A lazily started daemon may already own durable PTYs. Install the

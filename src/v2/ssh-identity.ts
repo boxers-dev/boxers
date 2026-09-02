@@ -213,12 +213,12 @@ export function acceptPeerAuthorization(encoded: string): void {
 export function reconcileManagedPeerAuthorizations(
   members: readonly FleetMember[],
   removedMembers: readonly FleetRemoval[],
+  gatewayExecutable = process.env["BOXERS_EXECUTABLE"] ?? process.argv[1] ?? "boxers",
 ): void {
   const localId = localMachineIdentity().id;
-  const executable = process.env["BOXERS_EXECUTABLE"] ?? process.argv[1] ?? "boxers";
   for (const member of members) {
     if (member.hostId !== localId && member.ssh)
-      authorizeManagedPeer(member.hostId, member.ssh.publicKey, executable);
+      authorizeManagedPeer(member.hostId, member.ssh.publicKey, gatewayExecutable);
   }
   for (const removal of removedMembers) {
     if (removal.hostId !== localId) revokeManagedPeer(removal.hostId);

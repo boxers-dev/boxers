@@ -10,7 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { activateManagedExecutable, doctorFleet, updateFleet } from "../../src/v2/fleet-admin.ts";
+import { activateManagedExecutable, doctorFleet } from "../../src/v2/fleet-admin.ts";
 import { enrollFleetMember, ensureFleet } from "../../src/v2/fleet.ts";
 import {
   canonicalSshPublicKey,
@@ -67,7 +67,7 @@ describe("managed fleet update activation", () => {
     expect(readlinkSync(stable)).toBe(candidate);
   });
 
-  it("fans update and doctor out while retaining partial-outage results", async () => {
+  it("fans doctor out while retaining partial-outage results", async () => {
     const state = mkdtempSync(join(tmpdir(), "boxers-fleet-admin-state-"));
     const bin = mkdtempSync(join(tmpdir(), "boxers-fleet-admin-bin-"));
     cleanup.push(state, bin);
@@ -100,7 +100,6 @@ case "$*" in
     for token do :; done
     decoded=$(node -e 'const value=JSON.parse(Buffer.from(process.argv[1], "base64url")); process.stdout.write(value.args.join(" "))' "$token")
     case "$decoded" in
-      "remote update "*) printf '%s\n' '{"version":"1.2.3","executable":"/managed/boxers","daemonRestartRequired":true}' ;;
       "doctor --json"*) printf '%s\n' '{"ok":true,"warnings":[],"checks":[{"name":"daemon","ok":true,"detail":"ready","remediation":{"kind":"manual","value":"none"}}]}' ;;
       *) printf '%s\n' 'host unavailable' >&2; exit 1 ;;
     esac
@@ -114,11 +113,6 @@ esac
     const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
     vi.spyOn(process.stderr, "write").mockReturnValue(true);
 
-    await expect(updateFleet({ all: true, version: "1.2.3" })).resolves.toBe(1);
-    expect(stdout.mock.calls.flat().join("")).toContain("Updated good");
-    expect(stdout.mock.calls.flat().join("")).toContain("FAILED  down");
-
-    stdout.mockClear();
     await expect(
       doctorFleet(
         { ok: true, warnings: [], checks: [] },

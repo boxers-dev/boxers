@@ -4,6 +4,7 @@ import { listRemoteMachines, queryRemoteMachine, type RemoteMachine } from "./ma
 import { readCachedPeerView, writeCachedPeerView } from "./peer-cache-store.ts";
 import { localMachineIdentity } from "./registry.ts";
 import type { HostStatusObservation, MachineView } from "./types.ts";
+import { fleetReleaseIsAcknowledged, readFleetUpdateState } from "./fleet-update.ts";
 
 export interface FleetHostStatusView {
   id: string;
@@ -12,6 +13,7 @@ export interface FleetHostStatusView {
   observedAt?: string;
   status?: HostStatusObservation;
   detail?: string;
+  update?: "current" | "pending" | "failed" | "none";
 }
 
 function matches(machine: RemoteMachine, reference: string): boolean {
@@ -43,11 +45,23 @@ export async function fleetHostStatusViews(options: {
   if (localSelected) {
     const recorded = readHostStatus();
     const status = options.refresh || !recorded ? collectHostStatus() : recorded;
+    const update = readFleetUpdateState();
+    const localUpdate = update.acknowledgements.find(
+      (acknowledgement) => acknowledgement.body.hostId === identity.id,
+    );
     views.push({
       id: identity.id,
       name: `${identity.name} (local)`,
       connection: "local",
       ...(status ? { status, observedAt: status.observedAt } : {}),
+      ...(localUpdate?.body.detail ? { detail: localUpdate.body.detail } : {}),
+      update: update.desired
+        ? fleetReleaseIsAcknowledged(identity.id, update)
+          ? "current"
+          : localUpdate?.body.status === "failed"
+            ? "failed"
+            : "pending"
+        : "none",
     });
   }
   const remotes = await Promise.all(
@@ -55,6 +69,7 @@ export async function fleetHostStatusViews(options: {
       const view = options.refresh
         ? writeCachedPeerView(machine, await queryRemoteMachine(machine, true))
         : readCachedPeerView(machine);
+      const detail = view.detail ?? view.snapshot?.boxersUpdate?.detail;
       return {
         id: machine.id,
         name: machine.name,
@@ -64,7 +79,8 @@ export async function fleetHostStatusViews(options: {
           : view.snapshot
             ? { observedAt: view.snapshot.observedAt }
             : {}),
-        ...(view.detail ? { detail: view.detail } : {}),
+        ...(detail ? { detail } : {}),
+        update: view.snapshot?.boxersUpdate?.status ?? "none",
       } satisfies FleetHostStatusView;
     }),
   );
@@ -107,6 +123,7 @@ export async function showFleetStatus(options: {
         "OBSERVED",
         "HEALTH",
         "VERSION",
+        "UPDATE",
         "DAEMON",
         "CODEX",
         "CLAUDE",
@@ -120,6 +137,7 @@ export async function showFleetStatus(options: {
         view.observedAt ? humanTimestamp(view.observedAt) : "never",
         view.status?.health ?? "unknown",
         view.status?.boxersVersion ?? "unknown",
+        view.update ?? "none",
         view.status?.daemon ?? "unknown",
         view.status?.authentication.codex ?? "unknown",
         view.status?.authentication.claude ?? "unknown",

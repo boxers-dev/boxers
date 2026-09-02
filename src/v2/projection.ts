@@ -4,6 +4,7 @@ import { listProjects, listTasks, localMachineIdentity } from "./registry.ts";
 import { readTaskState, taskNeedsAttention } from "./state.ts";
 import type { RemoteSnapshot, TaskProjectionPhase, TaskState, TaskSnapshot } from "./types.ts";
 import { readHostStatus } from "./host-status.ts";
+import { fleetReleaseIsAcknowledged, readFleetUpdateState } from "./fleet-update.ts";
 
 function projectionPhase(snapshot: TaskSnapshot, state: TaskState): TaskProjectionPhase {
   if (state.agentTurnState === "working") return "working";
@@ -31,6 +32,11 @@ function projectionPhase(snapshot: TaskSnapshot, state: TaskState): TaskProjecti
 export function captureStateProjection(): RemoteSnapshot {
   const projects = listProjects();
   const hostStatus = readHostStatus();
+  const update = readFleetUpdateState();
+  const localId = localMachineIdentity().id;
+  const localUpdate = update.acknowledgements.find(
+    (acknowledgement) => acknowledgement.body.hostId === localId,
+  );
   const servedAt = new Date().toISOString();
   let observedAt = servedAt;
   const tasks = projects.flatMap((project) =>
@@ -68,6 +74,20 @@ export function captureStateProjection(): RemoteSnapshot {
     observedAt,
     servedAt,
     ...(hostStatus ? { hostStatus } : {}),
+    ...(update.desired
+      ? {
+          boxersUpdate: {
+            desiredBuildId: update.desired.body.release.buildId,
+            desiredVersion: update.desired.body.release.packageVersion,
+            status: fleetReleaseIsAcknowledged(localId, update)
+              ? ("current" as const)
+              : localUpdate?.body.status === "failed"
+                ? ("failed" as const)
+                : ("pending" as const),
+            ...(localUpdate?.body.detail ? { detail: localUpdate.body.detail } : {}),
+          },
+        }
+      : {}),
     projects: projects.map((project) => ({
       id: project.id,
       name: basename(project.root),

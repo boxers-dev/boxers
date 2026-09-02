@@ -140,6 +140,33 @@ Both SSH targets must be reachable from their reciprocal machine. Boxers uses
 standard SSH host aliases, so stable LAN DNS or an overlay network such as
 Tailscale can provide the addresses for laptops that move between networks.
 
+Update Boxers as one fleet:
+
+```sh
+boxers update
+```
+
+Boxers first checks npm for a newer official release and offers to install it
+on the local machine. It then distributes the exact active application build
+to every connected machine. Runtime dependencies are installed separately on
+each host, so native packages such as `node-pty` match that host's operating
+system, CPU architecture, and Node.js ABI. Connected hosts use npm for
+dependencies only when their required runtime layer is missing; the initiating
+machine also uses npm for the optional official-release check.
+
+The selected build is recorded as durable fleet state. An offline machine is
+reported as pending and updates automatically after reconnecting by fetching
+the cached application payload from an updated peer. A machine that still has
+the legacy gateway performs one final npm bootstrap before joining this flow.
+A newer `boxers update` supersedes an older pending rollout. Existing agent
+sessions continue until a provider-confirmed safe daemon handoff boundary.
+Boxers never downgrades a newer official release without an explicit
+fleet-wide confirmation.
+
+When Boxers is run from its own source checkout, `boxers update` builds that
+checkout automatically and distributes the resulting development build. No
+publish or package step is required.
+
 ## Health and authentication
 
 ```sh

@@ -31,6 +31,7 @@ import {
   daemonStart,
   daemonStatus,
   daemonStop,
+  runUpdateHandoffWorker,
   runDaemonForeground,
 } from "./v2/daemon-commands.ts";
 import { runSetupWorker } from "./v2/setup.ts";
@@ -58,7 +59,8 @@ import {
 } from "./v2/ssh-identity.ts";
 import { runSshGateway } from "./v2/ssh-transport.ts";
 import { readFleet } from "./v2/fleet.ts";
-import { acceptManagedUpdate, doctorFleet, updateFleet } from "./v2/fleet-admin.ts";
+import { acceptManagedUpdate, doctorFleet } from "./v2/fleet-admin.ts";
+import { acceptFleetRelease, exportFleetRelease, updateFleetRelease } from "./v2/fleet-release.ts";
 import {
   daemonServiceStatus,
   installDaemonService,
@@ -75,7 +77,7 @@ General
   boxers doctor [--agent codex|claude] [--host <host>|--all] [--json]
       [--acknowledge-open-network]
   boxers status [--host <host>] [--refresh] [--json]
-  boxers update (--host <host>|--all) [--to <version>]
+  boxers update
 
 Auth
   boxers auth claude
@@ -429,6 +431,14 @@ export async function dispatch(argv: string[]): Promise<number> {
     if (!payload || unexpected.length) throw new Error("Invalid daemon intent worker invocation.");
     return runDaemonIntentWorker(payload);
   }
+  if (argv[0] === "__update-continue") {
+    if (argv.length !== 1) throw new Error("Invalid Boxers update continuation invocation.");
+    return updateFleetRelease({ skipRegistry: true });
+  }
+  if (argv[0] === "__update-handoff") {
+    if (argv.length !== 2) throw new Error("Invalid Boxers update handoff invocation.");
+    return runUpdateHandoffWorker(argv[1] as string);
+  }
   const [first, ...rest] = argv;
   if (first === undefined || first === "help" || first === "-h" || first === "--help") {
     process.stdout.write(USAGE);
@@ -466,21 +476,8 @@ export async function dispatch(argv: string[]): Promise<number> {
     return showFleetStatus({ refresh, ...(host ? { host } : {}), json });
   }
   if (first === "update") {
-    let host: string | undefined;
-    let all = false;
-    let version: string | undefined;
-    for (let index = 0; index < rest.length; index++) {
-      const arg = rest[index];
-      if (arg === "--host") host = value(rest, index++, arg);
-      else if (arg?.startsWith("--host=")) host = arg.slice(7);
-      else if (arg === "--all") all = true;
-      else if (arg === "--to") version = value(rest, index++, arg);
-      else if (arg?.startsWith("--to=")) version = arg.slice(5);
-      else throw new UsageError(`Unexpected argument for update: ${arg}`);
-    }
-    if (Boolean(host) === all)
-      throw new UsageError("update requires exactly one of --host or --all.");
-    return updateFleet({ ...(host ? { host } : {}), all, ...(version ? { version } : {}) });
+    only(rest, [], "update");
+    return updateFleetRelease();
   }
   if (first === "auth") {
     const [agentValue, ...authArgs] = rest;
@@ -703,6 +700,17 @@ export async function dispatch(argv: string[]): Promise<number> {
     if (command === "update") {
       if (args.length !== 1) throw new UsageError("remote update requires one request.");
       process.stdout.write(`${JSON.stringify(acceptManagedUpdate(args[0] as string))}\n`);
+      return 0;
+    }
+    if (command === "install-release") {
+      if (args.length !== 1)
+        throw new UsageError("remote install-release requires one fleet state payload.");
+      process.stdout.write(`${JSON.stringify(acceptFleetRelease(args[0] as string))}\n`);
+      return 0;
+    }
+    if (command === "export-release") {
+      if (args.length !== 1) throw new UsageError("remote export-release requires one build ID.");
+      process.stdout.write(exportFleetRelease(args[0] as string));
       return 0;
     }
     if (command === "snapshot") {

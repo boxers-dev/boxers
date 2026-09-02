@@ -75,6 +75,15 @@ export function parseRemoteSnapshot(text: string): RemoteSnapshot {
     throw new Error("Remote returned an invalid project snapshot.");
   if (snapshot.hostStatus !== undefined && !isHostStatusObservation(snapshot.hostStatus))
     throw new Error("Remote returned an invalid host status observation.");
+  if (
+    snapshot.boxersUpdate !== undefined &&
+    (typeof snapshot.boxersUpdate.desiredBuildId !== "string" ||
+      typeof snapshot.boxersUpdate.desiredVersion !== "string" ||
+      !["current", "pending", "failed"].includes(snapshot.boxersUpdate.status) ||
+      (snapshot.boxersUpdate.detail !== undefined &&
+        typeof snapshot.boxersUpdate.detail !== "string"))
+  )
+    throw new Error("Remote returned an invalid Boxers update observation.");
   const phases = new Set([
     "creating",
     "active",

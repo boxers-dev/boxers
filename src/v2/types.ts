@@ -301,6 +301,14 @@ export interface RemoteSnapshot {
   servedAt?: string | undefined;
   projects?: RemoteProjectSnapshot[] | undefined;
   hostStatus?: HostStatusObservation | undefined;
+  boxersUpdate?:
+    | {
+        desiredBuildId: string;
+        desiredVersion: string;
+        status: "current" | "pending" | "failed";
+        detail?: string;
+      }
+    | undefined;
   tasks: RemoteTaskSnapshot[];
 }
 

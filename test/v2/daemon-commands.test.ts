@@ -9,11 +9,13 @@ import {
   daemonStatus,
   daemonStop,
   isBoxersDaemonCommand,
+  runUpdateHandoffWorker,
   tailDaemonLog,
   waitForProcessExit,
 } from "../../src/v2/daemon-commands.ts";
 import {
   daemonLockPath,
+  daemonHealthPath,
   daemonLogPath,
   daemonPidPath,
   daemonSocketPath,
@@ -119,6 +121,24 @@ function registerSessionTask(sessionId: string, agentTurnState: AgentTurnState):
 }
 
 describe("daemon lifecycle safety", () => {
+  it("finishes an update handoff worker when the daemon reports the expected build", async () => {
+    home = mkdtempSync(join(tmpdir(), "boxers-daemon-handoff-"));
+    process.env.BOXERS_HOME = home;
+    const buildId = "a".repeat(64);
+    writeFileSync(daemonPidPath(), `${process.pid}\n`);
+    writeFileSync(
+      daemonHealthPath(),
+      `${JSON.stringify({
+        version: 1,
+        pid: process.pid,
+        protocolVersion: 1,
+        boxersVersion: "1.2.3",
+        boxersBuildId: buildId,
+      })}\n`,
+    );
+    await expect(runUpdateHandoffWorker(buildId, 1)).resolves.toBe(0);
+  });
+
   it("keeps a service waiter alive until the existing daemon exits", async () => {
     vi.useFakeTimers();
     let alive = true;
@@ -269,7 +289,19 @@ describe("daemon lifecycle safety", () => {
       sessions: [],
       intents: [{ task: "reviewing" }],
     });
-    await expect(daemonStop()).rejects.toThrow(/0 agent session.*1 intent/s);
+    await expect(daemonStop()).rejects.toThrow(/0 agent session.*1 intent.*0 background/s);
+    expect(kill.mock.calls.some((call: unknown[]) => call[1] === "SIGTERM")).toBe(false);
+  });
+
+  it("refuses to stop while daemon background work is active", async () => {
+    const kill = await activityFixture({
+      type: "sessions",
+      pid: 424_242,
+      sessions: [],
+      intents: [],
+      backgroundWork: 1,
+    });
+    await expect(daemonStop()).rejects.toThrow(/1 background operation/);
     expect(kill.mock.calls.some((call: unknown[]) => call[1] === "SIGTERM")).toBe(false);
   });
 
@@ -286,17 +318,21 @@ describe("daemon lifecycle safety", () => {
   });
 
   it("stops the live socket owner when the PID file is stale", async () => {
-    const kill = await activityFixture({
-      type: "sessions",
-      pid: 424_242,
-      sessions: [],
-      intents: [],
-    }, 424_243);
+    const kill = await activityFixture(
+      {
+        type: "sessions",
+        pid: 424_242,
+        sessions: [],
+        intents: [],
+      },
+      424_243,
+    );
     vi.spyOn(process.stdout, "write").mockReturnValue(true);
 
     await expect(daemonStop()).resolves.toBe(0);
-    expect(kill.mock.calls.some((call: unknown[]) => call[0] === 424_242 && call[1] === "SIGTERM"))
-      .toBe(true);
+    expect(
+      kill.mock.calls.some((call: unknown[]) => call[0] === 424_242 && call[1] === "SIGTERM"),
+    ).toBe(true);
   });
 
   it("force-stops a verified daemon without querying its socket", async () => {
@@ -368,8 +404,9 @@ describe("daemon lifecycle safety", () => {
     vi.spyOn(process.stderr, "write").mockReturnValue(true);
 
     await expect(daemonStop(true, () => "/usr/local/bin/boxers debug daemon")).resolves.toBe(0);
-    expect(kill.mock.calls.some((call: unknown[]) => call[0] === 424_242 && call[1] === "SIGTERM"))
-      .toBe(true);
+    expect(
+      kill.mock.calls.some((call: unknown[]) => call[0] === 424_242 && call[1] === "SIGTERM"),
+    ).toBe(true);
   });
 
   it("reports an active but unresponsive daemon accurately", async () => {

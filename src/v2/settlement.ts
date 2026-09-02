@@ -165,10 +165,12 @@ export class SettlementCoordinator {
       .then(() => work(context))
       .then(() => {
         if (active.abort.signal.aborted || active.deferred || active.terminal) return;
+        active.terminal = true;
         this.#finish(key, snapshot.runId, "ready");
       })
       .catch((error: unknown) => {
         if (active.abort.signal.aborted) return;
+        active.terminal = true;
         this.#finish(
           key,
           snapshot.runId,
@@ -215,6 +217,12 @@ export class SettlementCoordinator {
     const runs = [...this.#runs.values()];
     for (const active of runs) active.abort.abort();
     await Promise.allSettled(runs.map((active) => active.completion));
+  }
+
+  hasActiveRuns(): boolean {
+    return [...this.#runs.values()].some(
+      (active) => !active.abort.signal.aborted && !active.deferred && !active.terminal,
+    );
   }
 
   #now(): string {

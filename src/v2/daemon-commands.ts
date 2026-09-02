@@ -9,6 +9,9 @@ import { taskRuntimeId } from "./runtime/task.ts";
 import { readTaskState } from "./state.ts";
 import type { AgentTurnState } from "./types.ts";
 import { daemonProcessCommandLine, isBoxersDaemonCommand } from "./daemon-identity.ts";
+import { daemonServiceStatus } from "./service.ts";
+import { rollbackManagedRelease } from "./release.ts";
+import { recordFleetReleaseFailure } from "./fleet-update.ts";
 
 export { isBoxersDaemonCommand } from "./daemon-identity.ts";
 
@@ -264,7 +267,10 @@ export async function daemonStop(
     const boundary = sessionRestartBoundary(session.sessionId);
     return boundary.safe ? [] : [{ session, boundary }];
   });
-  if (blockingSessions.length || status.intents.length) {
+  const legacySettlementWork =
+    status.backgroundWork === undefined && persistedSettlementInProgress();
+  const backgroundWork = status.backgroundWork ?? (legacySettlementWork ? 1 : 0);
+  if (blockingSessions.length || status.intents.length || backgroundWork) {
     const details = blockingSessions
       .map(({ session, boundary }) =>
         boundary.taskName
@@ -273,7 +279,7 @@ export async function daemonStop(
       )
       .join(", ");
     throw new Error(
-      `The daemon still owns ${blockingSessions.length} agent session(s) that are working or not confirmed to be awaiting input${details ? `: ${details}` : ""}, and ${status.intents.length} intent(s). Finish them before restarting the daemon; stopping now would interrupt durable task work.`,
+      `The daemon still owns ${blockingSessions.length} agent session(s) that are working or not confirmed to be awaiting input${details ? `: ${details}` : ""}, ${status.intents.length} intent(s), and ${backgroundWork} background operation(s). Finish them before restarting the daemon; stopping now would interrupt durable task work.`,
     );
   }
   return stopDaemonProcess(status.pid, false);
@@ -289,10 +295,53 @@ export async function daemonRestart(
   return start();
 }
 
+/** Wait for the provider-confirmed safe boundary used by automatic update handoff. */
+export async function runUpdateHandoffWorker(
+  expectedBuildId: string,
+  intervalMs = 15_000,
+): Promise<number> {
+  if (!/^[a-f0-9]{64}$/.test(expectedBuildId))
+    throw new Error("Invalid Boxers update handoff build ID.");
+  while (daemonServiceStatus().boxersBuildId !== expectedBuildId) {
+    try {
+      await daemonRestart(false);
+    } catch (error) {
+      if (!daemonServiceStatus().active && rollbackManagedRelease(expectedBuildId)) {
+        try {
+          recordFleetReleaseFailure(
+            `Daemon handoff failed and the previous release was restored: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        } catch {
+          // Local-only updates have no fleet rollout to mark failed.
+        }
+        await daemonRestart(false);
+        return 1;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+  return 0;
+}
+
 interface SessionsQuery {
   pid: number;
   sessions: { sessionId: string; state: string; viewers: number }[];
   intents: { task: string }[];
+  backgroundWork?: number;
+}
+
+function persistedSettlementInProgress(): boolean {
+  return listRegisteredTasks().some(({ project, task }) => {
+    try {
+      const phase = readTaskState(project, task).settlement?.phase;
+      return Boolean(
+        phase &&
+        ["refreshing", "reconciling", "capturing", "checking", "generating"].includes(phase),
+      );
+    } catch {
+      return true;
+    }
+  });
 }
 
 interface SessionRestartBoundary {
@@ -357,7 +406,9 @@ function querySessions(): Promise<SessionsQuery> {
                 typeof session.viewers === "number",
             ) ||
             !Array.isArray(message.intents) ||
-            !message.intents.every((intent) => intent && typeof intent.task === "string")
+            !message.intents.every((intent) => intent && typeof intent.task === "string") ||
+            (message.backgroundWork !== undefined &&
+              (!Number.isSafeInteger(message.backgroundWork) || message.backgroundWork < 0))
           ) {
             finish(new Error("The daemon returned an invalid activity response."));
             return;
