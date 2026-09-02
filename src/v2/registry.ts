@@ -124,10 +124,7 @@ function remoteUrl(project: ProjectManifest): string | undefined {
 }
 
 /** Credential-free identity used only to discover equivalent checkouts. */
-export function canonicalProjectSource(project: ProjectManifest): string | undefined {
-  if (project.source) return project.source;
-  const source = remoteUrl(project);
-  if (!source) return undefined;
+export function canonicalizeProjectSource(source: string): string {
   if (source.includes("://")) {
     try {
       const url = new URL(source);
@@ -140,6 +137,13 @@ export function canonicalProjectSource(project: ProjectManifest): string | undef
   const scp = /^(?:[^@/:]+@)?([^/:]+):(.+)$/.exec(source);
   if (scp) return `${scp[1]!.toLowerCase()}/${scp[2]!.replace(/\.git$/, "")}`;
   return source.replace(/\.git$/, "");
+}
+
+/** Credential-free identity used only to discover equivalent checkouts. */
+export function canonicalProjectSource(project: ProjectManifest): string | undefined {
+  if (project.source) return project.source;
+  const source = remoteUrl(project);
+  return source ? canonicalizeProjectSource(source) : undefined;
 }
 
 /** Clone URL stays host-side and may use the user's normal Git authentication. */

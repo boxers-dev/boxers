@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { writeStderr, writeStdout } from "../core/output.ts";
 import {
@@ -37,6 +37,8 @@ import { atomicWriteText, checkoutsDir, projectDir, taskDir, taskRepairLogPath }
 import { command, commandWithInput, requireSuccess } from "./process.ts";
 import {
   assertTaskNameAvailable,
+  canonicalizeProjectSource,
+  canonicalProjectSource,
   createTaskManifest,
   findProject,
   initProject,
@@ -938,32 +940,49 @@ export async function newTaskInProject(
   projectReference: string,
   name: string,
   options: NewTaskOptions,
-  provision?: { source: string; base: string },
+  provision?: { source: string; base: string; destination?: string },
 ): Promise<number> {
   let project: ProjectManifest;
-  try {
-    project = projectByReference(projectReference);
-  } catch (error) {
-    if (
-      !provision ||
-      !(error instanceof Error) ||
-      error.message !== `Unknown project "${projectReference}" on this machine.`
-    )
-      throw error;
-    if (
-      !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(projectReference) ||
-      projectReference === "." ||
-      projectReference === ".."
-    )
-      throw new Error(`Project reference "${projectReference}" is not safe as a checkout name.`);
-    const checkoutRoot = checkoutsDir();
-    mkdirSync(checkoutRoot, { recursive: true, mode: 0o700 });
-    const status = await cloneAndInitializeProject(
-      provision.source,
-      provision.base,
-      join(checkoutRoot, projectReference),
+  if (provision) {
+    if (provision.destination && !isAbsolute(provision.destination))
+      throw new Error("Remote clone destination must be absolute.");
+    const source = canonicalizeProjectSource(provision.source);
+    const matches = listProjects().filter(
+      (candidate) => canonicalProjectSource(candidate) === source,
     );
-    if (status !== 0) return status;
+    if (matches.length > 1)
+      throw new Error(
+        `Project source ${source} is registered more than once on this machine; remove the duplicate registration before creating a task remotely.`,
+      );
+    if (matches[0]) {
+      project = matches[0];
+      if (provision.destination && resolve(project.root) !== resolve(provision.destination))
+        throw new Error(
+          `Project ${basename(project.root)} is already registered at ${project.root}, not ${provision.destination}.`,
+        );
+    } else {
+      if (
+        !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(projectReference) ||
+        projectReference === "." ||
+        projectReference === ".."
+      )
+        throw new Error(`Project reference "${projectReference}" is not safe as a checkout name.`);
+      const checkoutRoot = checkoutsDir();
+      mkdirSync(checkoutRoot, { recursive: true, mode: 0o700 });
+      const status = await cloneAndInitializeProject(
+        provision.source,
+        provision.base,
+        provision.destination ?? join(checkoutRoot, projectReference),
+      );
+      if (status !== 0) return status;
+      const registered = listProjects().filter(
+        (candidate) => canonicalProjectSource(candidate) === source,
+      );
+      if (registered.length !== 1)
+        throw new Error(`Could not find the project registered after cloning ${provision.source}.`);
+      project = registered[0]!;
+    }
+  } else {
     project = projectByReference(projectReference);
   }
   process.chdir(project.root);

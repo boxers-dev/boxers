@@ -5,6 +5,7 @@ import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   canonicalProjectSource,
+  canonicalizeProjectSource,
   createTaskManifest,
   initProject,
   localMachineIdentity,
@@ -108,6 +109,9 @@ describe("sanitized project seed", () => {
 
     git(root, "remote", "add", "origin", "git@github.com:Owner/Repo.git");
     expect(canonicalProjectSource(project)).toBe("github.com/Owner/Repo");
+    expect(canonicalizeProjectSource("ssh://git@github.com/Owner/Repo.git")).toBe(
+      "github.com/Owner/Repo",
+    );
     git(root, "remote", "set-url", "origin", "https://token@github.com/Owner/Repo.git");
     expect(canonicalProjectSource(project)).toBe("github.com/Owner/Repo");
   });

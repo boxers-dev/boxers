@@ -108,6 +108,8 @@ Tasks
       [--fast|--no-fast]
       [-d, --detach]
 
+  boxers <machine>/<task> new [--remote-path <absolute-path>] [--agent codex|claude] [...]
+
   # Prefix an existing task with <machine>/ to run the command remotely.
   boxers [<machine>/]<task> attach [--model <name>] [--effort <level>] [--fast]
   boxers [<machine>/]<task> status [--json] [--refresh]
@@ -115,9 +117,6 @@ Tasks
   boxers [<machine>/]<task> promote [--message <message>] [--skip-checks]
   boxers [<machine>/]<task> preview [start|stop|restart|logs]
   boxers [<machine>/]<task> discard [--force]
-
-  # Remote creation also identifies the project that will own the new task.
-  boxers <machine>/<project>/<task> new [--agent codex|claude] [...]
 
 Diagnostics
   boxers debug shell <task>
@@ -261,6 +260,7 @@ function parseNew(args: string[]): {
   model?: string;
   effort?: string;
   fast?: boolean;
+  remotePath?: string;
   detach: boolean;
 } {
   let agentValue: string | undefined;
@@ -270,6 +270,7 @@ function parseNew(args: string[]): {
   let model: string | undefined;
   let effort: string | undefined;
   let fast: boolean | undefined;
+  let remotePath: string | undefined;
   let detach = false;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
@@ -299,7 +300,13 @@ function parseNew(args: string[]): {
     } else if (arg?.startsWith("--effort=")) effort = arg.slice(9);
     else if (arg === "--fast") fast = true;
     else if (arg === "--no-fast") fast = false;
-    else if (arg === "-d" || arg === "--detach") detach = true;
+    else if (arg === "--remote-path") {
+      remotePath = value(args, index, arg);
+      index++;
+    } else if (arg?.startsWith("--remote-path=")) {
+      remotePath = arg.slice(14);
+      if (!remotePath) throw new UsageError("--remote-path requires a value.");
+    } else if (arg === "-d" || arg === "--detach") detach = true;
     else throw new UsageError(`Unexpected argument for new: ${arg}`);
   }
   if (prompt !== undefined && promptFile !== undefined)
@@ -314,6 +321,7 @@ function parseNew(args: string[]): {
     ...(model !== undefined ? { model } : {}),
     ...(effort !== undefined ? { effort } : {}),
     ...(fast !== undefined ? { fast } : {}),
+    ...(remotePath !== undefined ? { remotePath } : {}),
     detach,
   };
 }
@@ -761,6 +769,8 @@ export async function dispatch(argv: string[]): Promise<number> {
     const [project, task, ...newArgs] = rest;
     if (!project || !task) throw new UsageError("remote creation requires project and task.");
     const options = parseNew(newArgs);
+    if (options.remotePath)
+      throw new UsageError("--remote-path requires current-project remote creation.");
     return newTaskInProject(project, task, {
       ...(options.agent !== undefined ? { agent: options.agent } : {}),
       ...(options.prompt !== undefined ? { prompt: options.prompt } : {}),
@@ -788,7 +798,11 @@ export async function dispatch(argv: string[]): Promise<number> {
         ...(options.fast !== undefined ? { fast: options.fast } : {}),
         detach: options.detach,
       },
-      { source, base },
+      {
+        source,
+        base,
+        ...(options.remotePath !== undefined ? { destination: options.remotePath } : {}),
+      },
     );
   }
   if (first === "__remote-project-clone") {
@@ -800,48 +814,26 @@ export async function dispatch(argv: string[]): Promise<number> {
   if (rest.length === 0) throw new UsageError(`Missing command for task "${first}".`);
   const [taskCommand, ...args] = rest;
   const qualified = first.split("/");
-  if (qualified.length === 3 && taskCommand === "new") {
-    const [machine, project, task] = qualified;
-    if (!machine || !project || !task)
-      throw new UsageError("Remote creation requires <machine>/<project>/<task>.");
-    let currentProject: ReturnType<typeof requireProject> | undefined;
-    try {
-      currentProject = requireProject();
-    } catch (error) {
-      // Existing projects can still be selected remotely from outside a local checkout.
-      if (
-        !(error instanceof Error) ||
-        (!error.message.startsWith("Not inside a Git repository") &&
-          !error.message.startsWith("This repository is not initialized"))
-      )
-        throw error;
-    }
-    const referencesCurrentProject =
-      currentProject !== undefined &&
-      (currentProject.id.toLowerCase() === project.toLowerCase() ||
-        basename(currentProject.root).toLowerCase() === project.toLowerCase());
-    if (referencesCurrentProject && currentProject)
-      return runRemoteCommand(
-        machine,
-        [
-          "__remote-new-project",
-          project,
-          task,
-          projectCloneSource(currentProject),
-          currentProject.integration.base,
-          ...args,
-        ],
-        true,
-      );
-    return runRemoteCommand(machine, ["__remote-new", project, task, ...args], true);
-  }
   if (qualified.length > 1) {
     if (qualified.length !== 2)
       throw new UsageError("Remote task commands require <machine>/<task>.");
     const [machine, task] = qualified;
     if (!machine || !task) throw new UsageError("Remote task commands require <machine>/<task>.");
-    if (taskCommand === "new")
-      throw new UsageError("Remote new requires <machine>/<project>/<task>.");
+    if (taskCommand === "new") {
+      const project = requireProject();
+      return runRemoteCommand(
+        machine,
+        [
+          "__remote-new-project",
+          basename(project.root),
+          task,
+          projectCloneSource(project),
+          project.integration.base,
+          ...args,
+        ],
+        true,
+      );
+    }
     const remoteCommands = new Set([
       "attach",
       "status",
@@ -864,6 +856,8 @@ export async function dispatch(argv: string[]): Promise<number> {
   switch (taskCommand) {
     case "new": {
       const options = parseNew(args);
+      if (options.remotePath)
+        throw new UsageError("--remote-path applies only to <machine>/<task> new.");
       return newTask(first, {
         ...(options.agent !== undefined ? { agent: options.agent } : {}),
         ...(options.prompt !== undefined ? { prompt: options.prompt } : {}),

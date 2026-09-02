@@ -115,6 +115,7 @@ describe("v2 CLI", () => {
     await expect(dispatch(["--help"])).resolves.toBe(0);
     const output = write.mock.calls.map((call) => String(call[0])).join("");
     expect(output).toContain("boxers <task> new");
+    expect(output).toContain("boxers <machine>/<task> new [--remote-path <absolute-path>]");
     expect(output).toContain("boxers [<machine>/]<task> status");
     expect(output).toContain("boxers [<machine>/]<task> sync|review|check");
     expect(output).toContain("sync|review|check|setup");
@@ -443,11 +444,7 @@ describe("v2 CLI", () => {
       false,
     );
 
-    await expect(dispatch(["server/task", "new", "--agent", "codex"])).rejects.toThrow(
-      "<machine>/<project>/<task>",
-    );
-
-    await dispatch(["server/boxers/new-task", "new", "--agent", "codex", "-d"]);
+    await dispatch(["server/new-task", "new", "--agent", "codex", "-d"]);
     expect(machines.runRemoteCommand).toHaveBeenLastCalledWith(
       "server",
       [
@@ -463,11 +460,24 @@ describe("v2 CLI", () => {
       true,
     );
 
-    await dispatch(["server/other-project/another-task", "new", "-d"]);
+    await dispatch(["server/another-task", "new", "--remote-path", "/srv/projects/boxers", "-d"]);
     expect(machines.runRemoteCommand).toHaveBeenLastCalledWith(
       "server",
-      ["__remote-new", "other-project", "another-task", "-d"],
+      [
+        "__remote-new-project",
+        "boxers",
+        "another-task",
+        "git@github.com:owner/repo.git",
+        "main",
+        "--remote-path",
+        "/srv/projects/boxers",
+        "-d",
+      ],
       true,
+    );
+
+    await expect(dispatch(["server/project/task", "new"])).rejects.toThrow(
+      "Remote task commands require <machine>/<task>",
     );
   });
 
@@ -480,6 +490,15 @@ describe("v2 CLI", () => {
     await expect(dispatch(["task", "rm"])).rejects.toBeInstanceOf(UsageError);
     await dispatch(["task", "sync"]);
     expect(commands.sync).toHaveBeenCalledWith("task");
+  });
+
+  it("limits --remote-path to remote task creation", async () => {
+    await expect(dispatch(["task", "new", "--remote-path", "/srv/project"])).rejects.toThrow(
+      "--remote-path applies only to <machine>/<task> new",
+    );
+    await expect(
+      dispatch(["__remote-new", "project", "task", "--remote-path", "/srv/project"]),
+    ).rejects.toThrow("--remote-path requires current-project remote creation");
   });
 
   it("keeps remote snapshot and watch as internal protocol commands", async () => {
@@ -529,6 +548,26 @@ describe("v2 CLI", () => {
       "task",
       { agent: "codex", detach: true },
       { source: "git@example.test:owner/repo.git", base: "main" },
+    );
+
+    await dispatch([
+      "__remote-new-project",
+      "project-id",
+      "task",
+      "git@example.test:owner/repo.git",
+      "main",
+      "--remote-path=/srv/project",
+      "-d",
+    ]);
+    expect(commands.newTaskInProject).toHaveBeenLastCalledWith(
+      "project-id",
+      "task",
+      { detach: true },
+      {
+        source: "git@example.test:owner/repo.git",
+        base: "main",
+        destination: "/srv/project",
+      },
     );
   });
 

@@ -150,26 +150,28 @@ boxers build-box/fix-parser review
 boxers build-box/fix-parser promote
 ```
 
-To create a remote task, include the machine, project, and new task name:
+To create a remote task, run `new` from the current project and prefix the task
+with the machine:
 
 ```sh
-boxers build-box/my-project/fix-parser new
+boxers build-box/fix-parser new
 ```
 
-When this command is run from the matching local project, Boxers reuses the
-project's configured Git clone URL and base branch. If the project is not yet
-registered on `build-box`, it is cloned and initialized automatically under
-the remote machine's Boxers state directory at
+Boxers identifies an existing registration on `build-box` from the project's
+canonical Git clone source. If it is not registered there yet, Boxers reuses
+the current project's configured clone URL and base branch, then clones and
+initializes it under the remote machine's state directory at
 `$BOXERS_HOME/checkouts/my-project` (normally
 `~/.local/state/boxers/checkouts/my-project`). Existing registered projects are
 reused. The clone deliberately uses Git on the remote host, so the command
 fails with Git's error if that host cannot reach the repository or its Git
 credentials are not configured.
 
-For a different checkout location, provision the project explicitly first:
+To choose the checkout location when Boxers first provisions the project, pass
+an absolute remote path:
 
 ```sh
-boxers project add build-box --clone --into /srv/projects/my-project
+boxers build-box/fix-parser new --remote-path /srv/projects/my-project
 ```
 
 Both SSH targets must be reachable from their reciprocal machine. Boxers uses
