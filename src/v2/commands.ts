@@ -1072,7 +1072,7 @@ export async function discard(name: string, force: boolean): Promise<number> {
   ) {
     const info = findTaskRuntime(runtimeInventory(), task);
     writeStdout(
-      `Unmerged changes: no; last commit on ${delivered.ref}: ${JSON.stringify(delivered.subject)}, no other changes by this task\n`,
+      `Unmerged changes: no\nLast commit on ${delivered.ref}: ${JSON.stringify(delivered.subject)}\nNo other changes by this task\n`,
     );
     if (info) destroyTaskEnvironment(task);
     rmSync(taskDir(project.id, task.id), { recursive: true, force: true });

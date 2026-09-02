@@ -495,7 +495,7 @@ exec "$FAKE_REAL_GIT" "$@"
       expect(stdout.mock.calls.map(([message]) => message)).toEqual(
         usesRecordedDelivery
           ? [
-              'Unmerged changes: no; last commit on main: "Deliver the task", no other changes by this task\n',
+              'Unmerged changes: no\nLast commit on main: "Deliver the task"\nNo other changes by this task\n',
               `Discarded task ${name}.\n`,
             ]
           : ["Checking the task workspace against main...\n", `Discarded task ${name}.\n`],
