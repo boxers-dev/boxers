@@ -133,6 +133,10 @@ export interface DaemonOptions {
     | undefined
   >;
   onSettlementTransition?: (snapshot: Readonly<SettlementRunSnapshot>) => void;
+  peerObserverFactory?: (
+    onChanged: () => void,
+    debug: (message: string) => void,
+  ) => PeerObserverHandle;
   startupInventory?: () => Promise<RuntimeInfo[]>;
   onUpdateHandoff?: () => void;
 }
@@ -246,7 +250,7 @@ export function runDaemon(
   options: DaemonOptions = {},
 ): DaemonHandle {
   const sessions = new Map<string, Session>();
-  const subscribers = new Set<Socket>();
+  const subscribers = new Map<Socket, { authoritativeOnly: boolean }>();
   const epoch = randomUUID();
   let revision = 0;
   let closing = false;
@@ -261,10 +265,11 @@ export function runDaemon(
 
   debug(`Starting daemon event loop (pid ${process.pid}).`);
 
-  const publishChange = (): void => {
+  const publishChange = (scope: "authoritative" | "peer-cache" = "authoritative"): void => {
     revision++;
-    for (const subscriber of subscribers)
-      send(subscriber, { type: "state_changed", epoch, revision });
+    for (const [subscriber, subscription] of subscribers)
+      if (scope === "authoritative" || !subscription.authoritativeOnly)
+        send(subscriber, { type: "state_changed", epoch, revision });
   };
 
   const persistSettlement = (snapshot: Readonly<SettlementRunSnapshot>): void => {
@@ -459,6 +464,7 @@ export function runDaemon(
     socket: Socket,
     message: ClientMessage & { type: "run_intent" },
     onWorkerSpawn: (pid: number) => void,
+    resumeSettlement: boolean,
   ): Promise<void> => {
     const forward = (stream: "stdout" | "stderr", chunk: string): void => {
       send(socket, {
@@ -510,8 +516,14 @@ export function runDaemon(
         const completedPassage =
           code === 0 ||
           (message.intent.kind === "check" && state.check?.status === "failed" && !state.failure);
+        const unsettledCandidate =
+          state.hasUnmergedChanges.value === true &&
+          (state.settlement?.phase !== "ready" ||
+            state.settlement.targetOid !== state.baseOid ||
+            state.settlement.candidateTreeOid !== state.candidateTreeOid);
         if (
           completedPassage &&
+          (resumeSettlement || unsettledCandidate) &&
           state.agentTurnState === "awaiting_input" &&
           state.conversationHighWaterSequence > 0
         )
@@ -569,7 +581,8 @@ export function runDaemon(
       if (existsSync(leasePath)) {
         try {
           const current = readJson<TaskIntentLease>(leasePath);
-          if (current.daemonPid === process.pid && Array.isArray(current.operations)) return current;
+          if (current.daemonPid === process.pid && Array.isArray(current.operations))
+            return current;
         } catch {
           // The current daemon replaces its own malformed lease below.
         }
@@ -598,6 +611,20 @@ export function runDaemon(
     const running = previous
       .catch(() => undefined)
       .then(async () => {
+        const currentSettlement = settlements.current(taskKey);
+        let resumeSettlement = Boolean(currentSettlement && currentSettlement.phase !== "ready");
+        if (!currentSettlement)
+          for (const project of listProjects()) {
+            const task = listTasks(project).find(
+              (candidate) => candidate.name.toLowerCase() === taskKey,
+            );
+            if (!task) continue;
+            const state = readTaskState(project, task);
+            resumeSettlement = state.settlement
+              ? state.settlement.phase !== "ready"
+              : state.conversationHighWaterSequence > state.promotionConversationCheckpoint;
+            break;
+          }
         await settlements.cancelAndWait(taskKey);
         busyTaskNames.add(taskKey);
         writeLease((lease) => ({
@@ -610,13 +637,18 @@ export function runDaemon(
           updatedAt: new Date().toISOString(),
         }));
         try {
-          await runIntent(socket, message, (childPid) => {
-            writeLease((lease) => ({
-              ...lease,
-              childPid,
-              updatedAt: new Date().toISOString(),
-            }));
-          });
+          await runIntent(
+            socket,
+            message,
+            (childPid) => {
+              writeLease((lease) => ({
+                ...lease,
+                childPid,
+                updatedAt: new Date().toISOString(),
+              }));
+            },
+            resumeSettlement,
+          );
         } finally {
           busyTaskNames.delete(taskKey);
           const lease = readLease();
@@ -738,7 +770,7 @@ export function runDaemon(
           return;
         }
         case "subscribe": {
-          subscribers.add(socket);
+          subscribers.set(socket, { authoritativeOnly: message.authoritativeOnly === true });
           send(socket, {
             type: "subscribed",
             requestId: message.requestId,
@@ -942,8 +974,10 @@ export function runDaemon(
     fleetGossip.unref();
   };
   scheduleFleetGossip(5_000);
-  peerObservers =
-    socketPath === daemonSocketPath() ? startPeerObservers(publishChange, debug) : undefined;
+  const peerObserverFactory =
+    options.peerObserverFactory ??
+    (socketPath === daemonSocketPath() ? startPeerObservers : undefined);
+  peerObservers = peerObserverFactory?.(() => publishChange("peer-cache"), debug);
   const startupInventory = options.startupInventory ?? runtimeInventoryAsync;
   const startupRecovery =
     socketPath === daemonSocketPath() || options.startupInventory

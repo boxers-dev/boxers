@@ -60,6 +60,8 @@ export interface SubscribeRequest {
   requestId: string;
   epoch?: string;
   sinceRevision?: number;
+  /** Ignore peer-cache-only changes when serving another fleet daemon. */
+  authoritativeOnly?: boolean;
 }
 
 export interface StateChangedRequest {
@@ -288,6 +290,12 @@ export function parseClientMessage(line: string): ClientMessage | undefined {
       return undefined;
   }
   if (value["type"] === "setup_completed" && typeof value["taskName"] !== "string")
+    return undefined;
+  if (
+    value["type"] === "subscribe" &&
+    value["authoritativeOnly"] !== undefined &&
+    typeof value["authoritativeOnly"] !== "boolean"
+  )
     return undefined;
   return value as unknown as ClientMessage;
 }

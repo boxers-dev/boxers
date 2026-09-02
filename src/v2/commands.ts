@@ -1028,20 +1028,29 @@ async function refreshTaskStatus(name: string, json: boolean): Promise<number> {
   drainTaskLifecycleEvents(project, task);
   if (readTaskState(project, task).agentTurnState !== "working")
     await refreshSettledCandidate(name);
-  return status(name, json, false);
+  return renderTaskStatus(name, json, "refreshing_target");
 }
 
-export async function status(name: string, json: boolean, refresh = false): Promise<number> {
-  if (refresh) return refreshTaskStatus(name, json);
+function renderTaskStatus(name: string, json: boolean, ignoreOperationKind?: string): number {
   const { project, task } = requireRegisteredTask(name);
   const state = readTaskState(project, task);
-  const view = projectTaskView(project, task, state);
+  const view = projectTaskView(
+    project,
+    task,
+    state,
+    ignoreOperationKind ? { ignoreOperationKind } : {},
+  );
   if (json)
     writeStdout(
       `${JSON.stringify({ task: projectedTaskRecord(task), view, internal: { state, snapshot: task.lastSnapshot } })}\n`,
     );
   else writeStdout(formatTaskView(name, view));
   return view.issues.length ? 1 : 0;
+}
+
+export async function status(name: string, json: boolean, refresh = false): Promise<number> {
+  if (refresh) return refreshTaskStatus(name, json);
+  return renderTaskStatus(name, json);
 }
 
 export async function attach(

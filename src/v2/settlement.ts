@@ -113,7 +113,9 @@ export class SettlementCoordinator {
       const current = this.#runs.get(key);
       const eligible =
         (mode === "deferred" && current?.deferred) ||
-        (mode === "cancelled" && current?.snapshot.phase === "cancelled");
+        (mode === "cancelled" &&
+          current !== undefined &&
+          ["cancelled", "failed", "needs_input"].includes(current.snapshot.phase));
       if (!eligible) return { status: "duplicate" };
     }
     this.#highWater.set(key, triggerSequence);
@@ -184,17 +186,18 @@ export class SettlementCoordinator {
   cancel(taskKey: string): boolean {
     const key = taskKey.toLowerCase();
     const active = this.#runs.get(key);
-    if (!active || active.abort.signal.aborted) return false;
+    if (!active || active.abort.signal.aborted || active.terminal) return false;
     active.abort.abort();
     this.#finish(key, active.snapshot.runId, "cancelled");
     return true;
   }
 
-  async cancelAndWait(taskKey: string): Promise<void> {
+  async cancelAndWait(taskKey: string): Promise<boolean> {
     const active = this.#runs.get(taskKey.toLowerCase());
-    if (!active) return;
-    this.cancel(taskKey);
+    if (!active) return false;
+    const cancelled = this.cancel(taskKey);
     await active.completion;
+    return cancelled;
   }
 
   guardedPublish(identity: SettlementIdentity, action: () => void): boolean {

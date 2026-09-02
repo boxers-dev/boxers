@@ -65,9 +65,18 @@ export function projectTaskView(
       },
       "daemon",
     );
-  const operations = recordedOperations.filter(
-    (operation) => operation.kind !== options.ignoreOperationKind,
-  );
+  let ignoredRunningOperation = false;
+  const operations = recordedOperations.filter((operation) => {
+    if (
+      !ignoredRunningOperation &&
+      operation.kind === options.ignoreOperationKind &&
+      operation.state === "running"
+    ) {
+      ignoredRunningOperation = true;
+      return false;
+    }
+    return true;
+  });
   return deriveTaskView({
     name: task.name,
     state,

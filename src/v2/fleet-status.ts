@@ -67,7 +67,7 @@ export async function fleetHostStatusViews(options: {
   const remotes = await Promise.all(
     machines.map(async (machine) => {
       const view = options.refresh
-        ? writeCachedPeerView(machine, await queryRemoteMachine(machine, true))
+        ? writeCachedPeerView(machine, await queryRemoteMachine(machine, true)).view
         : readCachedPeerView(machine);
       const detail = view.detail ?? view.snapshot?.boxersUpdate?.detail;
       return {

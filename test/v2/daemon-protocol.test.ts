@@ -58,6 +58,27 @@ describe("daemon wire protocol", () => {
     ).toMatchObject({ intent: { kind: "setup" } });
   });
 
+  it("validates authoritative-only subscriptions", () => {
+    expect(
+      parseClientMessage(
+        encodeMessage({
+          type: "subscribe",
+          requestId: "remote-watch",
+          authoritativeOnly: true,
+        }).trim(),
+      ),
+    ).toMatchObject({ type: "subscribe", authoritativeOnly: true });
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "subscribe",
+          requestId: "remote-watch",
+          authoritativeOnly: "yes",
+        }),
+      ),
+    ).toBeUndefined();
+  });
+
   it("rejects malformed or unrecognized lines instead of throwing", () => {
     expect(parseClientMessage("not json")).toBeUndefined();
     expect(parseClientMessage(JSON.stringify({ type: "unknown" }))).toBeUndefined();

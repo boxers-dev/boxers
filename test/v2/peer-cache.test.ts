@@ -58,12 +58,13 @@ describe("peer projection cache", () => {
       observedAt: "2026-08-26T00:00:01.000Z",
       tasks: [],
     };
-    writeCachedPeerView(machine, {
+    const first = writeCachedPeerView(machine, {
       id: machine.id,
       name: machine.name,
       connection: "online",
       snapshot,
     });
+    expect(first.changed).toBe(true);
     expect(readCachedPeerView(machine).connection).toBe("online");
 
     atomicWriteJson(peerCachePath(machine.id), {
@@ -124,5 +125,41 @@ describe("peer projection cache", () => {
       snapshot: projection("2026-08-26T00:00:01.000Z", "idle"),
     });
     expect(readCachedPeerView(machine).snapshot).toEqual(newer);
+  });
+
+  it("refreshes volatile service times without reporting a visible change", () => {
+    const home = mkdtempSync(join(tmpdir(), "boxers-peer-cache-volatile-"));
+    cleanup.push(home);
+    process.env.BOXERS_HOME = home;
+    const machine = { id: "peer-id", name: "peer", sshHost: "peer.example" };
+    const snapshot = (servedAt: string): RemoteSnapshot => ({
+      protocolVersion: 3,
+      machine: {
+        version: 1,
+        id: machine.id,
+        name: machine.name,
+        createdAt: "2026-08-26T00:00:00.000Z",
+        boxersVersion: "1.2.3",
+      },
+      observedAt: servedAt,
+      servedAt,
+      tasks: [],
+    });
+    expect(
+      writeCachedPeerView(machine, {
+        id: machine.id,
+        name: machine.name,
+        connection: "online",
+        snapshot: snapshot("2026-08-26T00:00:01.000Z"),
+      }).changed,
+    ).toBe(true);
+    expect(
+      writeCachedPeerView(machine, {
+        id: machine.id,
+        name: machine.name,
+        connection: "online",
+        snapshot: snapshot("2026-08-26T00:00:02.000Z"),
+      }).changed,
+    ).toBe(false);
   });
 });

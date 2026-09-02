@@ -348,6 +348,7 @@ export function notifyDaemonSetupCompleted(taskName: string): void {
 export async function subscribeDaemonChanges(
   onReady: (cursor: { epoch: string; revision: number }) => void,
   onChanged: (cursor: { epoch: string; revision: number }) => void,
+  options: { authoritativeOnly?: boolean } = {},
 ): Promise<() => void> {
   const socket = await readyDaemonSocket();
   const requestId = randomUUID();
@@ -362,7 +363,13 @@ export async function subscribeDaemonChanges(
         onChanged({ epoch: message.epoch, revision: message.revision });
     }
   });
-  socket.write(encodeMessage({ type: "subscribe", requestId }));
+  socket.write(
+    encodeMessage({
+      type: "subscribe",
+      requestId,
+      ...(options.authoritativeOnly ? { authoritativeOnly: true } : {}),
+    }),
+  );
   return () => socket.destroy();
 }
 

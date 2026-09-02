@@ -102,6 +102,16 @@ describe("task settlement coordinator", () => {
     expect(handedOff).toBe(true);
   });
 
+  it("does not cancel or restart an already completed generation", async () => {
+    const coordinator = new SettlementCoordinator();
+    const run = coordinator.start("task", 2, async () => undefined);
+    await run.completion;
+    expect(coordinator.cancel("task")).toBe(false);
+    expect(await coordinator.cancelAndWait("task")).toBe(false);
+    expect(coordinator.restart("task", 2, async () => undefined).status).toBe("duplicate");
+    expect(coordinator.current("task")?.phase).toBe("ready");
+  });
+
   it("allows different tasks to settle concurrently", async () => {
     const entered = new Set<string>();
     const both = deferred();

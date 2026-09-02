@@ -37,6 +37,7 @@ import { readTaskIntentOperations } from "../../src/v2/leases.ts";
 
 const cleanupDirs: string[] = [];
 let daemon: DaemonHandle | undefined;
+const extraDaemons: DaemonHandle[] = [];
 const sockets: Socket[] = [];
 let previousBoxersHome: string | undefined;
 
@@ -46,6 +47,7 @@ afterEach(async () => {
     await daemon.close();
     daemon = undefined;
   }
+  for (const extraDaemon of extraDaemons.splice(0)) await extraDaemon.close();
   for (const dir of cleanupDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   if (previousBoxersHome === undefined) delete process.env.BOXERS_HOME;
   else process.env.BOXERS_HOME = previousBoxersHome;
@@ -482,6 +484,53 @@ describe("daemon session lifecycle", () => {
     });
   });
 
+  it("does not restart completed settlement after a successful refresh", async () => {
+    const state = useTemporaryState();
+    registerTask(state, "settled-refresh", "runtime-settled-refresh");
+    const project = listProjects()[0]!;
+    const task = listTasks(project)[0]!;
+    recordLifecycleEvent(project, task, {
+      version: 1,
+      sequence: 4,
+      event: {
+        version: 1,
+        kind: "turn_finished",
+        provider: "codex",
+        providerSessionId: "session",
+        providerTurnId: "turn-4",
+        recordedAt: "2030-01-01T00:00:00.000Z",
+      },
+      source: { provider: "codex", hookEvent: "Stop", rawBytes: 20 },
+    });
+    let launches = 0;
+    const socketPath = tempSocketPath();
+    daemon = runDaemon(socketPath, {
+      ingestLifecycle: async () => [],
+      executeIntent: async () => 0,
+      executeSettlement: async () => {
+        launches++;
+        return {};
+      },
+    });
+    const client = await connectClient(socketPath);
+    client.send({ type: "setup_completed", taskName: task.name });
+    await waitUntil(() => readTaskState(project, task).settlement?.phase === "ready");
+    expect(launches).toBe(1);
+    client.send({
+      type: "run_intent",
+      intentId: "settled-status-refresh",
+      task: task.name,
+      intent: { kind: "refresh", json: false },
+    });
+    await client.next(
+      (message) =>
+        message.type === "intent_exited" && message.intentId === "settled-status-refresh",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(launches).toBe(1);
+    expect(readTaskState(project, task).settlement?.phase).toBe("ready");
+  });
+
   it("cancels settlement before forwarding the first raw input", async () => {
     const token = "00112233445566778899aabbccddeeff";
     const frame = encodeLifecycleWakeFrame(token, 11);
@@ -563,6 +612,74 @@ describe("daemon session lifecycle", () => {
     await expect(client.next((message) => message.type === "state_changed")).resolves.toMatchObject(
       { type: "state_changed", revision: 1 },
     );
+  });
+
+  it("does not ping-pong peer-cache changes between mutually observing daemons", async () => {
+    const firstSocketPath = tempSocketPath();
+    const secondSocketPath = tempSocketPath();
+    let publishFirstPeerChange: () => void = () => undefined;
+    let publishSecondPeerChange: () => void = () => undefined;
+    daemon = runDaemon(firstSocketPath, {
+      peerObserverFactory: (onChanged) => {
+        publishFirstPeerChange = onChanged;
+        return { reconcile: () => undefined, close: () => undefined };
+      },
+    });
+    const second = runDaemon(secondSocketPath, {
+      peerObserverFactory: (onChanged) => {
+        publishSecondPeerChange = onChanged;
+        return { reconcile: () => undefined, close: () => undefined };
+      },
+    });
+    extraDaemons.push(second);
+    const firstLocal = await connectClient(firstSocketPath);
+    const firstRemoteWatch = await connectClient(firstSocketPath);
+    const secondLocal = await connectClient(secondSocketPath);
+    const secondRemoteWatch = await connectClient(secondSocketPath);
+    firstLocal.send({ type: "subscribe", requestId: "first-local" });
+    firstRemoteWatch.send({
+      type: "subscribe",
+      requestId: "first-remote",
+      authoritativeOnly: true,
+    });
+    secondLocal.send({ type: "subscribe", requestId: "second-local" });
+    secondRemoteWatch.send({
+      type: "subscribe",
+      requestId: "second-remote",
+      authoritativeOnly: true,
+    });
+    await Promise.all([
+      firstLocal.next((message) => message.type === "subscribed"),
+      firstRemoteWatch.next((message) => message.type === "subscribed"),
+      secondLocal.next((message) => message.type === "subscribed"),
+      secondRemoteWatch.next((message) => message.type === "subscribed"),
+    ]);
+
+    firstLocal.send({ type: "state_changed" });
+    await firstLocal.next((message) => message.type === "state_changed");
+    await expect(
+      firstRemoteWatch.next((message) => message.type === "state_changed"),
+    ).resolves.toMatchObject({ revision: 1 });
+
+    publishSecondPeerChange();
+    await expect(
+      secondLocal.next((message) => message.type === "state_changed"),
+    ).resolves.toMatchObject({ revision: 1 });
+    secondLocal.send({ type: "state_changed" });
+    await secondLocal.next((message) => message.type === "state_changed");
+    await expect(
+      secondRemoteWatch.next((message) => message.type === "state_changed"),
+    ).resolves.toMatchObject({ revision: 2 });
+
+    publishFirstPeerChange();
+    await expect(
+      firstLocal.next((message) => message.type === "state_changed"),
+    ).resolves.toMatchObject({ revision: 2 });
+    firstLocal.send({ type: "state_changed" });
+    await firstLocal.next((message) => message.type === "state_changed");
+    await expect(
+      firstRemoteWatch.next((message) => message.type === "state_changed"),
+    ).resolves.toMatchObject({ revision: 3 });
   });
 
   it("rejects incompatible daemon protocol versions", async () => {

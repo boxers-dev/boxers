@@ -19,6 +19,29 @@ export interface FleetPeerIdentity {
   name: string;
 }
 
+export interface PeerCacheWriteResult {
+  view: MachineView;
+  changed: boolean;
+}
+
+function comparablePeerView(view: MachineView): unknown {
+  if (!view.snapshot) return view;
+  const { servedAt: _servedAt, observedAt, ...snapshot } = view.snapshot;
+  return {
+    ...view,
+    snapshot: {
+      ...snapshot,
+      // An empty projection uses its service time as observedAt. It is not a
+      // state change, so do not turn every heartbeat into a notification.
+      ...(view.snapshot.tasks.length ? { observedAt } : {}),
+    },
+  };
+}
+
+function peerViewsEqual(left: MachineView, right: MachineView): boolean {
+  return JSON.stringify(comparablePeerView(left)) === JSON.stringify(comparablePeerView(right));
+}
+
 export function readCachedPeerView(peer: FleetPeerIdentity): MachineView {
   const path = peerCachePath(peer.id);
   if (!existsSync(path))
@@ -61,7 +84,10 @@ export function readCachedPeerViews(): MachineView[] {
     .map((member) => readCachedPeerView({ id: member.hostId, name: member.name }));
 }
 
-export function writeCachedPeerView(peer: FleetPeerIdentity, next: MachineView): MachineView {
+export function writeCachedPeerView(
+  peer: FleetPeerIdentity,
+  next: MachineView,
+): PeerCacheWriteResult {
   const previous = readCachedPeerView(peer);
   let newestSnapshot =
     next.snapshot &&
@@ -91,5 +117,5 @@ export function writeCachedPeerView(peer: FleetPeerIdentity, next: MachineView):
     updatedAt: new Date().toISOString(),
     view,
   } satisfies CachedPeerView);
-  return view;
+  return { view, changed: !peerViewsEqual(previous, view) };
 }

@@ -363,6 +363,7 @@ export async function remoteWatch(intervalMs = WATCH_INTERVAL_MS): Promise<numbe
   await subscribeDaemonChanges(
     () => process.stdout.write(`${JSON.stringify({ protocolVersion: 1, type: "ready" })}\n`),
     () => process.stdout.write(`${JSON.stringify({ protocolVersion: 1, type: "changed" })}\n`),
+    { authoritativeOnly: true },
   );
   const heartbeat = setInterval(
     () => process.stdout.write(`${JSON.stringify({ protocolVersion: 1, type: "heartbeat" })}\n`),

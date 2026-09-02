@@ -25,7 +25,7 @@ import {
   sync,
 } from "../../src/v2/commands.ts";
 import { createTaskManifest, initProject, requireTask, updateTask } from "../../src/v2/registry.ts";
-import { taskDir } from "../../src/v2/paths.ts";
+import { atomicWriteJson, taskDir, taskIntentLeasePath } from "../../src/v2/paths.ts";
 import { suspendTaskEnvironment } from "../../src/v2/runtime/task.ts";
 import { advanceNativeWorkspace, nativeWorkspacePatch } from "../../src/v2/sandbox.ts";
 import { readTaskState, recordLifecycleEvent, recordTaskSnapshot } from "../../src/v2/state.ts";
@@ -564,7 +564,35 @@ exec "$FAKE_REAL_GIT" "$@"
     );
 
     const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    atomicWriteJson(taskIntentLeasePath(task.name), {
+      version: 1,
+      task: task.name,
+      daemonPid: process.pid,
+      operations: [
+        { kind: "refreshing_target", state: "running", intentId: "self-refresh" },
+        { kind: "refreshing_target", state: "queued", intentId: "queued-refresh" },
+        { kind: "reviewing", state: "queued", intentId: "queued-review" },
+      ],
+      updatedAt: new Date().toISOString(),
+    });
     await expect(status("native", true, true)).resolves.toBe(0);
+    const refreshed = JSON.parse(String(stdout.mock.calls.at(-1)?.[0]));
+    expect(refreshed.view.operations).toEqual([
+      { kind: "refreshing_target", state: "queued", intentId: "queued-refresh" },
+      { kind: "reviewing", state: "queued", intentId: "queued-review" },
+    ]);
+    atomicWriteJson(taskIntentLeasePath(task.name), {
+      version: 1,
+      task: task.name,
+      daemonPid: process.pid,
+      operations: [{ kind: "refreshing_target", state: "running", intentId: "self-refresh" }],
+      updatedAt: new Date().toISOString(),
+    });
+    await expect(status("native", false, true)).resolves.toBe(0);
+    const refreshedText = String(stdout.mock.calls.at(-1)?.[0]);
+    expect(refreshedText).not.toContain("Operations:");
+    expect(refreshedText).not.toContain("  Wait");
+    unlinkSync(taskIntentLeasePath(task.name));
     suspendTaskEnvironment(task);
     const stopped = requireTask(project, "native");
     expect(readTaskState(project, stopped).hasUnmergedChanges.value).toBe(false);
