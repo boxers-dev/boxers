@@ -34,6 +34,16 @@ describe("interactive daemon client input", () => {
     );
   });
 
+  it("excludes daemon output that predates the current launch attempt", () => {
+    const directory = mkdtempSync(join(tmpdir(), "boxers-daemon-client-"));
+    const log = join(directory, "daemon.log");
+    writeFileSync(log, "old daemon chatter\nnew failure\n");
+
+    const error = daemonStartupError(log, undefined, Buffer.byteLength("old daemon chatter\n"));
+    expect(error.message).toContain("Recent daemon output:\nnew failure");
+    expect(error.message).not.toContain("old daemon chatter");
+  });
+
   it("parses setup recovery as a typed intent", () => {
     expect(parseDaemonIntent(["task", "setup"])).toEqual({
       task: "task",

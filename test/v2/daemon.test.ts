@@ -22,7 +22,9 @@ import {
 } from "../../src/v2/daemon-protocol.ts";
 import {
   atomicWriteJson,
+  daemonHealthPath,
   daemonLockPath,
+  daemonPidPath,
   daemonSocketPath,
   fleetPath,
   taskMutationBarrierPath,
@@ -108,6 +110,17 @@ it("does not strand the daemon lock when synchronous startup fails", () => {
 
   expect(() => daemonMain()).toThrow("Invalid fleet member host ID");
   expect(existsSync(daemonLockPath())).toBe(false);
+  expect(existsSync(daemonSocketPath())).toBe(false);
+});
+
+it("does not steal a live daemon lock when command-line identity is obscured", () => {
+  useTemporaryState();
+  writeFileSync(daemonLockPath(), `${process.pid}\n`);
+  writeFileSync(daemonPidPath(), `${process.pid}\n`);
+  atomicWriteJson(daemonHealthPath(), { version: 1, pid: process.pid });
+
+  expect(daemonMain()).toBe(false);
+  expect(readFileSync(daemonLockPath(), "utf8")).toBe(`${process.pid}\n`);
   expect(existsSync(daemonSocketPath())).toBe(false);
 });
 

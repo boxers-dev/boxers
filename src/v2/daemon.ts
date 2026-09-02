@@ -1015,6 +1015,15 @@ export function runDaemon(
 export function daemonMain(): boolean {
   const lockPath = daemonLockPath();
   mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+  const recordedOwner = (pid: number): boolean => {
+    try {
+      const recordedPid = Number.parseInt(readFileSync(daemonPidPath(), "utf8").trim(), 10);
+      const health = readJson<{ version?: unknown; pid?: unknown }>(daemonHealthPath());
+      return recordedPid === pid && health.version === 1 && health.pid === pid;
+    } catch {
+      return false;
+    }
+  };
   const claim = (): boolean => {
     try {
       writeFileSync(lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
@@ -1023,7 +1032,11 @@ export function daemonMain(): boolean {
       try {
         const owner = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
         process.kill(owner, 0);
-        if (processIsBoxersDaemon(owner)) return false;
+        // Process command lines are an advisory identity signal: launchers,
+        // symlinks, and service managers can obscure them. A matching durable
+        // PID/health record is enough to prevent stealing a live daemon's lock
+        // and unlinking the socket it still owns.
+        if (processIsBoxersDaemon(owner) || recordedOwner(owner)) return false;
         throw Object.assign(new Error("Stale daemon lock owner"), { code: "ESRCH" });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "EPERM") return false;
@@ -1062,7 +1075,10 @@ export function daemonMain(): boolean {
   const shutdown = (): void => {
     void close().then(() => {
       try {
-        unlinkSync(lockPath);
+        // A later daemon may have recovered ownership while this process was
+        // shutting down. Never remove another process's lock.
+        if (Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10) === process.pid)
+          unlinkSync(lockPath);
       } catch {
         // Another startup safely handles a stale lock if shutdown is interrupted.
       }

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
+import { closeSync, fstatSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
 import { dirname } from "node:path";
 import { colorEnabled, resetTerminalInputModes } from "../core/ansi.ts";
@@ -124,11 +124,20 @@ export function daemonSpawnCommand(
 
 const DAEMON_ERROR_LOG_BYTES = 8 * 1024;
 
-export function daemonStartupError(logPath: string, launchFailure?: string): Error {
+export function daemonStartupError(
+  logPath: string,
+  launchFailure?: string,
+  attemptLogOffset?: number,
+): Error {
   let recent = "";
   try {
     const contents = readFileSync(logPath);
-    recent = contents.subarray(Math.max(0, contents.length - DAEMON_ERROR_LOG_BYTES)).toString();
+    const offset = Math.max(
+      0,
+      attemptLogOffset ?? contents.length - DAEMON_ERROR_LOG_BYTES,
+      contents.length - DAEMON_ERROR_LOG_BYTES,
+    );
+    recent = contents.subarray(offset).toString();
   } catch {
     // The launch failure below is still more useful than masking it with a log read error.
   }
@@ -152,6 +161,7 @@ async function ensureDaemonRunning(socketPath: string): Promise<Socket> {
   const logPath = daemonLogPath();
   mkdirSync(dirname(logPath), { recursive: true, mode: 0o700 });
   const logFd = openSync(logPath, "a");
+  const attemptLogOffset = fstatSync(logFd).size;
   let launchFailure: string | undefined;
   try {
     const { command, args } = daemonSpawnCommand();
@@ -160,7 +170,6 @@ async function ensureDaemonRunning(socketPath: string): Promise<Socket> {
       launchFailure = `Daemon launch failed: ${error.message}`;
     });
     child.once("exit", (code, signal) => {
-      if (code === 0 && !signal) return;
       launchFailure = `Daemon launch exited ${signal ? `after ${signal}` : `with status ${code ?? 1}`}.`;
     });
     child.unref();
@@ -175,7 +184,12 @@ async function ensureDaemonRunning(socketPath: string): Promise<Socket> {
       continue;
     }
   }
-  throw daemonStartupError(logPath, launchFailure);
+  const startupFailure = daemonStartupError(logPath, launchFailure, attemptLogOffset);
+  if (!launchFailure && startupFailure.message.endsWith(`(see ${logPath}).`))
+    throw new Error(
+      `${startupFailure.message}\nThe daemon launcher remained alive without opening its socket. A previous daemon may be stuck during shutdown; inspect \`boxers daemon status\` and use \`boxers daemon stop --force\` only if interrupting daemon-owned work is acceptable.`,
+    );
+  throw startupFailure;
 }
 
 /** Ensure the durable session and lifecycle-event daemon is available. */
