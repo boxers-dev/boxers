@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { basename } from "node:path";
 import {
   attach,
   authenticate,
@@ -756,6 +757,26 @@ export async function dispatch(argv: string[]): Promise<number> {
       detach: options.detach,
     });
   }
+  if (first === "__remote-new-project") {
+    const [project, task, source, base, ...newArgs] = rest;
+    if (!project || !task || !source || !base)
+      throw new UsageError("remote project creation requires project, task, source, and base.");
+    const options = parseNew(newArgs);
+    return newTaskInProject(
+      project,
+      task,
+      {
+        ...(options.agent !== undefined ? { agent: options.agent } : {}),
+        ...(options.prompt !== undefined ? { prompt: options.prompt } : {}),
+        ...(options.template !== undefined ? { template: options.template } : {}),
+        ...(options.model !== undefined ? { model: options.model } : {}),
+        ...(options.effort !== undefined ? { effort: options.effort } : {}),
+        ...(options.fast !== undefined ? { fast: options.fast } : {}),
+        detach: options.detach,
+      },
+      { source, base },
+    );
+  }
   if (first === "__remote-project-clone") {
     const [source, base, destination, ...unexpected] = rest;
     if (!source || !base || !destination || unexpected.length)
@@ -769,6 +790,35 @@ export async function dispatch(argv: string[]): Promise<number> {
     const [machine, project, task] = qualified;
     if (!machine || !project || !task)
       throw new UsageError("Remote creation requires <machine>/<project>/<task>.");
+    let currentProject: ReturnType<typeof requireProject> | undefined;
+    try {
+      currentProject = requireProject();
+    } catch (error) {
+      // Existing projects can still be selected remotely from outside a local checkout.
+      if (
+        !(error instanceof Error) ||
+        (!error.message.startsWith("Not inside a Git repository") &&
+          !error.message.startsWith("This repository is not initialized"))
+      )
+        throw error;
+    }
+    const referencesCurrentProject =
+      currentProject !== undefined &&
+      (currentProject.id.toLowerCase() === project.toLowerCase() ||
+        basename(currentProject.root).toLowerCase() === project.toLowerCase());
+    if (referencesCurrentProject && currentProject)
+      return runRemoteCommand(
+        machine,
+        [
+          "__remote-new-project",
+          project,
+          task,
+          projectCloneSource(currentProject),
+          currentProject.integration.base,
+          ...args,
+        ],
+        true,
+      );
     return runRemoteCommand(machine, ["__remote-new", project, task, ...args], true);
   }
   if (qualified.length > 1) {

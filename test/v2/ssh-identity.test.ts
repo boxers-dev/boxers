@@ -118,6 +118,15 @@ describe("managed Boxers SSH gateway", () => {
     expect(() => authorizeGatewayRequest("observer-id", ["service", "install"])).toThrow(
       "required admin",
     );
+    expect(() =>
+      authorizeGatewayRequest("observer-id", [
+        "__remote-new-project",
+        "project",
+        "task",
+        "source",
+        "main",
+      ]),
+    ).toThrow("required admin");
     expect(() => authorizeGatewayRequest("observer-id", ["bash", "-lc", "whoami"])).toThrow(
       "not available",
     );

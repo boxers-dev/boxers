@@ -120,6 +120,22 @@ To create a remote task, include the machine, project, and new task name:
 boxers build-box/my-project/fix-parser new
 ```
 
+When this command is run from the matching local project, Boxers reuses the
+project's configured Git clone URL and base branch. If the project is not yet
+registered on `build-box`, it is cloned and initialized automatically under
+the remote machine's Boxers state directory at
+`$BOXERS_HOME/checkouts/my-project` (normally
+`~/.local/state/boxers/checkouts/my-project`). Existing registered projects are
+reused. The clone deliberately uses Git on the remote host, so the command
+fails with Git's error if that host cannot reach the repository or its Git
+credentials are not configured.
+
+For a different checkout location, provision the project explicitly first:
+
+```sh
+boxers project add build-box --clone --into /srv/projects/my-project
+```
+
 Both SSH targets must be reachable from their reciprocal machine. Boxers uses
 standard SSH host aliases, so stable LAN DNS or an overlay network such as
 Tailscale can provide the addresses for laptops that move between networks.

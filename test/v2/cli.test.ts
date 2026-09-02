@@ -31,6 +31,8 @@ vi.mock("../../src/v2/machines.ts", () => ({
 vi.mock("../../src/v2/registry.ts", () => ({
   projectCloneSource: vi.fn(() => "git@github.com:owner/repo.git"),
   requireProject: vi.fn(() => ({
+    id: "project-id",
+    root: "/work/boxers",
     integration: { mode: "remote", base: "main", remote: "origin" },
   })),
 }));
@@ -411,7 +413,23 @@ describe("v2 CLI", () => {
     await dispatch(["server/boxers/new-task", "new", "--agent", "codex", "-d"]);
     expect(machines.runRemoteCommand).toHaveBeenLastCalledWith(
       "server",
-      ["__remote-new", "boxers", "new-task", "--agent", "codex", "-d"],
+      [
+        "__remote-new-project",
+        "boxers",
+        "new-task",
+        "git@github.com:owner/repo.git",
+        "main",
+        "--agent",
+        "codex",
+        "-d",
+      ],
+      true,
+    );
+
+    await dispatch(["server/other-project/another-task", "new", "-d"]);
+    expect(machines.runRemoteCommand).toHaveBeenLastCalledWith(
+      "server",
+      ["__remote-new", "other-project", "another-task", "-d"],
       true,
     );
   });
@@ -458,6 +476,23 @@ describe("v2 CLI", () => {
       agent: "claude",
       detach: true,
     });
+
+    await dispatch([
+      "__remote-new-project",
+      "project-id",
+      "task",
+      "git@example.test:owner/repo.git",
+      "main",
+      "--agent",
+      "codex",
+      "-d",
+    ]);
+    expect(commands.newTaskInProject).toHaveBeenLastCalledWith(
+      "project-id",
+      "task",
+      { agent: "codex", detach: true },
+      { source: "git@example.test:owner/repo.git", base: "main" },
+    );
   });
 
   it("dispatches check and parses the explicit promotion check override", async () => {

@@ -35,7 +35,13 @@ import {
   enableDetectedChecks,
   renderConfig,
 } from "./init.ts";
-import { atomicWriteText, projectDir, taskDir, taskRepairLogPath } from "./paths.ts";
+import {
+  atomicWriteText,
+  checkoutsDir,
+  projectDir,
+  taskDir,
+  taskRepairLogPath,
+} from "./paths.ts";
 import { command, commandWithInput, requireSuccess } from "./process.ts";
 import {
   assertTaskNameAvailable,
@@ -906,8 +912,34 @@ export async function newTaskInProject(
   projectReference: string,
   name: string,
   options: NewTaskOptions,
+  provision?: { source: string; base: string },
 ): Promise<number> {
-  const project = projectByReference(projectReference);
+  let project: ProjectManifest;
+  try {
+    project = projectByReference(projectReference);
+  } catch (error) {
+    if (
+      !provision ||
+      !(error instanceof Error) ||
+      error.message !== `Unknown project "${projectReference}" on this machine.`
+    )
+      throw error;
+    if (
+      !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(projectReference) ||
+      projectReference === "." ||
+      projectReference === ".."
+    )
+      throw new Error(`Project reference "${projectReference}" is not safe as a checkout name.`);
+    const checkoutRoot = checkoutsDir();
+    mkdirSync(checkoutRoot, { recursive: true, mode: 0o700 });
+    const status = await cloneAndInitializeProject(
+      provision.source,
+      provision.base,
+      join(checkoutRoot, projectReference),
+    );
+    if (status !== 0) return status;
+    project = projectByReference(projectReference);
+  }
   process.chdir(project.root);
   return newTask(name, options);
 }

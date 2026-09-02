@@ -17,6 +17,11 @@ export function projectsDir(): string {
   return join(boxersHome(), "projects");
 }
 
+/** Git checkouts provisioned automatically when a task targets a new remote project. */
+export function checkoutsDir(): string {
+  return join(boxersHome(), "checkouts");
+}
+
 export function machineIdentityPath(): string {
   return join(boxersHome(), "machine.json");
 }

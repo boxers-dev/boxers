@@ -52,6 +52,7 @@ function requiredRole(args: readonly string[]): PeerRole {
   )
     return "admin";
   if (args[0] === "__remote-project-clone") return "admin";
+  if (args[0] === "__remote-new-project") return "admin";
   if (args[0] === "__remote-new") return "operate";
   const taskCommand = args[1];
   if (taskCommand === "status" || taskCommand === "review") return "observe";
