@@ -1,6 +1,6 @@
 {
   "name": "@boxers-dev/boxers",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "Run a fleet of sandbox-native autonomous coding agents that pack a punch.",
   "keywords": [
     "agent",
