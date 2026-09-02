@@ -66,7 +66,7 @@ export const codexHarness: AgentHarness = {
       "-c",
       'tui.resume_cwd="session"',
       "-c",
-      "tui.terminal_title=null",
+      "tui.terminal_title=[]",
       ...(options.developerInstructions === undefined
         ? []
         : ["-c", `developer_instructions=${JSON.stringify(options.developerInstructions)}`]),
