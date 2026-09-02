@@ -58,6 +58,7 @@ const POST_TURN_ACTIVITY = {
   reconciling: "Reconciling with the updated Git target",
   capturing: "Capturing the sandbox candidate",
   checking: "Running checks",
+  generating_metadata: "Generating candidate metadata",
 };
 
 interface PostTurnJob {
@@ -106,7 +107,9 @@ export interface DaemonOptions {
     taskName: string,
     triggerSequence: number,
     signal: AbortSignal,
-    onProgress: (phase: "refreshing" | "reconciling" | "capturing" | "checking") => void,
+    onProgress: (
+      phase: "refreshing" | "reconciling" | "capturing" | "checking" | "generating_metadata",
+    ) => void,
   ) => Promise<
     | {
         targetOid?: string;

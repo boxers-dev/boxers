@@ -143,15 +143,20 @@ export async function runAgentSessionDetached(
   );
 }
 
-const COMMIT_MESSAGE_PROMPT = `Read the structured JSON envelope supplied on standard input. It contains the exact target-to-candidate diff and normalized conversation events through an explicit high-water sequence. Write a Git commit message with a concise development note grounded in both the code and conversation.
+const COMMIT_MESSAGE_PROMPT = `Read the structured JSON envelope supplied on standard input. It contains the exact target-to-candidate diff and normalized conversation events through an explicit high-water sequence. Write a Git commit message with an adaptive development note grounded in both the code and the whole supplied conversation, not merely the final turn.
 
 The subject must use imperative mood and contain at most 72 characters.
 
-Focus the note on the most important motivation, decisions, constraints, non-obvious behavior, trade-offs, and follow-up work. Adapt the detail to the size of the change. Do not enumerate changed files, mechanically retell the diff, or invent context unsupported by the envelope. Write plain text suitable for a Git commit body and wrap prose at roughly 72 characters.
+The note should let a future reader understand:
+- Overview: what was discussed and why the change was requested.
+- Key decisions: the meaningful choices, constraints, trade-offs, and rejected approaches present in the conversation.
+- Implementation: the resulting approach and important non-obvious behavior, plus genuine follow-up work when applicable.
+
+Adapt both structure and detail to the size and complexity of the change. For a tiny, straightforward change, use only the relevant headings and a few sentences. For a substantive change or a conversation with several decisions, use the headings "Overview", "Key decisions", and "Implementation" with short paragraphs or bullets and enough detail to represent the discussion faithfully. Do not force every note into one paragraph, impose an arbitrary bullet count, enumerate changed files, mechanically retell the diff, or invent context unsupported by the envelope. Write plain text suitable for a Git commit body and wrap prose at roughly 72 characters.
 
 Return only a JSON object with exactly this shape: {"subject":"...","note":"..."}.`;
 
-const COMMIT_MESSAGE_SUMMARY_PROMPT = `The JSON supplied on standard input contains a Git commit subject and an overlong development note. Keep the subject unchanged and summarize the note once so it fits comfortably in a Git commit body. Preserve only the most important change, motivation, implementation decisions, constraints, and trade-offs. Remove repetition and low-value detail. Return only a JSON object with exactly the same {"subject":"...","note":"..."} shape, with the note under 8,000 characters.`;
+const COMMIT_MESSAGE_SUMMARY_PROMPT = `The JSON supplied on standard input contains a Git commit subject and an overlong development note. Keep the subject unchanged and summarize the note once so it fits comfortably in a Git commit body. Preserve its adaptive structure and the most important overview, discussion, decisions, implementation approach, constraints, and trade-offs. Remove repetition and low-value detail. Return only a JSON object with exactly the same {"subject":"...","note":"..."} shape, with the note under 8,000 characters.`;
 
 function commitMessageSchema(maxNoteLength?: number): string {
   return JSON.stringify({

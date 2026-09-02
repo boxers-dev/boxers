@@ -21,6 +21,7 @@ import {
   refreshAutomaticCheck,
   refreshAutomaticCommitMessage,
   review,
+  runPostTurn,
   status,
   sync,
 } from "../../src/v2/commands.ts";
@@ -856,6 +857,18 @@ preview:
       },
       source: { provider: "codex", hookEvent: "Stop", rawBytes: 20 },
     });
+    const postTurnPhases: string[] = [];
+    await expect(runPostTurn("native", 2, (phase) => postTurnPhases.push(phase))).resolves.toEqual({
+      targetOid: advancedTarget,
+      candidateTreeOid: expect.any(String),
+    });
+    expect(postTurnPhases).toEqual([
+      "refreshing",
+      "reconciling",
+      "capturing",
+      "checking",
+      "generating_metadata",
+    ]);
     await expect(status("native", true, true)).resolves.toBe(0);
     const diverged = JSON.parse(String(stdout.mock.calls.at(-1)?.[0]));
     expect(diverged.internal.state).toMatchObject({
@@ -879,10 +892,12 @@ preview:
       status: "passed",
       results: [{ name: "files", status: "passed" }],
     });
+    const sandboxLogBeforeCachedRefresh = readFileSync(sbxLog, "utf8");
     expect(refreshAutomaticCommitMessage("native")).toBe(
       "Update tracked files and assets\n\n" +
         "Preserve tracked, untracked, binary, and deleted content in one exact candidate snapshot.",
     );
+    expect(readFileSync(sbxLog, "utf8")).toBe(sandboxLogBeforeCachedRefresh);
     const generatedFor = readTaskState(project, requireTask(project, "native")).commitMessage;
     expect(generatedFor).toMatchObject({
       targetOid: advancedTarget,

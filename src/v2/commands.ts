@@ -1744,7 +1744,9 @@ export interface PostTurnResult {
 export async function runPostTurn(
   name: string,
   triggerSequence: number,
-  onPhase?: (phase: "refreshing" | "reconciling" | "capturing" | "checking") => void,
+  onPhase?: (
+    phase: "refreshing" | "reconciling" | "capturing" | "checking" | "generating_metadata",
+  ) => void,
 ): Promise<PostTurnResult> {
   const initial = requireRegisteredTask(name);
   const state = readTaskState(initial.project, initial.task);
@@ -1754,7 +1756,7 @@ export async function runPostTurn(
   )
     return {};
   if (refreshSetupStatus(initial.task)?.state === "running") return { deferred: true };
-  const captured = await refreshSettledCandidate(name, onPhase, false);
+  const captured = await refreshSettledCandidate(name, onPhase);
   const afterCapture = requireRegisteredTask(name);
   const current = readTaskState(afterCapture.project, afterCapture.task);
   if (
@@ -1767,6 +1769,15 @@ export async function runPostTurn(
     if (!captured.targetOid) return {};
     onPhase?.("checking");
     await refreshAutomaticCheck(name);
+    const beforeGeneration = requireRegisteredTask(name);
+    const generationState = readTaskState(beforeGeneration.project, beforeGeneration.task);
+    if (
+      generationState.agentTurnState !== "awaiting_input" ||
+      generationState.conversationHighWaterSequence !== triggerSequence
+    )
+      return {};
+    onPhase?.("generating_metadata");
+    refreshAutomaticCommitMessage(name);
   }
   const final = readTaskState(afterCapture.project, requireRegisteredTask(name).task);
   return {

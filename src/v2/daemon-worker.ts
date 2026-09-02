@@ -22,7 +22,7 @@ interface WorkerResult {
 
 interface WorkerProgress {
   type: "boxers-worker-progress";
-  phase: "refreshing" | "reconciling" | "capturing" | "checking";
+  phase: "refreshing" | "reconciling" | "capturing" | "checking" | "generating_metadata";
 }
 
 interface WorkerOutput {

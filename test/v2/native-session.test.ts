@@ -39,9 +39,7 @@ describe("native agent task lifecycle", () => {
     expect(resolveTemplate("claude", "tauri")).toBe(
       "ghcr.io/boxers-dev/boxers-templates:claude-tauri",
     );
-    expect(resolveTemplate("codex", "bun")).toBe(
-      "ghcr.io/boxers-dev/boxers-templates:codex-bun",
-    );
+    expect(resolveTemplate("codex", "bun")).toBe("ghcr.io/boxers-dev/boxers-templates:codex-bun");
     expect(resolveTemplate("codex", "rust")).toBe("rust");
     expect(resolveTemplate("codex", "local/template:v1")).toBe("local/template:v1");
   });
@@ -101,9 +99,7 @@ if [ "$command_name" = exec ] && [ "$2" = sh ]; then cat > /dev/null; fi
 
     const calls = readFileSync(log, "utf8");
     expect(calls).toContain("create <--clone> <--no-share-skills> <--name>");
-    expect(calls).toContain(
-      "<--template> <ghcr.io/boxers-dev/boxers-templates:codex-default>",
-    );
+    expect(calls).toContain("<--template> <ghcr.io/boxers-dev/boxers-templates:codex-default>");
     expect(calls.split("\n").find((line) => line.startsWith("create <--clone>"))).toContain(
       "<codex>",
     );
@@ -178,6 +174,9 @@ fi
     expect(calls.match(/codex exec/g)).toHaveLength(2);
     expect(calls).toContain("overlong development note");
     expect(calls).toContain("summarize the note once");
+    expect(calls).toContain("the whole supplied conversation");
+    expect(calls).toContain("Key decisions");
+    expect(calls).toContain("Implementation");
     expect(readFileSync(join(bin, "summary-input.json"), "utf8")).toContain("x".repeat(8_001));
     expect(generated).toEqual({
       subject: "Keep summary notes concise",
