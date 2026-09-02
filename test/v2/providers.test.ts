@@ -117,6 +117,17 @@ describe("provider lifecycle adapters", () => {
     );
   });
 
+  it("leaves the Boxers-managed terminal title unchanged", () => {
+    const args = codexHarness.durableSessionArguments(
+      { agent: "codex" } as never,
+      "/workspace",
+      {},
+    );
+
+    expect(args).toContain("tui.terminal_title=null");
+    expect(args).not.toContain("tui.terminal_title=[]");
+  });
+
   it("isolates lifecycle configuration while preserving native resume arguments", () => {
     const task = { agent: "claude" } as const;
     const recorder = "/git/boxers/bin/record-lifecycle";
