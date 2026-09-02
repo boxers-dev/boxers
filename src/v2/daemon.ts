@@ -21,6 +21,8 @@ import {
   parseClientMessage,
   type ClientMessage,
   type ServerMessage,
+  type PrepareShutdownRequest,
+  type ShutdownReason,
 } from "./daemon-protocol.ts";
 import { readVersion } from "../core/version.ts";
 import type { OutputSink } from "../core/output.ts";
@@ -37,7 +39,7 @@ import {
 import type { RuntimeInfo } from "./runtime/types.ts";
 import { gossipFleetMembership } from "./fleet-connect.ts";
 import { fleetReleaseNeedsDaemonHandoff, reconcileFleetRelease } from "./fleet-release.ts";
-import { activeReleaseBuildId } from "./release.ts";
+import { activeManagedBuildId, activeReleaseBuildId } from "./release.ts";
 import { taskIntentLeaseActive } from "./leases.ts";
 import { recoverTaskMutationBarrier, taskMutationBarrierActiveAsync } from "./mutation.ts";
 import {
@@ -55,6 +57,8 @@ import {
 } from "./settlement.ts";
 import { debugValue, writeDaemonDebug } from "./daemon-debug.ts";
 import type { RecordedTaskOperation, TaskOperationKind } from "./types.ts";
+import { restartBoundary, type RestartBlocker } from "./restart-boundary.ts";
+import { readDaemonHandoffState, recordDaemonHandoff } from "./daemon-handoff.ts";
 
 const REPLAY_BUFFER_BYTES = 200_000;
 const MAX_VIEWER_BUFFER_BYTES = 1_000_000;
@@ -97,6 +101,7 @@ interface Session {
   inputFlushTimer: ReturnType<typeof setTimeout> | undefined;
   state: "running" | "exited";
   controlParser: PtyControlParser | undefined;
+  uncommittedInput: boolean;
 }
 
 export interface DaemonHandle {
@@ -139,6 +144,7 @@ export interface DaemonOptions {
   ) => PeerObserverHandle;
   startupInventory?: () => Promise<RuntimeInfo[]>;
   onUpdateHandoff?: () => void;
+  onPreparedShutdown?: (reason: ShutdownReason) => void;
 }
 
 function cleanEnv(env: NodeJS.ProcessEnv): Record<string, string> {
@@ -211,6 +217,7 @@ function startSession(
     inputFlushTimer: undefined,
     state: "running",
     controlParser: request.bridgeToken ? new PtyControlParser(request.bridgeToken) : undefined,
+    uncommittedInput: false,
   };
   sessions.set(request.sessionId, session);
   proc.onData((chunk) => {
@@ -260,6 +267,8 @@ export function runDaemon(
   const settlementDebugPhases = new Map<string, SettlementRunSnapshot["phase"]>();
   let peerObservers: PeerObserverHandle | undefined;
   let updateHandoffRequested = false;
+  let draining = false;
+  let shutdownPreparation = false;
   const debug =
     options.debug ?? (socketPath === daemonSocketPath() ? writeDaemonDebug : () => undefined);
 
@@ -358,6 +367,9 @@ export function runDaemon(
           );
         else debug(`No new lifecycle events for sandbox ${debugValue(taskName)}.`);
         acceptLifecycle(taskName, events);
+        if (events.length)
+          for (const session of sessions.values())
+            if (session.taskName?.toLowerCase() === key) session.uncommittedInput = false;
         publishChange();
       })
       .catch((error) => {
@@ -428,6 +440,135 @@ export function runDaemon(
       if (task) return task.name;
     }
     return undefined;
+  };
+
+  const prepareShutdown = async (
+    request: PrepareShutdownRequest,
+    socket?: Socket,
+  ): Promise<void> => {
+    if (shutdownPreparation || closing) {
+      const blockers: RestartBlocker[] = [
+        {
+          kind: "background_work",
+          detail: "The daemon is already preparing another shutdown.",
+        },
+      ];
+      if (socket)
+        send(socket, { type: "shutdown_blocked", requestId: request.requestId, blockers });
+      return;
+    }
+    shutdownPreparation = true;
+    draining = true;
+    const blockers: RestartBlocker[] = [];
+    try {
+      if (
+        request.reason === "update" &&
+        request.expectedBuildId !== undefined &&
+        activeManagedBuildId() !== request.expectedBuildId
+      )
+        blockers.push({
+          kind: "superseded",
+          detail: `Update ${request.expectedBuildId.slice(0, 8)} is no longer the active managed build.`,
+        });
+
+      const liveSessions = [...sessions.values()].filter((session) => session.state === "running");
+      await Promise.all([...lifecycleTails.values()].map((tail) => tail.catch(() => undefined)));
+      await Promise.all(
+        liveSessions.flatMap((session) => {
+          const taskName = session.taskName ?? taskNameForSession(session.id);
+          return taskName
+            ? [ingestLifecycle(taskName, undefined, "the daemon is preparing to shut down")]
+            : [];
+        }),
+      );
+
+      for (const session of liveSessions) {
+        const taskName = session.taskName ?? taskNameForSession(session.id);
+        if (!taskName) {
+          blockers.push({
+            kind: "unknown_activity",
+            detail: `Session ${session.id} cannot be mapped to a registered task.`,
+          });
+          continue;
+        }
+        let matched = false;
+        for (const project of listProjects()) {
+          const task = listTasks(project).find(
+            (candidate) => candidate.name.toLowerCase() === taskName.toLowerCase(),
+          );
+          if (!task) continue;
+          matched = true;
+          const boundary = restartBoundary(task.name, readTaskState(project, task), session);
+          if (!boundary.safe) blockers.push(boundary.blocker);
+          break;
+        }
+        if (!matched)
+          blockers.push({
+            kind: "unknown_activity",
+            task: taskName,
+            detail: `Session ${session.id} references an unregistered task ${taskName}.`,
+          });
+      }
+      for (const task of intentTails.keys())
+        blockers.push({
+          kind: "active_intent",
+          task,
+          detail: `Task ${task} has an active daemon intent.`,
+        });
+      if (settlements.hasActiveRuns())
+        blockers.push({
+          kind: "background_work",
+          detail: "The daemon has active post-turn settlement work.",
+        });
+      if (
+        request.reason === "update" &&
+        request.expectedBuildId !== undefined &&
+        activeManagedBuildId() !== request.expectedBuildId &&
+        !blockers.some((blocker) => blocker.kind === "superseded")
+      )
+        blockers.push({
+          kind: "superseded",
+          detail: `Update ${request.expectedBuildId.slice(0, 8)} was superseded during shutdown preparation.`,
+        });
+
+      if (blockers.length) {
+        if (request.reason === "update" && request.expectedBuildId)
+          recordDaemonHandoff(request.expectedBuildId, "waiting", blockers);
+        if (socket)
+          send(socket, { type: "shutdown_blocked", requestId: request.requestId, blockers });
+        draining = false;
+        return;
+      }
+
+      if (request.reason === "update" && request.expectedBuildId)
+        recordDaemonHandoff(request.expectedBuildId, "restarting");
+      if (socket)
+        send(socket, { type: "shutdown_started", requestId: request.requestId, pid: process.pid });
+      const commit =
+        options.onPreparedShutdown ??
+        (request.reason === "update" && options.onUpdateHandoff
+          ? () => options.onUpdateHandoff?.()
+          : undefined) ??
+        ((reason: ShutdownReason) => {
+          if (reason === "update") process.exitCode = 75;
+          setTimeout(() => process.kill(process.pid, "SIGTERM"), 0);
+        });
+      commit(request.reason);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const failure: RestartBlocker = { kind: "lifecycle_failure", detail };
+      if (request.reason === "update" && request.expectedBuildId)
+        recordDaemonHandoff(request.expectedBuildId, "waiting", [failure]);
+      if (socket)
+        send(socket, {
+          type: "shutdown_blocked",
+          requestId: request.requestId,
+          blockers: [failure],
+        });
+      draining = false;
+    } finally {
+      shutdownPreparation = false;
+    }
   };
 
   const flushSessionInput = async (session: Session): Promise<void> => {
@@ -708,6 +849,14 @@ export function runDaemon(
     const handle = (message: ClientMessage): void => {
       switch (message.type) {
         case "start_session": {
+          if (draining) {
+            send(socket, {
+              type: "error",
+              requestId: message.requestId,
+              message: "The daemon is draining for shutdown and cannot start a session.",
+            });
+            return;
+          }
           debug(`Received start-session command for sandbox ${debugValue(message.taskName)}.`);
           void (async () => {
             let session = sessions.get(message.sessionId);
@@ -738,6 +887,10 @@ export function runDaemon(
             backgroundWork:
               intentTails.size + lifecycleTails.size + (settlements.hasActiveRuns() ? 1 : 0),
           });
+          return;
+        }
+        case "prepare_shutdown": {
+          void prepareShutdown(message, socket);
           return;
         }
         case "hello": {
@@ -806,6 +959,14 @@ export function runDaemon(
           return;
         }
         case "run_intent": {
+          if (draining) {
+            send(socket, {
+              type: "error",
+              intentId: message.intentId,
+              message: "The daemon is draining for shutdown and cannot accept an intent.",
+            });
+            return;
+          }
           if (!message.task || !message.intent?.kind) {
             send(socket, {
               type: "error",
@@ -818,6 +979,13 @@ export function runDaemon(
           return;
         }
         case "attach": {
+          if (draining) {
+            send(socket, {
+              type: "error",
+              message: "The daemon is draining for shutdown and cannot attach a new viewer.",
+            });
+            return;
+          }
           ownedSessionId = message.sessionId;
           void (async () => {
             const taskName = message.taskName ?? taskNameForSession(message.sessionId);
@@ -856,6 +1024,14 @@ export function runDaemon(
         case "input": {
           const session = sessions.get(message.sessionId);
           if (!session || session.activeWriter !== socket) return;
+          if (draining) {
+            send(socket, {
+              type: "error",
+              message: "The daemon is draining for shutdown and cannot accept input.",
+            });
+            return;
+          }
+          session.uncommittedInput = true;
           if (session.taskName) settlements.cancel(session.taskName);
           writeSessionInput(session, Buffer.from(message.dataBase64, "base64").toString("utf8"));
           return;
@@ -921,38 +1097,19 @@ export function runDaemon(
             debug(
               `Fleet release reconciliation is ${release.status}: ${debugValue(release.detail)}.`,
             );
-          const sessionsSafe = [...sessions.values()].every((session) => {
-            if (session.state === "exited") return true;
-            if (!session.taskName) return false;
-            for (const project of listProjects()) {
-              const task = listTasks(project).find(
-                (candidate) => candidate.name.toLowerCase() === session.taskName?.toLowerCase(),
-              );
-              if (task) return readTaskState(project, task).agentTurnState === "awaiting_input";
+          if (!updateHandoffRequested && fleetReleaseNeedsDaemonHandoff() && !shutdownPreparation) {
+            const desiredBuildId = activeManagedBuildId();
+            if (desiredBuildId) {
+              updateHandoffRequested = true;
+              void prepareShutdown({
+                type: "prepare_shutdown",
+                requestId: randomUUID(),
+                reason: "update",
+                expectedBuildId: desiredBuildId,
+              }).finally(() => {
+                if (!closing && !draining) updateHandoffRequested = false;
+              });
             }
-            return false;
-          });
-          if (
-            !updateHandoffRequested &&
-            fleetReleaseNeedsDaemonHandoff() &&
-            sessionsSafe &&
-            !busyTaskNames.size &&
-            !intentTails.size &&
-            !lifecycleTails.size &&
-            !settlements.hasActiveRuns()
-          ) {
-            updateHandoffRequested = true;
-            debug(
-              "The desired Boxers release is installed and daemon work is at a safe handoff boundary.",
-            );
-            if (options.onUpdateHandoff) options.onUpdateHandoff();
-            else if (socketPath === daemonSocketPath())
-              setTimeout(() => {
-                // systemd uses Restart=on-failure so normal `daemon stop`
-                // remains stopped while an update handoff is restarted.
-                process.exitCode = 75;
-                process.kill(process.pid, "SIGTERM");
-              }, 0);
           }
           const nextFailures = summary.failures.length ? failedAttempts + 1 : 0;
           const nextDelay = summary.failures.length
@@ -1106,6 +1263,10 @@ export function daemonMain(): boolean {
     ...(activeReleaseBuildId() ? { boxersBuildId: activeReleaseBuildId() } : {}),
     startedAt: new Date().toISOString(),
   });
+  const activeBuildId = activeReleaseBuildId();
+  const pendingHandoff = readDaemonHandoffState();
+  if (activeBuildId && pendingHandoff?.desiredBuildId === activeBuildId)
+    recordDaemonHandoff(activeBuildId, "active");
   const shutdown = (): void => {
     void close().then(() => {
       try {

@@ -42,7 +42,15 @@ export interface ListRequest {
   type: "list";
 }
 
-export const DAEMON_PROTOCOL_VERSION = 5;
+export type ShutdownReason = "stop" | "restart" | "update";
+export interface PrepareShutdownRequest {
+  type: "prepare_shutdown";
+  requestId: string;
+  reason: ShutdownReason;
+  expectedBuildId?: string;
+}
+
+export const DAEMON_PROTOCOL_VERSION = 6;
 
 export interface HelloRequest {
   type: "hello";
@@ -98,6 +106,7 @@ export type ClientMessage =
   | DetachMessage
   | StopMessage
   | ListRequest
+  | PrepareShutdownRequest
   | HelloRequest
   | SnapshotRequest
   | SubscribeRequest
@@ -136,6 +145,16 @@ export interface SessionsMessage {
   sessions: SessionInfo[];
   intents: { task: string }[];
   backgroundWork: number;
+}
+export interface ShutdownStartedMessage {
+  type: "shutdown_started";
+  requestId: string;
+  pid: number;
+}
+export interface ShutdownBlockedMessage {
+  type: "shutdown_blocked";
+  requestId: string;
+  blockers: import("./restart-boundary.ts").RestartBlocker[];
 }
 export interface ErrorMessage {
   type: "error";
@@ -194,6 +213,8 @@ export type ServerMessage =
   | ExitedMessage
   | SessionStartedMessage
   | SessionsMessage
+  | ShutdownStartedMessage
+  | ShutdownBlockedMessage
   | ErrorMessage
   | HelloMessage
   | SnapshotMessage
@@ -231,6 +252,7 @@ const CLIENT_MESSAGE_TYPES = new Set([
   "detach",
   "stop",
   "list",
+  "prepare_shutdown",
   "hello",
   "get_snapshot",
   "subscribe",
@@ -244,6 +266,8 @@ const SERVER_MESSAGE_TYPES = new Set([
   "exited",
   "session_started",
   "sessions",
+  "shutdown_started",
+  "shutdown_blocked",
   "error",
   "hello",
   "snapshot",
@@ -295,6 +319,15 @@ export function parseClientMessage(line: string): ClientMessage | undefined {
     value["type"] === "subscribe" &&
     value["authoritativeOnly"] !== undefined &&
     typeof value["authoritativeOnly"] !== "boolean"
+  )
+    return undefined;
+  if (
+    value["type"] === "prepare_shutdown" &&
+    (typeof value["requestId"] !== "string" ||
+      !["stop", "restart", "update"].includes(String(value["reason"])) ||
+      (value["expectedBuildId"] !== undefined &&
+        (typeof value["expectedBuildId"] !== "string" ||
+          !/^[a-f0-9]{64}$/.test(value["expectedBuildId"]))))
   )
     return undefined;
   return value as unknown as ClientMessage;

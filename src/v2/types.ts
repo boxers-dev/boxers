@@ -445,6 +445,8 @@ export interface RemoteSnapshot {
         desiredVersion: string;
         status: "current" | "pending" | "failed";
         detail?: string;
+        activation?: "waiting" | "restarting" | "active" | "failed";
+        blockers?: import("./restart-boundary.ts").RestartBlocker[];
       }
     | undefined;
   tasks: RemoteTaskSnapshot[];

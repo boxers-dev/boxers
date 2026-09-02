@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { daemonMain, runDaemon, type DaemonHandle } from "../../src/v2/daemon.ts";
 import {
+  DAEMON_PROTOCOL_VERSION,
   encodeMessage,
   LineDecoder,
   parseServerMessage,
@@ -189,6 +190,103 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<v
 }
 
 describe("daemon session lifecycle", () => {
+  it("prepares shutdown for a fresh task and freezes new admission", async () => {
+    const state = useTemporaryState();
+    registerTask(state, "fresh", "runtime-fresh");
+    const shutdowns: string[] = [];
+    const drains: string[] = [];
+    const socketPath = tempSocketPath();
+    daemon = runDaemon(socketPath, {
+      ingestLifecycle: async (taskName) => {
+        drains.push(taskName);
+        return [];
+      },
+      onPreparedShutdown: (reason) => shutdowns.push(reason),
+    });
+    const viewer = await connectClient(socketPath);
+    viewer.send({
+      type: "attach",
+      sessionId: "runtime-fresh",
+      taskName: "fresh",
+      command: process.execPath,
+      args: ["-e", ECHO_SCRIPT],
+      cols: 80,
+      rows: 24,
+    });
+    await viewer.next((message) => message.type === "output" || message.type === "replay");
+
+    const control = await connectClient(socketPath);
+    control.send({ type: "prepare_shutdown", requestId: "fresh-stop", reason: "restart" });
+    await expect(
+      control.next((message) => message.type === "shutdown_started"),
+    ).resolves.toMatchObject({ type: "shutdown_started", requestId: "fresh-stop" });
+    expect(shutdowns).toEqual(["restart"]);
+    expect(drains).toContain("fresh");
+
+    const rejected = await connectClient(socketPath);
+    rejected.send({
+      type: "start_session",
+      requestId: "too-late",
+      sessionId: "late",
+      taskName: "fresh",
+      bridgeToken: "0123456789abcdef0123456789abcdef",
+      command: process.execPath,
+      args: ["-e", ECHO_SCRIPT],
+      cols: 80,
+      rows: 24,
+    });
+    await expect(rejected.next((message) => message.type === "error")).resolves.toMatchObject({
+      type: "error",
+      requestId: "too-late",
+      message: expect.stringContaining("draining"),
+    });
+  });
+
+  it("returns a structured blocker for a provider turn that is working", async () => {
+    const state = useTemporaryState();
+    registerTask(state, "working", "runtime-working");
+    const project = listProjects()[0]!;
+    const task = listTasks(project)[0]!;
+    recordLifecycleEvent(project, task, {
+      version: 1,
+      sequence: 1,
+      event: {
+        version: 1,
+        kind: "user_prompt",
+        provider: "codex",
+        providerSessionId: "session",
+        providerTurnId: "turn",
+        prompt: "work",
+        recordedAt: "2030-01-01T00:00:00.000Z",
+      },
+      source: { provider: "codex", hookEvent: "UserPromptSubmit", rawBytes: 20 },
+    });
+    const socketPath = tempSocketPath();
+    daemon = runDaemon(socketPath, {
+      ingestLifecycle: async () => [],
+      onPreparedShutdown: () => undefined,
+    });
+    const viewer = await connectClient(socketPath);
+    viewer.send({
+      type: "attach",
+      sessionId: "runtime-working",
+      taskName: "working",
+      command: process.execPath,
+      args: ["-e", ECHO_SCRIPT],
+      cols: 80,
+      rows: 24,
+    });
+    await viewer.next((message) => message.type === "output" || message.type === "replay");
+    const control = await connectClient(socketPath);
+    control.send({ type: "prepare_shutdown", requestId: "working-stop", reason: "restart" });
+    await expect(
+      control.next((message) => message.type === "shutdown_blocked"),
+    ).resolves.toMatchObject({
+      type: "shutdown_blocked",
+      blockers: [{ kind: "working", task: "working" }],
+    });
+  });
+
   it("drains a lifecycle wake and starts one settlement for a duplicate Stop", async () => {
     const token = "0123456789abcdef0123456789abcdef";
     const frame = encodeLifecycleWakeFrame(token, 7);
@@ -415,7 +513,11 @@ describe("daemon session lifecycle", () => {
       cols: 100,
       rows: 40,
     });
-    viewer.send({ type: "hello", requestId: "attached-without-input", protocolVersion: 5 });
+    viewer.send({
+      type: "hello",
+      requestId: "attached-without-input",
+      protocolVersion: DAEMON_PROTOCOL_VERSION,
+    });
     await viewer.next(
       (message) => message.type === "hello" && message.requestId === "attached-without-input",
     );
@@ -584,12 +686,16 @@ describe("daemon session lifecycle", () => {
     const socketPath = tempSocketPath();
     daemon = runDaemon(socketPath);
     const client = await connectClient(socketPath);
-    client.send({ type: "hello", requestId: "hello-1", protocolVersion: 5 });
+    client.send({
+      type: "hello",
+      requestId: "hello-1",
+      protocolVersion: DAEMON_PROTOCOL_VERSION,
+    });
     const hello = await client.next((message) => message.type === "hello");
     expect(hello).toMatchObject({
       type: "hello",
       requestId: "hello-1",
-      protocolVersion: 5,
+      protocolVersion: DAEMON_PROTOCOL_VERSION,
       revision: 0,
     });
     if (hello.type !== "hello") throw new Error("Expected daemon hello.");
@@ -1086,7 +1192,11 @@ describe("daemon session lifecycle", () => {
     expect(existsSync(marker)).toBe(true);
 
     const control = await connectClient(socketPath);
-    control.send({ type: "hello", requestId: "during-backpressure", protocolVersion: 5 });
+    control.send({
+      type: "hello",
+      requestId: "during-backpressure",
+      protocolVersion: DAEMON_PROTOCOL_VERSION,
+    });
     await expect(control.next((message) => message.type === "hello")).resolves.toMatchObject({
       requestId: "during-backpressure",
     });

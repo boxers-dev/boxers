@@ -13,6 +13,7 @@ import type {
 } from "./types.ts";
 import { readHostStatus } from "./host-status.ts";
 import { fleetReleaseIsAcknowledged, readFleetUpdateState } from "./fleet-update.ts";
+import { readDaemonHandoffState } from "./daemon-handoff.ts";
 import { deriveTaskView } from "./task-view.ts";
 import { readTaskIntentOperations } from "./leases.ts";
 
@@ -46,8 +47,7 @@ export function projectTaskView(
 ): TaskView {
   let state = recordedState;
   const setupConfigured = state.setupConfigured ?? Boolean(state.setup);
-  const checksConfigured =
-    state.checksConfigured ?? Boolean(state.check || state.checkProgress);
+  const checksConfigured = state.checksConfigured ?? Boolean(state.check || state.checkProgress);
   const checkConfigHash = state.checkConfigHash;
   const recordedOperations = readTaskIntentOperations(task.name.toLowerCase());
   const recordedOperation = recordedOperations.find((operation) => operation.state === "running");
@@ -98,6 +98,7 @@ export function captureStateProjection(): RemoteSnapshot {
   const localUpdate = update.acknowledgements.find(
     (acknowledgement) => acknowledgement.body.hostId === localId,
   );
+  const handoff = readDaemonHandoffState();
   const servedAt = new Date().toISOString();
   let observedAt = servedAt;
   const tasks = projects.flatMap((project) =>
@@ -137,12 +138,33 @@ export function captureStateProjection(): RemoteSnapshot {
           boxersUpdate: {
             desiredBuildId: update.desired.body.release.buildId,
             desiredVersion: update.desired.body.release.packageVersion,
-            status: fleetReleaseIsAcknowledged(localId, update)
-              ? ("current" as const)
-              : localUpdate?.body.status === "failed"
+            status:
+              localUpdate?.body.status === "failed" ||
+              (handoff?.desiredBuildId === update.desired.body.release.buildId &&
+                handoff.status === "failed")
                 ? ("failed" as const)
-                : ("pending" as const),
-            ...(localUpdate?.body.detail ? { detail: localUpdate.body.detail } : {}),
+                : fleetReleaseIsAcknowledged(localId, update) &&
+                    !(
+                      handoff?.desiredBuildId === update.desired.body.release.buildId &&
+                      ["waiting", "restarting"].includes(handoff.status)
+                    )
+                  ? ("current" as const)
+                  : ("pending" as const),
+            ...(handoff?.desiredBuildId === update.desired.body.release.buildId
+              ? {
+                  activation: handoff.status,
+                  ...(handoff.blockers.length ? { blockers: handoff.blockers } : {}),
+                  ...(handoff.lastError
+                    ? { detail: handoff.lastError }
+                    : handoff.blockers.length
+                      ? { detail: handoff.blockers.map((blocker) => blocker.detail).join("; ") }
+                      : localUpdate?.body.detail
+                        ? { detail: localUpdate.body.detail }
+                        : {}),
+                }
+              : localUpdate?.body.detail
+                ? { detail: localUpdate.body.detail }
+                : {}),
           },
         }
       : {}),

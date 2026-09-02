@@ -1,5 +1,13 @@
 import { createServer, type Server } from "node:net";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +17,7 @@ import {
   daemonStatus,
   daemonStop,
   isBoxersDaemonCommand,
+  type PreparedShutdownResult,
   runUpdateHandoffWorker,
   tailDaemonLog,
   waitForProcessExit,
@@ -16,12 +25,15 @@ import {
 import {
   daemonLockPath,
   daemonHealthPath,
+  daemonHandoffPath,
   daemonLogPath,
   daemonPidPath,
   daemonSocketPath,
   taskStatePath,
 } from "../../src/v2/paths.ts";
 import type { AgentTurnState } from "../../src/v2/types.ts";
+import { recordDaemonHandoff } from "../../src/v2/daemon-handoff.ts";
+import type { ShutdownReason } from "../../src/v2/daemon-protocol.ts";
 
 const previousHome = process.env.BOXERS_HOME;
 let home: string | undefined;
@@ -50,7 +62,62 @@ async function activityFixture(
   const pid = 424_242;
   writeFileSync(daemonPidPath(), `${recordedPid}\n`);
   server = createServer((socket) => {
-    socket.once("data", () => socket.end(`${JSON.stringify(response)}\n`));
+    socket.once("data", (chunk) => {
+      if ((response as { type?: string }).type !== "sessions") {
+        socket.end(`${JSON.stringify(response)}\n`);
+        return;
+      }
+      const request = JSON.parse(String(chunk)) as { type: string; requestId: string };
+      if (request.type !== "prepare_shutdown") {
+        socket.end(`${JSON.stringify(response)}\n`);
+        return;
+      }
+      const activity = response as {
+        pid: number;
+        sessions: { sessionId: string; state: string }[];
+        intents: { task: string }[];
+        backgroundWork?: number;
+      };
+      const blockers: { kind: string; task?: string; detail: string }[] = [];
+      for (const session of activity.sessions.filter(
+        (candidate) => candidate.state === "running",
+      )) {
+        const statePath = taskStatePath("project-id", "task-id");
+        if (!existsSync(statePath)) {
+          blockers.push({
+            kind: "unknown_activity",
+            detail: `Session ${session.sessionId} cannot be mapped to a registered task.`,
+          });
+          continue;
+        }
+        const state = JSON.parse(readFileSync(statePath, "utf8")) as { agentTurnState: string };
+        if (state.agentTurnState === "working")
+          blockers.push({
+            kind: "working",
+            task: "restart-boundary",
+            detail: "Task restart-boundary's provider turn is still working.",
+          });
+      }
+      for (const intent of activity.intents)
+        blockers.push({
+          kind: "active_intent",
+          task: intent.task,
+          detail: `Task ${intent.task} has an active daemon intent.`,
+        });
+      if (activity.backgroundWork)
+        blockers.push({
+          kind: "background_work",
+          detail: "The daemon has active background work.",
+        });
+      socket.end(
+        `${JSON.stringify(
+          blockers.length
+            ? { type: "shutdown_blocked", requestId: request.requestId, blockers }
+            : { type: "shutdown_started", requestId: request.requestId, pid: activity.pid },
+        )}\n`,
+      );
+      if (!blockers.length) stopped = true;
+    });
   });
   await new Promise<void>((resolve, reject) => {
     server?.once("error", reject);
@@ -110,6 +177,8 @@ function registerSessionTask(sessionId: string, agentTurnState: AgentTurnState):
       agentTurnState,
       conversationHighWaterSequence: agentTurnState === "not_started" ? 0 : 1,
       lifecycleDrainSequence: agentTurnState === "not_started" ? 0 : 1,
+      ...(agentTurnState === "working" ? { lastLifecycleEventKind: "user_prompt" } : {}),
+      ...(agentTurnState === "awaiting_input" ? { lastLifecycleEventKind: "turn_finished" } : {}),
       promotionConversationCheckpoint: 0,
       hasUnmergedChanges: {
         value: "unknown",
@@ -149,6 +218,40 @@ describe("daemon lifecycle safety", () => {
     await expect(runUpdateHandoffWorker(buildId, 1, () => newerBuildId)).resolves.toBe(0);
 
     expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("retries structured blockers before activating the prepared update", async () => {
+    home = mkdtempSync(join(tmpdir(), "boxers-daemon-handoff-"));
+    process.env.BOXERS_HOME = home;
+    const buildId = "a".repeat(64);
+    let active = false;
+    const requests: string[] = [];
+    const requestShutdown = vi.fn(
+      async (reason: ShutdownReason): Promise<PreparedShutdownResult> => {
+        requests.push(reason);
+        return requests.length === 1
+          ? {
+              status: "blocked",
+              blockers: [{ kind: "working", task: "parser", detail: "still working" }],
+            }
+          : { status: "started", pid: 424_242 };
+      },
+    );
+
+    await expect(
+      runUpdateHandoffWorker(buildId, 1, () => buildId, {
+        serviceBuildId: () => (active ? buildId : undefined),
+        requestShutdown,
+        waitForExit: async () => undefined,
+        start: async () => {
+          active = true;
+          return 0;
+        },
+      }),
+    ).resolves.toBe(0);
+
+    expect(requests).toEqual(["update", "update"]);
+    expect(readFileSync(daemonHandoffPath(), "utf8")).toContain('"status": "active"');
   });
 
   it("keeps a service waiter alive until the existing daemon exits", async () => {
@@ -259,7 +362,7 @@ describe("daemon lifecycle safety", () => {
       sessions: [{ sessionId: "task", state: "running", viewers: 0 }],
       intents: [],
     });
-    await expect(daemonStop()).rejects.toThrow(/1 agent session.*task activity unknown.*0 intent/s);
+    await expect(daemonStop()).rejects.toThrow(/cannot be mapped to a registered task/);
     expect(kill.mock.calls.some((call: unknown[]) => call[1] === "SIGTERM")).toBe(false);
   });
 
@@ -275,7 +378,7 @@ describe("daemon lifecycle safety", () => {
     vi.spyOn(process.stdout, "write").mockReturnValue(true);
 
     await expect(daemonStop()).resolves.toBe(0);
-    expect(kill.mock.calls.some((call: unknown[]) => call[1] === "SIGTERM")).toBe(true);
+    expect(kill.mock.calls.some((call: unknown[]) => call[1] === 0)).toBe(true);
   });
 
   it("identifies a working task that prevents normal restart", async () => {
@@ -288,9 +391,7 @@ describe("daemon lifecycle safety", () => {
     });
     registerSessionTask(sessionId, "working");
 
-    await expect(daemonStop()).rejects.toThrow(
-      /boxers-project-restart-boundary \(restart-boundary: working\)/,
-    );
+    await expect(daemonStop()).rejects.toThrow(/restart-boundary.*provider turn is still working/);
     expect(kill.mock.calls.some((call: unknown[]) => call[1] === "SIGTERM")).toBe(false);
   });
 
@@ -301,7 +402,7 @@ describe("daemon lifecycle safety", () => {
       sessions: [],
       intents: [{ task: "reviewing" }],
     });
-    await expect(daemonStop()).rejects.toThrow(/0 agent session.*1 intent.*0 background/s);
+    await expect(daemonStop()).rejects.toThrow(/reviewing.*active daemon intent/);
     expect(kill.mock.calls.some((call: unknown[]) => call[1] === "SIGTERM")).toBe(false);
   });
 
@@ -313,7 +414,7 @@ describe("daemon lifecycle safety", () => {
       intents: [],
       backgroundWork: 1,
     });
-    await expect(daemonStop()).rejects.toThrow(/1 background operation/);
+    await expect(daemonStop()).rejects.toThrow(/active background work/);
     expect(kill.mock.calls.some((call: unknown[]) => call[1] === "SIGTERM")).toBe(false);
   });
 
@@ -326,7 +427,7 @@ describe("daemon lifecycle safety", () => {
     });
     vi.spyOn(process.stdout, "write").mockReturnValue(true);
     await expect(daemonStop()).resolves.toBe(0);
-    expect(kill.mock.calls.some((call: unknown[]) => call[1] === "SIGTERM")).toBe(true);
+    expect(kill.mock.calls.some((call: unknown[]) => call[1] === 0)).toBe(true);
   });
 
   it("retires a handoff superseded while it checks daemon safety", async () => {
@@ -369,9 +470,9 @@ describe("daemon lifecycle safety", () => {
     vi.spyOn(process.stdout, "write").mockReturnValue(true);
 
     await expect(daemonStop()).resolves.toBe(0);
-    expect(
-      kill.mock.calls.some((call: unknown[]) => call[0] === 424_242 && call[1] === "SIGTERM"),
-    ).toBe(true);
+    expect(kill.mock.calls.some((call: unknown[]) => call[0] === 424_242 && call[1] === 0)).toBe(
+      true,
+    );
   });
 
   it("force-stops a verified daemon without querying its socket", async () => {
@@ -458,6 +559,30 @@ describe("daemon lifecycle safety", () => {
       running: true,
       responsive: false,
       pid: 424_242,
+    });
+  });
+
+  it("includes structured handoff blockers in daemon status", async () => {
+    await activityFixture({
+      type: "sessions",
+      pid: 424_242,
+      sessions: [],
+      intents: [],
+      backgroundWork: 0,
+    });
+    const buildId = "a".repeat(64);
+    recordDaemonHandoff(buildId, "waiting", [
+      { kind: "working", task: "parser", detail: "Task parser is still working." },
+    ]);
+    const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+
+    await expect(daemonStatus(true)).resolves.toBe(0);
+    expect(JSON.parse(write.mock.calls.map((call) => String(call[0])).join(""))).toMatchObject({
+      handoff: {
+        desiredBuildId: buildId,
+        status: "waiting",
+        blockers: [{ kind: "working", task: "parser" }],
+      },
     });
   });
 

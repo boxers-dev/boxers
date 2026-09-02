@@ -2,16 +2,19 @@ import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } fro
 import { connect } from "node:net";
 import { daemonMain } from "./daemon.ts";
 import { ensureDaemonReady } from "./daemon-client.ts";
-import { encodeMessage, LineDecoder, parseServerMessage } from "./daemon-protocol.ts";
+import {
+  encodeMessage,
+  LineDecoder,
+  parseServerMessage,
+  type ShutdownReason,
+} from "./daemon-protocol.ts";
 import { daemonLockPath, daemonLogPath, daemonPidPath, daemonSocketPath } from "./paths.ts";
-import { listRegisteredTasks } from "./registry.ts";
-import { taskRuntimeId } from "./runtime/task.ts";
-import { readTaskState } from "./state.ts";
-import type { AgentTurnState } from "./types.ts";
 import { daemonProcessCommandLine, isBoxersDaemonCommand } from "./daemon-identity.ts";
 import { daemonServiceStatus } from "./service.ts";
 import { activeManagedBuildId, rollbackManagedRelease } from "./release.ts";
 import { recordFleetReleaseFailure } from "./fleet-update.ts";
+import type { RestartBlocker } from "./restart-boundary.ts";
+import { readDaemonHandoffState, recordDaemonHandoff } from "./daemon-handoff.ts";
 
 export { isBoxersDaemonCommand } from "./daemon-identity.ts";
 
@@ -225,7 +228,7 @@ async function stopDaemonProcess(
 export async function daemonStop(
   force = false,
   inspectProcess: (pid: number) => string | undefined = daemonProcessCommandLine,
-  beforeSignal?: () => void,
+  reason: ShutdownReason = "stop",
 ): Promise<number> {
   if (force) {
     const candidates = [readPidFile(daemonLockPath()), readDaemonPid()];
@@ -250,9 +253,9 @@ export async function daemonStop(
     );
     return stopDaemonProcess(pid, true, inspectProcess);
   }
-  let status: SessionsQuery;
+  let result: PreparedShutdownResult;
   try {
-    status = await querySessions();
+    result = await requestPreparedShutdown(reason);
   } catch (error) {
     const recordedPids = [readPidFile(daemonLockPath()), readDaemonPid()].filter(
       (pid): pid is number => pid !== undefined && processIsAlive(pid),
@@ -265,34 +268,25 @@ export async function daemonStop(
       `Could not verify that the daemon is safe to stop: ${error instanceof Error ? error.message : String(error)} If interrupting daemon-owned work is acceptable, run \`boxers daemon stop --force\`.`,
     );
   }
-  const runningSessions = status.sessions.filter((session) => session.state === "running");
-  const blockingSessions = runningSessions.flatMap((session) => {
-    const boundary = sessionRestartBoundary(session.sessionId);
-    return boundary.safe ? [] : [{ session, boundary }];
-  });
-  const legacySettlementWork =
-    status.backgroundWork === undefined && persistedSettlementInProgress();
-  const backgroundWork = status.backgroundWork ?? (legacySettlementWork ? 1 : 0);
-  if (blockingSessions.length || status.intents.length || backgroundWork) {
-    const details = blockingSessions
-      .map(({ session, boundary }) =>
-        boundary.taskName
-          ? `${session.sessionId} (${boundary.taskName}: ${boundary.turnState})`
-          : `${session.sessionId} (task activity unknown)`,
-      )
-      .join(", ");
+  if (result.status === "blocked")
     throw new Error(
-      `The daemon still owns ${blockingSessions.length} agent session(s) that are working or not confirmed to be awaiting input${details ? `: ${details}` : ""}, ${status.intents.length} intent(s), and ${backgroundWork} background operation(s). Finish them before restarting the daemon; stopping now would interrupt durable task work.`,
+      `The daemon is not ready to stop:\n${result.blockers.map((blocker) => `  ${blocker.task ? `${blocker.task}: ` : ""}${blocker.detail}`).join("\n")}`,
     );
+  for (let attempt = 0; attempt < 20; attempt++) {
+    if (!processIsAlive(result.pid)) {
+      process.stdout.write("Stopped the boxers daemon.\n");
+      return 0;
+    }
+    await wait(200);
   }
-  beforeSignal?.();
-  return stopDaemonProcess(status.pid, false);
+  throw new Error(`The boxers daemon (pid ${result.pid}) did not stop within 4s.`);
 }
 
 /** Safely stop the current daemon, then start and readiness-check its replacement. */
 export async function daemonRestart(
   force = false,
-  stop: (force: boolean) => Promise<number> = daemonStop,
+  stop: (force: boolean) => Promise<number> = (requestedForce) =>
+    daemonStop(requestedForce, daemonProcessCommandLine, "restart"),
   start: () => Promise<number> = daemonStart,
 ): Promise<number> {
   await stop(force);
@@ -304,6 +298,15 @@ export async function runUpdateHandoffWorker(
   expectedBuildId: string,
   intervalMs = 1_000,
   activatedBuildId: () => string | undefined = activeManagedBuildId,
+  dependencies: {
+    serviceBuildId?: () => string | undefined;
+    requestShutdown?: (
+      reason: ShutdownReason,
+      expectedBuildId?: string,
+    ) => Promise<PreparedShutdownResult>;
+    start?: () => Promise<number>;
+    waitForExit?: (pid: number) => Promise<void>;
+  } = {},
 ): Promise<number> {
   if (!/^[a-f0-9]{64}$/.test(expectedBuildId))
     throw new Error("Invalid Boxers update handoff build ID.");
@@ -311,12 +314,25 @@ export async function runUpdateHandoffWorker(
   const assertCurrent = (): void => {
     if (!isCurrent()) throw new SupersededUpdateHandoff();
   };
-  while (daemonServiceStatus().boxersBuildId !== expectedBuildId) {
+  const serviceBuildId = dependencies.serviceBuildId ?? (() => daemonServiceStatus().boxersBuildId);
+  const requestShutdown = dependencies.requestShutdown ?? requestPreparedShutdown;
+  const start = dependencies.start ?? daemonStart;
+  const waitForExit = dependencies.waitForExit ?? waitForProcessExit;
+  while (serviceBuildId() !== expectedBuildId) {
     try {
       assertCurrent();
-      await daemonRestart(false, (force) =>
-        daemonStop(force, daemonProcessCommandLine, assertCurrent),
-      );
+      recordDaemonHandoff(expectedBuildId, "waiting");
+      const result = await requestShutdown("update", expectedBuildId);
+      if (result.status === "blocked") {
+        recordDaemonHandoff(expectedBuildId, "waiting", result.blockers);
+        if (result.blockers.some((blocker) => blocker.kind === "superseded")) return 0;
+        await wait(intervalMs);
+        continue;
+      }
+      recordDaemonHandoff(expectedBuildId, "restarting");
+      await waitForExit(result.pid);
+      assertCurrent();
+      await start();
     } catch (error) {
       if (error instanceof SupersededUpdateHandoff || !isCurrent()) return 0;
       if (!daemonServiceStatus().active && rollbackManagedRelease(expectedBuildId)) {
@@ -328,11 +344,24 @@ export async function runUpdateHandoffWorker(
           // Local-only updates have no fleet rollout to mark failed.
         }
         await daemonRestart(false);
+        recordDaemonHandoff(
+          expectedBuildId,
+          "failed",
+          [],
+          error instanceof Error ? error.message : String(error),
+        );
         return 1;
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+      recordDaemonHandoff(
+        expectedBuildId,
+        "waiting",
+        [],
+        error instanceof Error ? error.message : String(error),
+      );
+      await wait(intervalMs);
     }
   }
+  recordDaemonHandoff(expectedBuildId, "active");
   return 0;
 }
 
@@ -343,42 +372,58 @@ interface SessionsQuery {
   backgroundWork?: number;
 }
 
-function persistedSettlementInProgress(): boolean {
-  return listRegisteredTasks().some(({ project, task }) => {
-    try {
-      const phase = readTaskState(project, task).settlement?.phase;
-      return Boolean(
-        phase &&
-        ["refreshing", "reconciling", "capturing", "checking", "generating"].includes(phase),
-      );
-    } catch {
-      return true;
-    }
-  });
-}
+export type PreparedShutdownResult =
+  | { status: "started"; pid: number }
+  | { status: "blocked"; blockers: RestartBlocker[] };
 
-interface SessionRestartBoundary {
-  safe: boolean;
-  taskName?: string;
-  turnState?: AgentTurnState;
-}
-
-/** Only a provider-confirmed completed turn is safe to interrupt during normal restart. */
-function sessionRestartBoundary(sessionId: string): SessionRestartBoundary {
-  try {
-    const registered = listRegisteredTasks().find(
-      ({ task }) => taskRuntimeId(task) === sessionId || task.id === sessionId,
-    );
-    if (!registered) return { safe: false };
-    const turnState = readTaskState(registered.project, registered.task).agentTurnState;
-    return {
-      safe: turnState === "awaiting_input",
-      taskName: registered.task.name,
-      turnState,
+/** Ask the daemon to freeze admission, drain lifecycle state, classify work, and shut itself down. */
+export function requestPreparedShutdown(
+  reason: ShutdownReason,
+  expectedBuildId?: string,
+): Promise<PreparedShutdownResult> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(daemonSocketPath());
+    const requestId = `${process.pid}-${Date.now()}`;
+    const decoder = new LineDecoder();
+    let settled = false;
+    const finish = (result: PreparedShutdownResult | Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      if (result instanceof Error) reject(result);
+      else resolve(result);
     };
-  } catch {
-    return { safe: false };
-  }
+    const timer = setTimeout(
+      () => finish(new Error("Timed out waiting for the daemon to prepare shutdown.")),
+      15_000,
+    );
+    socket.setEncoding("utf8");
+    socket.once("connect", () =>
+      socket.write(
+        encodeMessage({
+          type: "prepare_shutdown",
+          requestId,
+          reason,
+          ...(expectedBuildId ? { expectedBuildId } : {}),
+        }),
+      ),
+    );
+    socket.once("error", (error) => finish(error));
+    socket.once("close", () => {
+      if (!settled) finish(new Error("The daemon closed the shutdown preparation connection."));
+    });
+    socket.on("data", (chunk: string) => {
+      for (const line of decoder.push(chunk)) {
+        const message = parseServerMessage(line);
+        if (!message || !("requestId" in message) || message.requestId !== requestId) continue;
+        if (message.type === "shutdown_started") finish({ status: "started", pid: message.pid });
+        else if (message.type === "shutdown_blocked")
+          finish({ status: "blocked", blockers: message.blockers });
+        else if (message.type === "error") finish(new Error(message.message));
+      }
+    });
+  });
 }
 
 function querySessions(): Promise<SessionsQuery> {
@@ -435,6 +480,7 @@ function querySessions(): Promise<SessionsQuery> {
 }
 
 export async function daemonStatus(json: boolean): Promise<number> {
+  const handoff = readDaemonHandoffState();
   let status: SessionsQuery;
   try {
     status = await querySessions();
@@ -444,7 +490,7 @@ export async function daemonStatus(json: boolean): Promise<number> {
       const detail = error instanceof Error ? error.message : String(error);
       if (json)
         process.stdout.write(
-          `${JSON.stringify({ running: true, responsive: false, pid, error: detail })}\n`,
+          `${JSON.stringify({ running: true, responsive: false, pid, error: detail, ...(handoff ? { handoff } : {}) })}\n`,
         );
       else
         process.stdout.write(
@@ -454,13 +500,15 @@ export async function daemonStatus(json: boolean): Promise<number> {
     }
     if (json)
       process.stdout.write(
-        `${JSON.stringify({ running: false, responsive: false, sessions: [], intents: [] })}\n`,
+        `${JSON.stringify({ running: false, responsive: false, sessions: [], intents: [], ...(handoff ? { handoff } : {}) })}\n`,
       );
     else process.stdout.write("The boxers daemon is not running.\n");
     return 0;
   }
   if (json) {
-    process.stdout.write(`${JSON.stringify({ running: true, responsive: true, ...status })}\n`);
+    process.stdout.write(
+      `${JSON.stringify({ running: true, responsive: true, ...status, ...(handoff ? { handoff } : {}) })}\n`,
+    );
     return 0;
   }
   process.stdout.write(
@@ -472,5 +520,13 @@ export async function daemonStatus(json: boolean): Promise<number> {
     );
   for (const intent of status.intents)
     process.stdout.write(`  ${intent.task}\tintent in progress\n`);
+  if (handoff) {
+    process.stdout.write(
+      `Daemon handoff ${handoff.status} for build ${handoff.desiredBuildId.slice(0, 8)}.\n`,
+    );
+    for (const blocker of handoff.blockers)
+      process.stdout.write(`  ${blocker.task ? `${blocker.task}\t` : ""}${blocker.detail}\n`);
+    if (handoff.lastError) process.stdout.write(`  ${handoff.lastError}\n`);
+  }
   return 0;
 }

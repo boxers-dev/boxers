@@ -47,6 +47,10 @@ export function daemonHealthPath(): string {
   return join(boxersHome(), "daemon-health.json");
 }
 
+export function daemonHandoffPath(): string {
+  return join(boxersHome(), "daemon-handoff.json");
+}
+
 export function hostStatusPath(): string {
   return join(boxersHome(), "host-status.json");
 }

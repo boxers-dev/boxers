@@ -114,6 +114,19 @@ describe("multi-machine protocol", () => {
     expect(parseRemoteSnapshot(JSON.stringify(withHostStatus)).hostStatus).toEqual(
       withHostStatus.hostStatus,
     );
+    const withPendingActivation = {
+      ...snapshot,
+      boxersUpdate: {
+        desiredBuildId: "a".repeat(64),
+        desiredVersion: "0.3.0",
+        status: "pending",
+        activation: "waiting",
+        blockers: [{ kind: "working", task: "multi-host", detail: "still working" }],
+      },
+    } as const;
+    expect(parseRemoteSnapshot(JSON.stringify(withPendingActivation)).boxersUpdate).toEqual(
+      withPendingActivation.boxersUpdate,
+    );
     expect(() =>
       parseRemoteSnapshot(
         JSON.stringify({

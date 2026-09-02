@@ -199,6 +199,15 @@ sessions continue until a provider-confirmed safe daemon handoff boundary.
 Boxers never downgrades a newer official release without an explicit
 fleet-wide confirmation.
 
+Daemon handoff drains durable lifecycle records before deciding whether a
+restart is safe. A fresh task with no submitted provider turn, a completed turn
+awaiting input, and an exited session are safe boundaries. Active turns,
+unconfirmed terminal input, intents, and post-turn processing remain blockers.
+While preparing shutdown the daemon rejects new sessions, input, and intents so
+the decision cannot race newly admitted work. `boxers status` and
+`boxers daemon status` report an installed release as pending until the desired
+daemon build is active, including the task or operation delaying handoff.
+
 When Boxers is run from its own source checkout, `boxers update` builds that
 checkout automatically and distributes the resulting development build. No
 publish or package step is required.

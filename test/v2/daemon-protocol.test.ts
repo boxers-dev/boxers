@@ -79,6 +79,39 @@ describe("daemon wire protocol", () => {
     ).toBeUndefined();
   });
 
+  it("validates prepared shutdown requests and structured responses", () => {
+    const buildId = "a".repeat(64);
+    expect(
+      parseClientMessage(
+        encodeMessage({
+          type: "prepare_shutdown",
+          requestId: "shutdown-1",
+          reason: "update",
+          expectedBuildId: buildId,
+        }).trim(),
+      ),
+    ).toMatchObject({ type: "prepare_shutdown", reason: "update", expectedBuildId: buildId });
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "prepare_shutdown",
+          requestId: "shutdown-1",
+          reason: "update",
+          expectedBuildId: "not-a-build",
+        }),
+      ),
+    ).toBeUndefined();
+    expect(
+      parseServerMessage(
+        encodeMessage({
+          type: "shutdown_blocked",
+          requestId: "shutdown-1",
+          blockers: [{ kind: "working", task: "task-a", detail: "still working" }],
+        }).trim(),
+      ),
+    ).toMatchObject({ type: "shutdown_blocked", blockers: [{ kind: "working" }] });
+  });
+
   it("rejects malformed or unrecognized lines instead of throwing", () => {
     expect(parseClientMessage("not json")).toBeUndefined();
     expect(parseClientMessage(JSON.stringify({ type: "unknown" }))).toBeUndefined();
