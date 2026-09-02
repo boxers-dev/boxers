@@ -76,6 +76,7 @@ export type TaskIntent =
   | { kind: "sync" }
   | { kind: "review"; color?: boolean }
   | { kind: "check" }
+  | { kind: "setup" }
   | { kind: "promote"; message?: string; skipChecks: boolean }
   | { kind: "preview"; action?: "show" | "start" | "stop" | "restart" | "logs" }
   | { kind: "discard"; force: boolean };
@@ -273,7 +274,7 @@ export function parseClientMessage(line: string): ClientMessage | undefined {
       typeof value["task"] !== "string" ||
       !intent ||
       typeof intent !== "object" ||
-      !["refresh", "sync", "review", "check", "promote", "preview", "discard"].includes(
+      !["refresh", "sync", "review", "check", "setup", "promote", "preview", "discard"].includes(
         String((intent as Record<string, unknown>)["kind"]),
       )
     )

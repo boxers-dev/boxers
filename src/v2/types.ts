@@ -42,6 +42,8 @@ export interface SetupStatus {
   pid?: number;
   exitCode?: number;
   logPath: string;
+  attempt?: number;
+  maxAttempts?: number;
 }
 
 export interface CheckResult {
@@ -59,6 +61,25 @@ export interface CheckRun {
   candidateTreeOid: string;
   configHash: string;
   results: CheckResult[];
+}
+
+export interface CheckProgress {
+  targetOid: string;
+  candidateTreeOid: string;
+  configHash: string;
+  total: number;
+  completed: number;
+  current?: string;
+  startedAt: string;
+}
+
+export interface DeliveryRecord {
+  ref: string;
+  oid: string;
+  subject: string;
+  deliveredAt: string;
+  conversationSequence: number;
+  checks: "passed" | "skipped" | "not_configured";
 }
 
 export interface CandidateCommitMessage {
@@ -122,6 +143,123 @@ export interface Observation<T> {
   value: T;
   observedAt: string;
   source: ObservationSource;
+  /** Conversation sequence causally preceding a Git workspace observation. */
+  conversationSequence?: number;
+}
+
+export type TaskOperationKind =
+  | "setup"
+  | "refreshing_target"
+  | "reconciling"
+  | "capturing_changes"
+  | "running_checks"
+  | "generating_metadata"
+  | "reviewing"
+  | "promoting"
+  | "discarding"
+  | "starting_preview";
+
+export interface OperationView {
+  kind: TaskOperationKind;
+  state: "queued" | "running" | "cancelling";
+  startedAt?: string;
+  detail?: string;
+}
+
+export interface RecordedTaskOperation extends OperationView {
+  intentId?: string;
+}
+
+export interface TaskActionView {
+  kind:
+    | "wait"
+    | "attach"
+    | "retry_setup"
+    | "resolve_conflicts"
+    | "fix_checks"
+    | "refresh"
+    | "review"
+    | "check"
+    | "promote"
+    | "discard"
+    | "doctor";
+  label: string;
+  command?: string;
+  reason: string;
+}
+
+export interface TaskIssue {
+  code:
+    | "setup_failed"
+    | "setup_timed_out"
+    | "reconciliation_conflict"
+    | "checks_failed"
+    | "preview_failed"
+    | "runtime_unavailable"
+    | "lifecycle_capture_failed"
+    | "operation_failed";
+  source: "setup" | "reconciliation" | "checks" | "preview" | "runtime" | "daemon";
+  message: string;
+  owner: "agent" | "user" | "boxers" | "host";
+  logPath?: string;
+  remediation?: TaskActionView;
+}
+
+export interface TaskView {
+  agent: { state: AgentTurnState; label: string };
+  operations: OperationView[];
+  setup: {
+    state: "not_configured" | "running" | "retrying" | "passed" | "failed" | "timed_out";
+    command?: string;
+    startedAt?: string;
+    finishedAt?: string;
+    attempt?: number;
+    maxAttempts?: number;
+    exitCode?: number;
+    logPath?: string;
+  };
+  reconciliation: {
+    state:
+      | "not_needed"
+      | "awaiting_setup"
+      | "queued"
+      | "running"
+      | "current"
+      | "conflicted"
+      | "failed";
+    conflicts?: string[];
+  };
+  changes: {
+    state: "unknown" | "none" | "capturing" | "reconciling" | "conflicted" | "unmerged";
+    observedAt?: string;
+  };
+  checks: {
+    state:
+      | "not_configured"
+      | "awaiting_setup"
+      | "awaiting_reconciliation"
+      | "awaiting_candidate"
+      | "not_run"
+      | "running"
+      | "passed"
+      | "failed"
+      | "stale";
+    results?: CheckResult[];
+    progress?: CheckProgress;
+  };
+  delivery?: DeliveryRecord;
+  removal: {
+    state:
+      | "safe"
+      | "verification_required"
+      | "blocked_by_activity"
+      | "blocked_by_unmerged_changes"
+      | "unknown";
+    reason: string;
+  };
+  preview?: PreviewStatus;
+  issues: TaskIssue[];
+  actions: TaskActionView[];
 }
 
 export type WorkspaceRelation =
@@ -149,9 +287,13 @@ export interface TaskState {
   hasUnmergedChanges: Observation<boolean | "unknown">;
   baseOid?: string | undefined;
   candidateTreeOid?: string | undefined;
-  lastDelivery?: Observation<{ ref: string; oid: string; subject: string }> | undefined;
+  lastDelivery?: Observation<DeliveryRecord> | undefined;
   setup?: SetupStatus | undefined;
   check?: CheckRun | undefined;
+  checkProgress?: CheckProgress | undefined;
+  checksConfigured?: boolean | undefined;
+  checkConfigHash?: string | undefined;
+  setupConfigured?: boolean | undefined;
   commitMessage?: CandidateCommitMessage | undefined;
   summary?: string | undefined;
   failure?: string | undefined;
@@ -244,10 +386,7 @@ export interface RemoteTaskSnapshot {
   name: string;
   agent: Agent;
   runtime?: { kind: string; id: string } | undefined;
-  phase: TaskProjectionPhase;
-  activity: AgentTurnState;
-  needsAttention?: boolean | undefined;
-  hasUnmergedChanges?: boolean | undefined;
+  view: TaskView;
   runtimeState?: string | undefined;
   stateObservedAt?: string | undefined;
   runtimeObservedAt?: string | undefined;
@@ -255,8 +394,7 @@ export interface RemoteTaskSnapshot {
   workspaceObservedAt?: string | undefined;
   state?: TaskState | undefined;
   preview?: PreviewStatus | undefined;
-  lastDelivery?: { ref: string; oid: string; subject: string } | undefined;
-  summary?: string | undefined;
+  internal?: { state: TaskState; phase?: TaskProjectionPhase; runtimeState?: string } | undefined;
 }
 
 export interface RemoteProjectSnapshot {
@@ -295,7 +433,7 @@ export interface HostStatusObservation {
 }
 
 export interface RemoteSnapshot {
-  protocolVersion: 2;
+  protocolVersion: 3;
   machine: MachineIdentity & { boxersVersion: string };
   observedAt: string;
   servedAt?: string | undefined;

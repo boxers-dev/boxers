@@ -14,7 +14,6 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { humanTimestamp } from "../core/time.ts";
 import { writeStderr, writeStdout } from "../core/output.ts";
 import {
   authenticateAgent,
@@ -35,13 +34,7 @@ import {
   enableDetectedChecks,
   renderConfig,
 } from "./init.ts";
-import {
-  atomicWriteText,
-  checkoutsDir,
-  projectDir,
-  taskDir,
-  taskRepairLogPath,
-} from "./paths.ts";
+import { atomicWriteText, checkoutsDir, projectDir, taskDir, taskRepairLogPath } from "./paths.ts";
 import { command, commandWithInput, requireSuccess } from "./process.ts";
 import {
   assertTaskNameAvailable,
@@ -94,16 +87,16 @@ import {
   runRepairAgent,
 } from "./session.ts";
 import { withTaskMutationBarrier } from "./mutation.ts";
-import { readSetupStatus, startBackgroundSetup, waitForSetup } from "./setup.ts";
+import { readSetupStatus, retryTaskSetup, startBackgroundSetup, waitForSetup } from "./setup.ts";
 import { formatMachineViews } from "./machines.ts";
 import {
   readTaskState,
   recordCandidateCommitMessage,
   recordTaskSnapshot,
   updateTaskState,
-  taskNeedsAttention,
 } from "./state.ts";
-import { captureStateProjection } from "./projection.ts";
+import { captureStateProjection, projectTaskView } from "./projection.ts";
+import { formatTaskView } from "./task-view.ts";
 import { defaultRuntime } from "./runtime/registry.ts";
 import type { RuntimeDiagnostic } from "./runtime/types.ts";
 import { readCachedPeerViews } from "./peer-cache-store.ts";
@@ -817,6 +810,16 @@ export async function newTask(name: string, options: NewTaskOptions): Promise<nu
       },
       false,
     );
+    updateTaskState(
+      project,
+      task,
+      {
+        setupConfigured: Boolean(config.setup),
+        checksConfigured: Boolean(config.check?.commands.length),
+        checkConfigHash: config.check ? checkConfigHash(config.check) : null,
+      },
+      "git",
+    );
     const configuredPreview = config.preview;
     if (configuredPreview) {
       previewUrls = publishTaskPorts(task, configuredPreview.ports);
@@ -993,7 +996,8 @@ export async function list(json: boolean): Promise<number> {
   }
   return views.some(
     (view) =>
-      view.connection === "error" || view.snapshot?.tasks.some((task) => task.phase === "failed"),
+      view.connection === "error" ||
+      Boolean(view.snapshot?.tasks.some((task) => task.view.issues.length)),
   )
     ? 1
     : 0;
@@ -1031,19 +1035,13 @@ export async function status(name: string, json: boolean, refresh = false): Prom
   if (refresh) return refreshTaskStatus(name, json);
   const { project, task } = requireRegisteredTask(name);
   const state = readTaskState(project, task);
-  if (json) writeStdout(`${JSON.stringify({ task: projectedTaskRecord(task), state })}\n`);
-  else {
-    const unmerged =
-      state.hasUnmergedChanges.value === "unknown"
-        ? "unknown"
-        : state.hasUnmergedChanges.value
-          ? "yes"
-          : "no";
+  const view = projectTaskView(project, task, state);
+  if (json)
     writeStdout(
-      `${name}: ${state.agentTurnState}\nNeeds attention: ${taskNeedsAttention(state) ? "yes" : "no"} (event ${humanTimestamp(state.lastLifecycleEventAt ?? state.updatedAt)})\nUnmerged changes: ${unmerged} (observed ${humanTimestamp(state.hasUnmergedChanges.observedAt)})${unmerged === "no" && state.lastDelivery ? `; as of that observation, last commit on ${project.integration.base}: ${JSON.stringify(state.lastDelivery.value.subject)}, no other changes by this task` : ""}\n${state.settlement ? `Settlement: ${state.settlement.phase}${state.settlement.failure ? ` (${state.settlement.failure})` : ""}\n` : ""}${state.lifecycleDiagnostic ? `Lifecycle capture: ${state.lifecycleDiagnostic}\n` : ""}${state.setup ? `Setup: ${state.setup.state}\n` : ""}${state.check ? `Checks: ${state.check.status}\n` : ""}${state.failure ? `Failure: ${state.failure}\n` : ""}`,
+      `${JSON.stringify({ task: projectedTaskRecord(task), view, internal: { state, snapshot: task.lastSnapshot } })}\n`,
     );
-  }
-  return state.failure || state.settlement?.phase === "failed" ? 1 : 0;
+  else writeStdout(formatTaskView(name, view));
+  return view.issues.length ? 1 : 0;
 }
 
 export async function attach(
@@ -1095,22 +1093,25 @@ export async function discard(name: string, force: boolean): Promise<number> {
   // Promotion advances the workspace to the delivered commit and records the
   // resulting clean relation atomically. Reuse that durable observation instead
   // of fetching the target and re-reading the same workspace Git state.
-  if (
-    !force &&
-    delivered &&
-    recordedState.hasUnmergedChanges.value === false &&
-    recordedState.hasUnmergedChanges.source === "git" &&
-    recordedState.agentTurnState !== "working"
-  ) {
+  const removal = projectTaskView(project, task, recordedState, {
+    ignoreOperationKind: "discarding",
+  }).removal;
+  if (!force && removal.state === "safe") {
     const info = findTaskRuntime(runtimeInventory(), task);
     writeStdout(
-      `Unmerged changes: no\nLast commit on ${delivered.ref}: ${JSON.stringify(delivered.subject)}\nNo other changes by this task\n`,
+      `Unmerged changes: no\n${delivered ? `Last commit on ${delivered.ref}: ${JSON.stringify(delivered.subject)}\n` : ""}No other changes by this task\n`,
     );
     if (info) destroyTaskEnvironment(task);
     rmSync(taskDir(project.id, task.id), { recursive: true, force: true });
     writeStdout(`Discarded task ${name}.\n`);
     return 0;
   }
+  if (!force && removal.state === "blocked_by_activity")
+    throw new Error(`Task ${name} is active and cannot be discarded safely.`);
+  if (!force && removal.state === "blocked_by_unmerged_changes")
+    throw new Error(
+      `Task ${name} contains unmerged work; promote it or use --force to discard it.`,
+    );
   if (!force) await waitForSetup(task);
   if (!force) ({ project, task } = requireRegisteredTask(name));
   if (!force) writeStdout(`Checking the task workspace against ${project.integration.base}...\n`);
@@ -1309,7 +1310,7 @@ function recordUnresolvedNativeConflicts(
     failure: reconciliationFailure(conflicts),
     question: "Attach to the task, resolve and stage every conflicted file, then try again.",
   };
-  const updated = updateTask(project, task, snapshot, true);
+  const updated = updateTask(project, task, snapshot, true, "git");
   updateTaskState(project, updated, { failure: snapshot.failure ?? null }, "git");
   return snapshot;
 }
@@ -1485,7 +1486,23 @@ function prepareCandidate(
     failure: undefined,
     question: undefined,
   };
-  updateTask(project, task, snapshot, changed);
+  updateTask(project, task, snapshot, changed, "git");
+  let config: ProjectConfig | undefined;
+  try {
+    config = parseProjectConfig(targetConfig(project, targetOid).text);
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes("has no .boxers/config.yml"))
+      throw error;
+  }
+  updateTaskState(
+    project,
+    task,
+    {
+      checksConfigured: Boolean(config?.check?.commands.length),
+      checkConfigHash: config?.check ? checkConfigHash(config.check) : null,
+    },
+    "git",
+  );
   return { snapshot, targetOid, ...(changed ? { candidateTreeOid } : {}) };
 }
 
@@ -1685,86 +1702,164 @@ async function executeChecksUnsafe(
   configHash: string,
 ): Promise<TaskSnapshot> {
   if (!prepared.candidateTreeOid) throw new Error("Cannot check an empty candidate.");
-  const candidateDiff = command("git", [
-    "-C",
-    project.seedPath,
-    "diff",
-    "--binary",
-    "--full-index",
-    "--no-ext-diff",
-    prepared.targetOid,
-    prepared.candidateTreeOid,
-  ]);
-  requireSuccess(candidateDiff, "Could not read the exact candidate patch for checks");
-  // A Git patch is byte-sensitive: requireSuccess intentionally trims display
-  // output, so pass the original stdout through to `git apply`.
-  const candidatePatch = candidateDiff.stdout;
-  const checkWorkspace = prepareTaskCheckWorkspace(
-    task,
-    project.integration.base,
-    prepared.targetOid,
-    prepared.candidateTreeOid,
-    candidatePatch,
-  );
-  if (checkWorkspace.candidateTreeOid !== prepared.candidateTreeOid)
-    throw new Error(
-      `Candidate changed while preparing checks: captured ${prepared.candidateTreeOid}, isolated ${checkWorkspace.candidateTreeOid}.`,
-    );
-  const setup = await prepareIsolatedCheckSetup(
-    task,
-    prepared.candidateTreeOid,
-    checkWorkspace.path,
-    config.check?.setup ?? config.setup?.run,
-  );
+  const startedAt = new Date().toISOString();
+  const setupCommand = config.check?.setup ?? config.setup?.run;
   const definitions = config.check?.commands ?? [];
-  if (!definitions.length) return prepared.snapshot;
-  const candidateTreeOid =
-    prepared.candidateTreeOid ?? materializeNativeCandidate(project, task, prepared.targetOid);
-  const currentCandidate = (): TaskManifest | undefined => {
-    const current = listTasks(project).find((candidate) => candidate.id === task.id);
-    if (!current) return undefined;
-    const state = readTaskState(project, current);
-    return state.baseOid === prepared.targetOid && state.candidateTreeOid === candidateTreeOid
-      ? current
-      : undefined;
-  };
-  const results: CheckResult[] = [];
-  if (setup && setup.state !== "passed") {
-    results.push({
-      name: "setup",
-      command: setup.command,
-      status: setup.state === "timed_out" ? "timed_out" : "failed",
-      ...(setup.exitCode === undefined ? {} : { exitCode: setup.exitCode }),
-      durationMs:
-        setup.finishedAt === undefined
-          ? 0
-          : Math.max(0, Date.parse(setup.finishedAt) - Date.parse(setup.startedAt)),
-      logPath: setup.logPath,
-    });
-  }
-  for (const definition of setup && setup.state !== "passed" ? [] : definitions) {
-    results.push(await runNativeCheck(task, definition, checkWorkspace.path));
-  }
-  const finalTree = taskWorkspaceTreeAt(task, checkWorkspace.path);
-  if (finalTree !== candidateTreeOid)
-    throw new Error(
-      "A configured check modified the workspace. Check commands must be read-only; move formatting or fixes into the agent workflow.",
-    );
-  const failures = results.filter((result) => result.status !== "passed");
-  const current = currentCandidate();
-  if (!current) return requireRegisteredTask(task.name).task.lastSnapshot ?? prepared.snapshot;
-  const snapshot: TaskSnapshot = {
-    ...(current.lastSnapshot ?? prepared.snapshot),
-    check: {
-      status: failures.length ? "failed" : "passed",
-      targetOid: prepared.targetOid,
-      candidateTreeOid,
-      configHash,
-      results,
+  const total = definitions.length + (setupCommand ? 1 : 0);
+  updateTaskState(
+    project,
+    task,
+    {
+      checkProgress: {
+        targetOid: prepared.targetOid,
+        candidateTreeOid: prepared.candidateTreeOid,
+        configHash,
+        total,
+        completed: 0,
+        ...(setupCommand
+          ? { current: "setup" }
+          : definitions[0]
+            ? { current: definitions[0].name }
+            : {}),
+        startedAt,
+      },
     },
-  };
-  updateTask(project, current, snapshot);
-  return snapshot;
+    "worker",
+  );
+  let completed = 0;
+  try {
+    const candidateDiff = command("git", [
+      "-C",
+      project.seedPath,
+      "diff",
+      "--binary",
+      "--full-index",
+      "--no-ext-diff",
+      prepared.targetOid,
+      prepared.candidateTreeOid,
+    ]);
+    requireSuccess(candidateDiff, "Could not read the exact candidate patch for checks");
+    // A Git patch is byte-sensitive: requireSuccess intentionally trims display
+    // output, so pass the original stdout through to `git apply`.
+    const candidatePatch = candidateDiff.stdout;
+    const checkWorkspace = prepareTaskCheckWorkspace(
+      task,
+      project.integration.base,
+      prepared.targetOid,
+      prepared.candidateTreeOid,
+      candidatePatch,
+    );
+    if (checkWorkspace.candidateTreeOid !== prepared.candidateTreeOid)
+      throw new Error(
+        `Candidate changed while preparing checks: captured ${prepared.candidateTreeOid}, isolated ${checkWorkspace.candidateTreeOid}.`,
+      );
+    const setup = await prepareIsolatedCheckSetup(
+      task,
+      prepared.candidateTreeOid,
+      checkWorkspace.path,
+      config.check?.setup ?? config.setup?.run,
+    );
+    if (setupCommand) {
+      completed++;
+      updateTaskState(
+        project,
+        task,
+        {
+          checkProgress: {
+            targetOid: prepared.targetOid,
+            candidateTreeOid: prepared.candidateTreeOid,
+            configHash,
+            total,
+            completed,
+            ...(setup?.state === "passed" && definitions[0]
+              ? { current: definitions[0].name }
+              : {}),
+            startedAt,
+          },
+        },
+        "worker",
+      );
+    }
+    if (!definitions.length) return prepared.snapshot;
+    const candidateTreeOid =
+      prepared.candidateTreeOid ?? materializeNativeCandidate(project, task, prepared.targetOid);
+    const currentCandidate = (): TaskManifest | undefined => {
+      const current = listTasks(project).find((candidate) => candidate.id === task.id);
+      if (!current) return undefined;
+      const state = readTaskState(project, current);
+      return state.baseOid === prepared.targetOid && state.candidateTreeOid === candidateTreeOid
+        ? current
+        : undefined;
+    };
+    const results: CheckResult[] = [];
+    if (setup && setup.state !== "passed") {
+      results.push({
+        name: "setup",
+        command: setup.command,
+        status: setup.state === "timed_out" ? "timed_out" : "failed",
+        ...(setup.exitCode === undefined ? {} : { exitCode: setup.exitCode }),
+        durationMs:
+          setup.finishedAt === undefined
+            ? 0
+            : Math.max(0, Date.parse(setup.finishedAt) - Date.parse(setup.startedAt)),
+        logPath: setup.logPath,
+      });
+    }
+    for (const definition of setup && setup.state !== "passed" ? [] : definitions) {
+      results.push(await runNativeCheck(task, definition, checkWorkspace.path));
+      completed++;
+      updateTaskState(
+        project,
+        task,
+        {
+          checkProgress: {
+            targetOid: prepared.targetOid,
+            candidateTreeOid,
+            configHash,
+            total,
+            completed,
+            ...(definitions[completed - (setupCommand ? 1 : 0)]
+              ? { current: definitions[completed - (setupCommand ? 1 : 0)]!.name }
+              : {}),
+            startedAt,
+          },
+        },
+        "worker",
+      );
+    }
+    const finalTree = taskWorkspaceTreeAt(task, checkWorkspace.path);
+    if (finalTree !== candidateTreeOid)
+      throw new Error(
+        "A configured check modified the workspace. Check commands must be read-only; move formatting or fixes into the agent workflow.",
+      );
+    const failures = results.filter((result) => result.status !== "passed");
+    const current = currentCandidate();
+    if (!current) return requireRegisteredTask(task.name).task.lastSnapshot ?? prepared.snapshot;
+    const snapshot: TaskSnapshot = {
+      ...(current.lastSnapshot ?? prepared.snapshot),
+      check: {
+        status: failures.length ? "failed" : "passed",
+        targetOid: prepared.targetOid,
+        candidateTreeOid,
+        configHash,
+        results,
+      },
+    };
+    updateTask(project, current, snapshot);
+    return snapshot;
+  } finally {
+    const current = listTasks(project).find((candidate) => candidate.id === task.id);
+    if (current) {
+      const progress = readTaskState(project, current).checkProgress;
+      if (
+        progress?.targetOid === prepared.targetOid &&
+        progress.candidateTreeOid === prepared.candidateTreeOid &&
+        progress.configHash === configHash &&
+        progress.startedAt === startedAt
+      )
+        updateTaskState(project, current, { checkProgress: null }, "worker");
+    }
+  }
 }
 
 function executeChecks(
@@ -1879,6 +1974,23 @@ export async function check(name: string): Promise<number> {
     return 1;
   }
   return 0;
+}
+
+export async function setup(name: string): Promise<number> {
+  const { project, task } = requireRegisteredTask(name);
+  const targetOid = refreshSeed(project);
+  const configured = parseProjectConfig(targetConfig(project, targetOid).text).setup;
+  if (!configured) {
+    writeStdout("No task setup is configured.\n");
+    return 0;
+  }
+  writeStdout(
+    `Running setup for ${name} (attempt ${(readSetupStatus(task)?.attempt ?? 0) + 1})...\n`,
+  );
+  const code = await retryTaskSetup(task, configured);
+  const result = readSetupStatus(task);
+  writeStdout(`Setup ${result?.state ?? (code === 0 ? "passed" : "failed")}.\n`);
+  return code;
 }
 
 function acquireLock(project: ProjectManifest): { fd: number; path: string } {
@@ -2197,6 +2309,9 @@ export async function promote(name: string, message?: string, skipChecks = false
           ref: remoteDelivery?.branch ?? project.integration.base,
           oid: finalCommit,
           subject: commitSubject,
+          deliveredAt: new Date().toISOString(),
+          conversationSequence: readTaskState(project, advanced).conversationHighWaterSequence,
+          checks: !checkConfigured ? "not_configured" : skipChecks ? "skipped" : "passed",
         },
       });
       updateTaskState(
@@ -2288,6 +2403,8 @@ export function executeTaskIntent(name: string, intent: TaskIntent): Promise<num
       return review(name, intent.color ?? false);
     case "check":
       return check(name);
+    case "setup":
+      return setup(name);
     case "promote":
       return promote(name, intent.message, intent.skipChecks);
     case "preview":

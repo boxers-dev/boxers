@@ -45,6 +45,19 @@ describe("daemon wire protocol", () => {
     ).toBeUndefined();
   });
 
+  it("accepts the typed setup recovery intent", () => {
+    expect(
+      parseClientMessage(
+        encodeMessage({
+          type: "run_intent",
+          intentId: "setup-1",
+          task: "task-a",
+          intent: { kind: "setup" },
+        }).trim(),
+      ),
+    ).toMatchObject({ intent: { kind: "setup" } });
+  });
+
   it("rejects malformed or unrecognized lines instead of throwing", () => {
     expect(parseClientMessage("not json")).toBeUndefined();
     expect(parseClientMessage(JSON.stringify({ type: "unknown" }))).toBeUndefined();

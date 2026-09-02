@@ -7,6 +7,7 @@ import type { IPty } from "@lydell/node-pty";
 import {
   atomicWriteText,
   atomicWriteJson,
+  readJson,
   daemonHealthPath,
   daemonLockPath,
   daemonPidPath,
@@ -53,9 +54,18 @@ import {
   type SettlementRunSnapshot,
 } from "./settlement.ts";
 import { debugValue, writeDaemonDebug } from "./daemon-debug.ts";
+import type { RecordedTaskOperation, TaskOperationKind } from "./types.ts";
 
 const REPLAY_BUFFER_BYTES = 200_000;
 const MAX_VIEWER_BUFFER_BYTES = 1_000_000;
+interface TaskIntentLease {
+  version: 1;
+  task: string;
+  daemonPid: number;
+  childPid?: number;
+  operations: RecordedTaskOperation[];
+  updatedAt: string;
+}
 const SETTLEMENT_ACTIVITY: Record<SettlementRunSnapshot["phase"], string> = {
   queued: "Queued post-turn processing",
   refreshing: "Checking for updated Git targets",
@@ -520,7 +530,11 @@ export function runDaemon(
     debug(
       `Received ${debugValue(message.intent.kind)} command for sandbox ${debugValue(message.task)}.`,
     );
-    if (taskIntentLeaseActive(taskKey) && !busyTaskNames.has(taskKey)) {
+    if (
+      taskIntentLeaseActive(taskKey) &&
+      !busyTaskNames.has(taskKey) &&
+      !intentTails.has(taskKey)
+    ) {
       send(socket, {
         type: "error",
         intentId: message.intentId,
@@ -528,35 +542,100 @@ export function runDaemon(
       });
       return;
     }
+    const intentOperation: TaskOperationKind | undefined = (() => {
+      switch (message.intent.kind) {
+        case "refresh":
+          return "refreshing_target";
+        case "sync":
+          return "reconciling";
+        case "review":
+          return "reviewing";
+        case "check":
+          return "running_checks";
+        case "promote":
+          return "promoting";
+        case "discard":
+          return "discarding";
+        case "setup":
+          return "setup";
+        case "preview":
+          return message.intent.action === "start" || message.intent.action === "restart"
+            ? "starting_preview"
+            : undefined;
+      }
+    })();
+    const leasePath = taskIntentLeasePath(taskKey);
+    const readLease = (): TaskIntentLease => {
+      if (existsSync(leasePath)) {
+        try {
+          const current = readJson<TaskIntentLease>(leasePath);
+          if (current.daemonPid === process.pid && Array.isArray(current.operations)) return current;
+        } catch {
+          // The current daemon replaces its own malformed lease below.
+        }
+      }
+      return {
+        version: 1,
+        task: message.task,
+        daemonPid: process.pid,
+        operations: [],
+        updatedAt: new Date().toISOString(),
+      };
+    };
+    const writeLease = (update: (lease: TaskIntentLease) => TaskIntentLease): void =>
+      atomicWriteJson(leasePath, update(readLease()));
+    if (intentOperation)
+      writeLease((lease) => ({
+        ...lease,
+        operations: [
+          ...lease.operations,
+          { kind: intentOperation, state: "queued", intentId: message.intentId },
+        ],
+        updatedAt: new Date().toISOString(),
+      }));
+    else if (!existsSync(leasePath)) atomicWriteJson(leasePath, readLease());
     const previous = intentTails.get(taskKey) ?? Promise.resolve();
     const running = previous
       .catch(() => undefined)
       .then(async () => {
         await settlements.cancelAndWait(taskKey);
         busyTaskNames.add(taskKey);
-        const lease = {
-          version: 1,
-          task: message.task,
-          daemonPid: process.pid,
-          intentId: message.intentId,
+        writeLease((lease) => ({
+          ...lease,
+          operations: lease.operations.map((operation) =>
+            operation.intentId === message.intentId
+              ? { ...operation, state: "running", startedAt: new Date().toISOString() }
+              : operation,
+          ),
           updatedAt: new Date().toISOString(),
-        };
-        atomicWriteJson(taskIntentLeasePath(taskKey), lease);
+        }));
         try {
           await runIntent(socket, message, (childPid) => {
-            atomicWriteJson(taskIntentLeasePath(taskKey), {
+            writeLease((lease) => ({
               ...lease,
               childPid,
               updatedAt: new Date().toISOString(),
-            });
+            }));
           });
         } finally {
           busyTaskNames.delete(taskKey);
-          try {
-            unlinkSync(taskIntentLeasePath(taskKey));
-          } catch {
-            // Discard may already have removed task-owned state.
-          }
+          const lease = readLease();
+          const operations = lease.operations.filter(
+            (operation) => operation.intentId !== message.intentId,
+          );
+          if (operations.length)
+            atomicWriteJson(leasePath, {
+              ...lease,
+              operations,
+              childPid: undefined,
+              updatedAt: new Date().toISOString(),
+            });
+          else
+            try {
+              unlinkSync(leasePath);
+            } catch {
+              // Discard may already have removed task-owned state.
+            }
         }
       })
       .catch((error) => {
@@ -623,7 +702,7 @@ export function runDaemon(
               state: session.state,
               viewers: session.viewers.size,
             })),
-            intents: [...busyTaskNames].map((task) => ({ task })),
+            intents: [...intentTails.keys()].map((task) => ({ task })),
             backgroundWork:
               intentTails.size + lifecycleTails.size + (settlements.hasActiveRuns() ? 1 : 0),
           });

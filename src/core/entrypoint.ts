@@ -1,6 +1,7 @@
 const DAEMON_BACKED_TASK_INTENTS = new Set([
   "review",
   "check",
+  "setup",
   "promote",
   "sync",
   "preview",

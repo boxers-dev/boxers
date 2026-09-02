@@ -5,6 +5,7 @@ import { readFleet } from "./fleet.ts";
 import type { MachineView, RemoteSnapshot } from "./types.ts";
 import { captureStateProjection } from "./projection.ts";
 import { isTaskState } from "./state.ts";
+import { isTaskView } from "./task-view.ts";
 import { collectHostStatus, isHostStatusObservation, readHostStatus } from "./host-status.ts";
 import { managedSshArgs } from "./ssh-transport.ts";
 export type { MachineView } from "./types.ts";
@@ -47,8 +48,10 @@ export function parseRemoteSnapshot(text: string): RemoteSnapshot {
   if (!value || typeof value !== "object")
     throw new Error("Remote returned a non-object snapshot.");
   const snapshot = value as Partial<RemoteSnapshot>;
-  if (snapshot.protocolVersion !== 2)
-    throw new Error(`Unsupported remote protocol version ${String(snapshot.protocolVersion)}.`);
+  if (snapshot.protocolVersion !== 3)
+    throw new Error(
+      `Unsupported remote task-view protocol version ${String(snapshot.protocolVersion)}; upgrade both Boxers hosts.`,
+    );
   if (
     !snapshot.machine ||
     typeof snapshot.machine.id !== "string" ||
@@ -84,34 +87,28 @@ export function parseRemoteSnapshot(text: string): RemoteSnapshot {
         typeof snapshot.boxersUpdate.detail !== "string"))
   )
     throw new Error("Remote returned an invalid Boxers update observation.");
-  const phases = new Set([
-    "creating",
-    "active",
-    "working",
-    "reconciling",
-    "setting_up",
-    "checking",
-    "needs_input",
-    "reviewed",
-    "idle",
-    "failed",
-    "stopped",
-    "awaiting_input",
-    "settling",
-    "queued",
-    "refreshing",
-    "capturing",
-    "generating",
-    "ready",
-    "cancelled",
-    "check_failed",
-    "settlement_failed",
-  ]);
-  const activities = new Set(["not_started", "working", "awaiting_input", "exited", "unknown"]);
   for (const task of snapshot.tasks) {
     if (
       !task ||
       typeof task !== "object" ||
+      Object.keys(task).some(
+        (key) =>
+          ![
+            "id",
+            "projectId",
+            "project",
+            "name",
+            "agent",
+            "runtime",
+            "view",
+            "runtimeState",
+            "stateObservedAt",
+            "runtimeObservedAt",
+            "activityObservedAt",
+            "workspaceObservedAt",
+            "internal",
+          ].includes(key),
+      ) ||
       typeof task.id !== "string" ||
       typeof task.projectId !== "string" ||
       typeof task.project !== "string" ||
@@ -122,23 +119,16 @@ export function parseRemoteSnapshot(text: string): RemoteSnapshot {
           typeof task.runtime !== "object" ||
           typeof task.runtime.kind !== "string" ||
           typeof task.runtime.id !== "string")) ||
-      !phases.has(task.phase) ||
-      !activities.has(task.activity) ||
+      !isTaskView(task.view) ||
       (task.runtimeState !== undefined && typeof task.runtimeState !== "string") ||
-      (task.summary !== undefined && typeof task.summary !== "string") ||
-      (task.needsAttention !== undefined && typeof task.needsAttention !== "boolean") ||
-      (task.hasUnmergedChanges !== undefined && typeof task.hasUnmergedChanges !== "boolean") ||
       (task.stateObservedAt !== undefined && typeof task.stateObservedAt !== "string") ||
       (task.runtimeObservedAt !== undefined && typeof task.runtimeObservedAt !== "string") ||
       (task.activityObservedAt !== undefined && typeof task.activityObservedAt !== "string") ||
       (task.workspaceObservedAt !== undefined && typeof task.workspaceObservedAt !== "string") ||
-      (task.lastDelivery !== undefined &&
-        (!task.lastDelivery ||
-          typeof task.lastDelivery !== "object" ||
-          typeof task.lastDelivery.ref !== "string" ||
-          typeof task.lastDelivery.oid !== "string" ||
-          typeof task.lastDelivery.subject !== "string")) ||
-      (task.state !== undefined && !isTaskState(task.state, task.id))
+      (task.internal !== undefined &&
+        (!task.internal ||
+          typeof task.internal !== "object" ||
+          !isTaskState(task.internal.state, task.id)))
     )
       throw new Error("Remote returned an invalid task snapshot.");
   }
@@ -213,7 +203,7 @@ export async function queryRemoteMachine(
       error instanceof Error ? error.message : String(error),
       machine.sshHost,
     );
-    const incompatible = detail.startsWith("Unsupported remote protocol version");
+    const incompatible = detail.startsWith("Unsupported remote task-view protocol version");
     const authentication = /permission denied|authentication failed/i.test(detail);
     const offline = /timed out|connection|no route|resolve hostname|host is down/i.test(detail);
     return {
@@ -239,8 +229,9 @@ export function formatMachineViews(views: readonly MachineView[], groupByProject
       "PROJECT",
       "TASK",
       "AGENT",
-      "NEEDS_ATTENTION",
-      "UNMERGED_CHANGES",
+      "CHANGES",
+      "CHECKS",
+      "NEXT",
       "PREVIEW",
       "DETAIL",
     ],
@@ -256,12 +247,24 @@ export function formatMachineViews(views: readonly MachineView[], groupByProject
         "—",
         "—",
         "—",
+        "—",
         view.detail?.replace(/\s+/g, " ") ?? "—",
       ]);
       continue;
     }
     if (!view.snapshot.tasks.length) {
-      rows.push([view.name, view.connection, "—", "—", "—", "—", "—", "—", view.detail ?? "—"]);
+      rows.push([
+        view.name,
+        view.connection,
+        "—",
+        "—",
+        "—",
+        "—",
+        "—",
+        "—",
+        "—",
+        view.detail ?? "—",
+      ]);
       continue;
     }
     for (const [index, task] of view.snapshot.tasks.entries()) {
@@ -269,21 +272,29 @@ export function formatMachineViews(views: readonly MachineView[], groupByProject
       const sourceParts = project?.source?.split("/").filter(Boolean);
       const logicalProject =
         sourceParts && sourceParts.length >= 2 ? sourceParts.slice(1).join("/") : task.project;
-      const deliveryDetail =
-        task.hasUnmergedChanges === false && task.lastDelivery
-          ? `Last commit on ${project?.base ?? task.lastDelivery.ref}; no other changes by this task`
-          : "";
-      const summary = task.summary === task.lastDelivery?.subject ? "" : (task.summary ?? "");
-      const detail = `${summary}${deliveryDetail ? `${summary ? " — " : ""}${deliveryDetail}` : ""}`;
+      const detail = task.view.issues[0]?.message ?? task.view.operations[0]?.detail ?? "";
       rows.push([
         groupByProject || !index ? view.name : "",
         groupByProject || !index ? view.connection : "",
         logicalProject,
         task.name,
-        task.agent,
-        (task.needsAttention ?? task.activity === "awaiting_input") ? "yes" : "no",
-        task.hasUnmergedChanges === undefined ? "unknown" : task.hasUnmergedChanges ? "yes" : "no",
-        task.preview?.urls?.[0] ?? task.preview?.state ?? "—",
+        task.view.agent.label,
+        task.view.changes.state === "unmerged"
+          ? "Unmerged"
+          : task.view.changes.state === "none"
+            ? "None"
+            : task.view.changes.state === "conflicted"
+              ? "Conflicted"
+              : task.view.changes.state === "unknown"
+                ? "Unknown"
+                : "Working",
+        task.view.checks.state.startsWith("awaiting_")
+          ? "Waiting"
+          : task.view.checks.state === "not_configured"
+            ? "None"
+            : task.view.checks.state.replace(/^./, (letter) => letter.toUpperCase()),
+        task.view.actions[0]?.kind ?? "—",
+        task.view.preview?.urls?.[0] ?? task.view.preview?.state ?? "—",
         `${detail}${!index && view.connection === "stale" && view.detail ? `${detail ? " — " : ""}${view.detail}` : ""}`,
       ]);
     }

@@ -1,10 +1,20 @@
 import { basename } from "node:path";
 import { readVersion } from "../core/version.ts";
 import { listProjects, listTasks, localMachineIdentity } from "./registry.ts";
-import { readTaskState, taskNeedsAttention } from "./state.ts";
-import type { RemoteSnapshot, TaskProjectionPhase, TaskState, TaskSnapshot } from "./types.ts";
+import { readTaskState, updateTaskState } from "./state.ts";
+import type {
+  ProjectManifest,
+  RemoteSnapshot,
+  TaskManifest,
+  TaskProjectionPhase,
+  TaskState,
+  TaskSnapshot,
+  TaskView,
+} from "./types.ts";
 import { readHostStatus } from "./host-status.ts";
 import { fleetReleaseIsAcknowledged, readFleetUpdateState } from "./fleet-update.ts";
+import { deriveTaskView } from "./task-view.ts";
+import { readTaskIntentOperations } from "./leases.ts";
 
 function projectionPhase(snapshot: TaskSnapshot, state: TaskState): TaskProjectionPhase {
   if (state.agentTurnState === "working") return "working";
@@ -28,6 +38,48 @@ function projectionPhase(snapshot: TaskSnapshot, state: TaskState): TaskProjecti
   return snapshot.phase;
 }
 
+export function projectTaskView(
+  project: ProjectManifest,
+  task: TaskManifest,
+  recordedState = readTaskState(project, task),
+  options: { ignoreOperationKind?: string } = {},
+): TaskView {
+  let state = recordedState;
+  const setupConfigured = state.setupConfigured ?? Boolean(state.setup);
+  const checksConfigured =
+    state.checksConfigured ?? Boolean(state.check || state.checkProgress);
+  const checkConfigHash = state.checkConfigHash;
+  const recordedOperations = readTaskIntentOperations(task.name.toLowerCase());
+  const recordedOperation = recordedOperations.find((operation) => operation.state === "running");
+  if (
+    state.checkProgress &&
+    recordedOperation?.kind !== "running_checks" &&
+    state.settlement?.phase !== "checking"
+  )
+    state = updateTaskState(
+      project,
+      task,
+      {
+        checkProgress: null,
+        failure: "The recorded check worker is no longer active.",
+      },
+      "daemon",
+    );
+  const operations = recordedOperations.filter(
+    (operation) => operation.kind !== options.ignoreOperationKind,
+  );
+  return deriveTaskView({
+    name: task.name,
+    state,
+    setupConfigured,
+    checksConfigured,
+    ...(checkConfigHash ? { checkConfigHash } : {}),
+    ...(task.lastSnapshot?.preview ? { preview: task.lastSnapshot.preview } : {}),
+    ...(task.lastSnapshot?.runtimeState ? { runtimeState: task.lastSnapshot.runtimeState } : {}),
+    ...(operations.length ? { operations } : {}),
+  });
+}
+
 /** Materialize the host projection from durable state without subprocesses. */
 export function captureStateProjection(): RemoteSnapshot {
   const projects = listProjects();
@@ -43,6 +95,7 @@ export function captureStateProjection(): RemoteSnapshot {
     listTasks(project).map((task) => {
       const snapshot = task.lastSnapshot ?? { phase: "idle" as const, agent: task.agent };
       const state = readTaskState(project, task);
+      const view = projectTaskView(project, task, state);
       if (state.updatedAt < observedAt) observedAt = state.updatedAt;
       return {
         id: task.id,
@@ -51,25 +104,21 @@ export function captureStateProjection(): RemoteSnapshot {
         name: task.name,
         agent: task.agent,
         runtime: task.runtime,
-        phase: projectionPhase(snapshot, state),
-        activity: state.agentTurnState,
-        needsAttention: taskNeedsAttention(state),
-        ...(state.hasUnmergedChanges.value === "unknown"
-          ? {}
-          : { hasUnmergedChanges: state.hasUnmergedChanges.value }),
+        view,
         runtimeState: snapshot.runtimeState ?? "unknown",
         stateObservedAt: state.updatedAt,
         activityObservedAt: state.lastLifecycleEventAt ?? state.updatedAt,
         workspaceObservedAt: state.hasUnmergedChanges.observedAt,
-        state,
-        ...(snapshot.preview ? { preview: snapshot.preview } : {}),
-        ...(state.lastDelivery ? { lastDelivery: state.lastDelivery.value } : {}),
-        ...(state.summary ? { summary: state.summary } : {}),
+        internal: {
+          state,
+          phase: projectionPhase(snapshot, state),
+          ...(snapshot.runtimeState ? { runtimeState: snapshot.runtimeState } : {}),
+        },
       };
     }),
   );
   return {
-    protocolVersion: 2,
+    protocolVersion: 3,
     machine: { ...localMachineIdentity(), boxersVersion: readVersion() },
     observedAt,
     servedAt,

@@ -51,6 +51,8 @@ export function startBackgroundSetup(
     command: setup.run,
     startedAt,
     logPath,
+    attempt: 1,
+    maxAttempts: 2,
   };
   atomicWriteJson(statusPath(task), initial);
   const project = listProjects().find((candidate) => candidate.id === task.projectId);
@@ -108,24 +110,33 @@ export async function runSetupWorker(
   timeoutMs: number,
   startedAt: string,
   previewRun?: string,
+  streamToTerminal = false,
 ): Promise<number> {
   const project = listProjects().find((candidate) => candidate.id === projectId);
   const task = project && listTasks(project).find((candidate) => candidate.id === taskId);
   if (!task) throw new Error("Background setup task no longer exists.");
   const logPath = join(taskDir(projectId, taskId), "setup.log");
+  const previous = readSetupStatus(task);
+  const attempt = previous?.attempt ?? 1;
+  const maxAttempts = previous?.maxAttempts ?? 2;
   atomicWriteJson(statusPath(task), {
     state: "running",
     command: run,
     startedAt,
     pid: process.pid,
     logPath,
+    attempt,
+    maxAttempts,
   } satisfies SetupStatus);
   runTaskShell(task, "mkdir -p .git/boxers && printf 'running\\n' > .git/boxers/setup-status");
-  const stream = (chunk: string) => writeFileSync(logPath, chunk, { flag: "a" });
+  const stream = (chunk: string, destination: "stdout" | "stderr") => {
+    writeFileSync(logPath, chunk, { flag: "a" });
+    if (streamToTerminal) (destination === "stdout" ? process.stdout : process.stderr).write(chunk);
+  };
   const result = await runTaskSetupStreaming(task, run, {
     timeout: timeoutMs,
-    onStdout: stream,
-    onStderr: stream,
+    onStdout: (chunk) => stream(chunk, "stdout"),
+    onStderr: (chunk) => stream(chunk, "stderr"),
   });
   const status: SetupStatus = {
     state: result.timedOut ? "timed_out" : result.status === 0 ? "passed" : "failed",
@@ -134,6 +145,8 @@ export async function runSetupWorker(
     finishedAt: new Date().toISOString(),
     exitCode: result.status,
     logPath,
+    attempt,
+    maxAttempts,
   };
   atomicWriteJson(statusPath(task), status);
   let current = listTasks(project).find((candidate) => candidate.id === taskId);
@@ -178,6 +191,57 @@ export async function runSetupWorker(
   );
   notifyDaemonSetupCompleted(task.name);
   return result.timedOut || result.status !== 0 ? 1 : 0;
+}
+
+/** Rerun task setup synchronously inside the daemon-owned mutation. */
+export async function retryTaskSetup(
+  task: TaskManifest,
+  setup: NonNullable<ProjectConfig["setup"]>,
+): Promise<number> {
+  const previous = readSetupStatus(task);
+  if (previous?.state === "running") throw new Error("Task setup is already running.");
+  const attempt = (previous?.attempt ?? 0) + 1;
+  const maxAttempts = Math.max(previous?.maxAttempts ?? 2, attempt);
+  const startedAt = new Date().toISOString();
+  const logPath = join(taskDir(task.projectId, task.id), "setup.log");
+  writeFileSync(logPath, "", { mode: 0o600 });
+  atomicWriteJson(statusPath(task), {
+    state: "running",
+    command: setup.run,
+    startedAt,
+    logPath,
+    attempt,
+    maxAttempts,
+  } satisfies SetupStatus);
+  const project = listProjects().find((candidate) => candidate.id === task.projectId);
+  if (project)
+    updateTask(
+      project,
+      task,
+      {
+        ...(task.lastSnapshot ?? { phase: "idle", agent: task.agent }),
+        setup: {
+          state: "running",
+          command: setup.run,
+          startedAt,
+          logPath,
+          attempt,
+          maxAttempts,
+        },
+      },
+      undefined,
+      "worker",
+    );
+  notifyDaemonStateChanged();
+  return runSetupWorker(
+    task.projectId,
+    task.id,
+    setup.run,
+    setup.timeoutMs,
+    startedAt,
+    undefined,
+    true,
+  );
 }
 
 export async function waitForSetup(task: TaskManifest): Promise<SetupStatus | undefined> {

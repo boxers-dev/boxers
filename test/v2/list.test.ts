@@ -7,10 +7,7 @@ import { list } from "../../src/v2/commands.ts";
 import { atomicWriteJson, taskDir, taskIntentLeasePath } from "../../src/v2/paths.ts";
 import { createTaskManifest, initProject, updateTask } from "../../src/v2/registry.ts";
 import { enrollFleetMember, ensureFleet } from "../../src/v2/fleet.ts";
-import {
-  canonicalSshPublicKey,
-  ensureManagedSshIdentity,
-} from "../../src/v2/ssh-identity.ts";
+import { canonicalSshPublicKey, ensureManagedSshIdentity } from "../../src/v2/ssh-identity.ts";
 
 describe("task list", () => {
   it("lists cached task state without contacting Docker Sandboxes", async () => {
@@ -59,10 +56,11 @@ describe("task list", () => {
       await expect(list(false)).resolves.toBe(0);
       const output = write.mock.calls.map((call) => String(call[0])).join("");
       expect(output).toContain("cached-task");
-      expect(output).toContain("UNMERGED_CHANGES");
+      expect(output).toContain("CHANGES");
+      expect(output).toContain("CHECKS");
       expect(output).toContain("PREVIEW");
       expect(output).toContain("http://localhost:45173");
-      expect(output).toMatch(/cached-task\s+codex\s+no\s+no/);
+      expect(output).toMatch(/cached-task\s+Not started\s+None\s+None/);
       expect(output).not.toContain("legacy-remote");
       expect(existsSync(marker)).toBe(false);
       write.mockRestore();
@@ -206,8 +204,8 @@ describe("task list", () => {
             tasks: Array<{
               name: string;
               runtime: { kind: string; id: string };
-              needsAttention: boolean;
-              state: unknown;
+              view: unknown;
+              internal: unknown;
             }>;
           };
         }>;
@@ -216,7 +214,10 @@ describe("task list", () => {
       const local = parsed.machines.find((machine) => machine.name === "local");
       const projected = local?.snapshot?.tasks.find((candidate) => candidate.name === task.name);
       expect(projected?.runtime).toEqual({ kind: "docker-sandboxes", id: task.runtime.id });
-      expect(projected).toMatchObject({ needsAttention: false, state: expect.any(Object) });
+      expect(projected).toMatchObject({
+        view: { agent: { label: "Not started" } },
+        internal: { state: expect.any(Object) },
+      });
       expect(
         local?.snapshot?.tasks.find((candidate) => candidate.name === setupTask.name),
       ).toBeDefined();

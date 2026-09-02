@@ -23,8 +23,13 @@ The durable task facts are:
 | `commitMessage`      | Exact target/tree/conversation-high-water generation       |
 | `failure`            | Current infrastructure or reconciliation failure           |
 
-`needsAttention` is derived from `agentTurnState === "awaiting_input"` or a
-failure. It is not persisted or inferred from PTY output.
+`TaskView` is the authoritative public observation contract. It independently
+projects agent activity, Boxers operations, setup, reconciliation, changes,
+checks, delivery, removal safety, structured issues, and ordered actions from
+durable facts. There is no public `needsAttention` Boolean or authoritative
+flattened phase. Status, list, JSON, and fleet snapshots render the same view
+without probing Docker or Git; internal phases remain diagnostics for control
+plane orchestration only.
 
 ## Event passage
 

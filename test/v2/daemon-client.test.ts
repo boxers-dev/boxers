@@ -10,6 +10,16 @@ import {
 import { readVersion } from "../../src/core/version.ts";
 
 describe("interactive daemon client input", () => {
+  it("parses setup recovery as a typed intent", () => {
+    expect(parseDaemonIntent(["task", "setup"])).toEqual({
+      task: "task",
+      intent: { kind: "setup" },
+    });
+    expect(() => parseDaemonIntent(["task", "setup", "extra"])).toThrow(
+      "setup does not accept arguments",
+    );
+  });
+
   it("includes the invoking terminal's color preference in review intents", () => {
     const previousForceColor = process.env["FORCE_COLOR"];
     const previousNoColor = process.env["NO_COLOR"];

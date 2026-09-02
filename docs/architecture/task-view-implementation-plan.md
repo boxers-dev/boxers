@@ -1,6 +1,6 @@
 # Structured task status implementation plan
 
-Status: proposed. This document is an implementation brief for replacing the
+Status: implemented. This document is the implementation brief for replacing the
 current flattened task `phase`/`needsAttention` presentation with one shared,
 structured task view. It must be read together with
 [`implementation-plan.md`](implementation-plan.md) and
@@ -618,6 +618,15 @@ At minimum, cover these end-to-end combinations:
 | ready for input| passed | none       | delivered passed  | discard or attach                      |
 | exited         | passed | unmerged   | not run           | attach/restart or check/promote         |
 | unknown        | passed | unknown    | awaiting candidate| refresh; never claim safe discard      |
+
+## Dead-state audit
+
+The TaskView cutover does not remove persisted `TaskSnapshot.phase` values.
+Each existing value is still referenced by manifest validation, runtime
+snapshot merging, provisioning, reconciliation, candidate capture, promotion,
+or internal orchestration tests. They remain internal diagnostics and are not
+used as the public status contract. Removing them requires a separate persisted
+state change with its own compatibility analysis.
 
 Also verify:
 

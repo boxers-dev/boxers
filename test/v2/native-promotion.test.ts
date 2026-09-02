@@ -28,12 +28,8 @@ import { createTaskManifest, initProject, requireTask, updateTask } from "../../
 import { taskDir } from "../../src/v2/paths.ts";
 import { suspendTaskEnvironment } from "../../src/v2/runtime/task.ts";
 import { advanceNativeWorkspace, nativeWorkspacePatch } from "../../src/v2/sandbox.ts";
-import {
-  readTaskState,
-  recordLifecycleEvent,
-  recordTaskSnapshot,
-  taskNeedsAttention,
-} from "../../src/v2/state.ts";
+import { readTaskState, recordLifecycleEvent, recordTaskSnapshot } from "../../src/v2/state.ts";
+import { projectTaskView } from "../../src/v2/projection.ts";
 
 const cleanup: string[] = [];
 const originalCwd = process.cwd();
@@ -170,7 +166,18 @@ check:
     for (let attempt = 0; attempt < 100 && !existsSync(delayedMarker); attempt++)
       await new Promise((resolve) => setTimeout(resolve, 10));
     expect(existsSync(delayedMarker)).toBe(true);
-    expect(readTaskState(project, requireTask(project, "native")).check).toBeUndefined();
+    const runningCheckState = readTaskState(project, requireTask(project, "native"));
+    expect(runningCheckState.check).toBeUndefined();
+    expect(runningCheckState).toMatchObject({
+      checkProgress: {
+        targetOid: expect.any(String),
+        candidateTreeOid: captured,
+        total: 2,
+        completed: 1,
+        current: "delayed",
+        startedAt: expect.any(String),
+      },
+    });
     await expect(checking).resolves.toMatchObject({
       candidateTreeOid: captured,
       check: {
@@ -182,6 +189,7 @@ check:
         ],
       },
     });
+    expect(readTaskState(project, requireTask(project, "native")).checkProgress).toBeUndefined();
     expect(readFileSync(join(workspace, "tracked.txt"), "utf8")).toBe("newer live edit\n");
   });
 
@@ -235,6 +243,14 @@ check:
     expect(git(remote, "show", `${published}:tracked.txt`)).toBe("after");
     expect(git(workspace, "rev-parse", "HEAD")).toBe(published);
     expect(requireTask(project, "native").lastSnapshot?.targetOid).toBe(published);
+    expect(
+      readTaskState(project, requireTask(project, "native")).lastDelivery?.value,
+    ).toMatchObject({
+      ref: branch,
+      oid: published,
+      checks: "not_configured",
+      deliveredAt: expect.any(String),
+    });
     expect(stdout.mock.calls.map((call) => String(call[0])).join("")).toContain(
       "Open a pull request to merge it into main.",
     );
@@ -421,12 +437,10 @@ exec "$FAKE_REAL_GIT" "$@"
     );
 
     const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-    await expect(discard("native", false)).resolves.toBe(0);
-    expect(stdout.mock.calls.map(([message]) => message)).toEqual([
-      "Checking the task workspace against main...\n",
-      "Discarded task native.\n",
-    ]);
-    expect(() => requireTask(project, "native")).toThrow('Unknown task "native"');
+    await expect(discard("native", false)).rejects.toThrow("contains unmerged work");
+    expect(stdout).not.toHaveBeenCalled();
+    expect(requireTask(project, "native").name).toBe("native");
+    await expect(discard("native", true)).resolves.toBe(0);
 
     const forced = createTaskManifest(project, "forced", "codex");
     useFakeRuntime(forced, "boxers-project-forced");
@@ -491,20 +505,27 @@ exec "$FAKE_REAL_GIT" "$@"
           source: { provider: "codex", hookEvent: "UserPromptSubmit", rawBytes: 20 },
         });
 
-      await expect(discard(name, false)).resolves.toBe(0);
+      if (usesRecordedDelivery) await expect(discard(name, false)).resolves.toBe(0);
+      else await expect(discard(name, false)).rejects.toThrow("is active");
       expect(stdout.mock.calls.map(([message]) => message)).toEqual(
         usesRecordedDelivery
           ? [
               'Unmerged changes: no\nLast commit on main: "Deliver the task"\nNo other changes by this task\n',
               `Discarded task ${name}.\n`,
             ]
-          : ["Checking the task workspace against main...\n", `Discarded task ${name}.\n`],
+          : [],
       );
       stdout.mockClear();
       const log = readFileSync(process.env["FAKE_SBX_LOG"], "utf8");
-      expect(log.slice(logOffset).includes("exec ")).toBe(!usesRecordedDelivery);
+      expect(log.slice(logOffset).includes("exec ")).toBe(false);
       logOffset = log.length;
-      expect(() => requireTask(project, name)).toThrow(`Unknown task "${name}"`);
+      if (usesRecordedDelivery)
+        expect(() => requireTask(project, name)).toThrow(`Unknown task "${name}"`);
+      else {
+        expect(requireTask(project, name).name).toBe(name);
+        await discard(name, true);
+        stdout.mockClear();
+      }
     }
   });
 
@@ -559,7 +580,7 @@ exec "$FAKE_REAL_GIT" "$@"
     process.env["FAKE_SBX_STATUS"] = "stopped";
     await expect(status("native", true, true)).resolves.toBe(0);
     const inspected = JSON.parse(String(stdout.mock.calls.at(-1)?.[0]));
-    expect(inspected.state).toMatchObject({ hasUnmergedChanges: { value: false } });
+    expect(inspected.internal.state).toMatchObject({ hasUnmergedChanges: { value: false } });
     expect(readFileSync(sbxLog, "utf8")).toContain("exec <boxers-project-task>");
 
     writeFileSync(join(root, "upstream.txt"), "new target work\n");
@@ -574,7 +595,7 @@ exec "$FAKE_REAL_GIT" "$@"
     );
     await expect(status("native", true, true)).resolves.toBe(0);
     const stale = JSON.parse(String(stdout.mock.calls.at(-1)?.[0]));
-    expect(stale.state).toMatchObject({ baseOid: expect.any(String) });
+    expect(stale.internal.state).toMatchObject({ baseOid: expect.any(String) });
 
     await expect(discard("native", false)).resolves.toBe(0);
     expect(() => requireTask(project, "native")).toThrow('Unknown task "native"');
@@ -646,7 +667,10 @@ exec "$FAKE_REAL_GIT" "$@"
     const listedTask = listed.machines
       .find((machine: { name: string }) => machine.name === "local")
       ?.snapshot.tasks.find((candidate: { name: string }) => candidate.name === "native");
-    expect(listedTask).toMatchObject({ hasUnmergedChanges: false, state: expect.any(Object) });
+    expect(listedTask).toMatchObject({
+      view: { changes: { state: "none" } },
+      internal: { state: expect.any(Object) },
+    });
     expect(listedTask).not.toHaveProperty("git");
     expect(existsSync(sbxLog)).toBe(false);
   });
@@ -686,7 +710,7 @@ exec "$FAKE_REAL_GIT" "$@"
     expect(readTaskState(project, stopped).hasUnmergedChanges.value).toBe(true);
     expect(stopped.lastSnapshot?.candidateTreeOid).toEqual(expect.any(String));
     process.env["FAKE_SBX_STATUS"] = "stopped";
-    await expect(discard("native", false)).rejects.toThrow("may contain work not on main");
+    await expect(discard("native", false)).rejects.toThrow("contains unmerged work");
   });
 
   it("promotes the exact native working tree and runs previews", async () => {
@@ -747,7 +771,7 @@ preview:
     const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
     await expect(status("native", true, true)).resolves.toBe(0);
     const inspected = JSON.parse(String(stdout.mock.calls.at(-1)?.[0]));
-    expect(inspected.state).toMatchObject({
+    expect(inspected.internal.state).toMatchObject({
       hasUnmergedChanges: { value: true },
       candidateTreeOid: expect.any(String),
     });
@@ -782,7 +806,7 @@ preview:
     });
     await expect(status("native", true, true)).resolves.toBe(0);
     const deferred = JSON.parse(String(stdout.mock.calls.at(-1)?.[0]));
-    expect(deferred.state.agentTurnState).toBe("working");
+    expect(deferred.internal.state.agentTurnState).toBe("working");
     expect(readTaskState(project, requireTask(project, "native")).hasUnmergedChanges.value).toBe(
       true,
     );
@@ -803,7 +827,7 @@ preview:
     });
     await expect(status("native", true, true)).resolves.toBe(0);
     const diverged = JSON.parse(String(stdout.mock.calls.at(-1)?.[0]));
-    expect(diverged.state).toMatchObject({
+    expect(diverged.internal.state).toMatchObject({
       agentTurnState: "awaiting_input",
       baseOid: advancedTarget,
       hasUnmergedChanges: { value: true },
@@ -866,10 +890,15 @@ preview:
     expect(git(root, "log", "-1", "--pretty=%b")).toBe(
       "Preserve tracked, untracked, binary, and deleted content in one exact candidate snapshot.",
     );
-    expect(readTaskState(project, requireTask(project, "native")).lastDelivery?.value).toEqual({
+    expect(
+      readTaskState(project, requireTask(project, "native")).lastDelivery?.value,
+    ).toMatchObject({
       ref: "main",
       oid: git(root, "rev-parse", "HEAD"),
       subject: "Update tracked files and assets",
+      checks: "passed",
+      conversationSequence: 2,
+      deliveredAt: expect.any(String),
     });
     expect(git(workspace, "status", "--porcelain")).toBe("");
     const merged = requireTask(project, "native").lastSnapshot;
@@ -980,6 +1009,9 @@ check:
     });
     await expect(promote("failed-gate", undefined, true)).resolves.toBe(0);
     expect(readFileSync(join(root, "tracked.txt"), "utf8")).toBe("sensitive patch body\n");
+    expect(
+      readTaskState(project, requireTask(project, "failed-gate")).lastDelivery?.value.checks,
+    ).toBe("skipped");
   });
 
   it("automatically repairs reconciliation conflicts in a fresh provider session", async () => {
@@ -1036,7 +1068,7 @@ printf 'resolved and staged shared.txt\n'
     });
     expect(requireTask(project, "native").lastSnapshot?.failure).toBeUndefined();
     expect(requireTask(project, "native").lastSnapshot?.question).toBeUndefined();
-    expect(taskNeedsAttention(readTaskState(project, requireTask(project, "native")))).toBe(false);
+    expect(projectTaskView(project, requireTask(project, "native")).issues).toEqual([]);
     expect(readTaskState(project, requireTask(project, "native"))).toMatchObject({
       hasUnmergedChanges: { value: true },
     });
@@ -1107,7 +1139,11 @@ check:
         "Attach and ask the agent to resolve and stage every conflicted file, then try again.",
     });
     const conflictedState = readTaskState(project, requireTask(project, "native"));
-    expect(taskNeedsAttention(conflictedState)).toBe(true);
+    expect(projectTaskView(project, requireTask(project, "native"))).toMatchObject({
+      agent: { label: "Not started" },
+      reconciliation: { state: "conflicted" },
+      issues: [{ code: "reconciliation_conflict" }],
+    });
     expect(conflictedState).toMatchObject({ failure: "Reconciliation conflicts: shared.txt" });
     const calls = readFileSync(process.env["FAKE_SBX_LOG"], "utf8");
     expect(calls).not.toContain("run <-d> <codex> <--name> <boxers-project-task>");

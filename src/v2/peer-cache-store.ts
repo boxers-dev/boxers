@@ -4,6 +4,7 @@ import { atomicWriteJson, peerCachePath, readJson } from "./paths.ts";
 import { readFleet } from "./fleet.ts";
 import { localMachineIdentity } from "./registry.ts";
 import type { MachineView } from "./types.ts";
+import { parseRemoteSnapshot } from "./machines.ts";
 
 interface CachedPeerView {
   version: 1;
@@ -30,6 +31,7 @@ export function readCachedPeerView(peer: FleetPeerIdentity): MachineView {
   try {
     const cached = readJson<CachedPeerView>(path);
     if (cached.version !== 1 || cached.view.id !== peer.id) throw new Error("invalid cache");
+    if (cached.view.snapshot) parseRemoteSnapshot(JSON.stringify(cached.view.snapshot));
     const age = Date.now() - Date.parse(cached.updatedAt);
     if (cached.view.connection === "online" && (!Number.isFinite(age) || age > PEER_FRESHNESS_MS))
       return {
@@ -38,12 +40,16 @@ export function readCachedPeerView(peer: FleetPeerIdentity): MachineView {
         detail: `Peer observer heartbeat is stale; last contact ${humanTimestamp(cached.updatedAt)}`,
       };
     return cached.view;
-  } catch {
+  } catch (error) {
+    const detail =
+      error instanceof Error ? error.message : "The cached peer projection is invalid.";
     return {
       id: peer.id,
       name: peer.name,
-      connection: "error",
-      detail: "The cached peer projection is invalid.",
+      connection: detail.startsWith("Unsupported remote task-view protocol version")
+        ? "incompatible"
+        : "error",
+      detail,
     };
   }
 }

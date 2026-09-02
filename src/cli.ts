@@ -19,6 +19,7 @@ import {
   debugShell,
   status as taskStatus,
   sync,
+  setup as setupTask,
 } from "./v2/commands.ts";
 import {
   runDaemonIntentWorker,
@@ -111,7 +112,7 @@ Tasks
   # Prefix an existing task with <machine>/ to run the command remotely.
   boxers [<machine>/]<task> attach [--model <name>] [--effort <level>] [--fast]
   boxers [<machine>/]<task> status [--json] [--refresh]
-  boxers [<machine>/]<task> sync|review|check
+  boxers [<machine>/]<task> sync|review|check|setup
   boxers [<machine>/]<task> promote [--message <message>] [--skip-checks]
   boxers [<machine>/]<task> preview [start|stop|restart|logs]
   boxers [<machine>/]<task> discard [--force]
@@ -841,6 +842,7 @@ export async function dispatch(argv: string[]): Promise<number> {
       "status",
       "review",
       "check",
+      "setup",
       "promote",
       "sync",
       "preview",
@@ -880,6 +882,9 @@ export async function dispatch(argv: string[]): Promise<number> {
     case "check":
       only(args, [], "check");
       return checkTask(first);
+    case "setup":
+      only(args, [], "setup");
+      return setupTask(first);
     case "promote": {
       const options = parsePromote(args);
       return promote(first, options.message, options.skipChecks);

@@ -6,6 +6,26 @@ import { atomicWriteJson, peerCachePath } from "../../src/v2/paths.ts";
 import { readCachedPeerView, writeCachedPeerView } from "../../src/v2/peer-cache-store.ts";
 import type { RemoteSnapshot } from "../../src/v2/types.ts";
 
+const taskView = (working: boolean) => ({
+  agent: {
+    state: working ? ("working" as const) : ("not_started" as const),
+    label: working ? "Generating" : "Not started",
+  },
+  operations: [],
+  setup: { state: "not_configured" as const },
+  reconciliation: { state: "not_needed" as const },
+  changes: { state: "unknown" as const },
+  checks: { state: "not_configured" as const },
+  removal: {
+    state: working ? ("blocked_by_activity" as const) : ("verification_required" as const),
+    reason: "recorded",
+  },
+  issues: [],
+  actions: [
+    { kind: working ? ("wait" as const) : ("attach" as const), label: "Next", reason: "Continue" },
+  ],
+});
+
 const originalHome = process.env.BOXERS_HOME;
 const cleanup: string[] = [];
 
@@ -27,7 +47,7 @@ describe("peer projection cache", () => {
       createdAt: "2026-08-26T00:00:00.000Z",
     };
     const snapshot: RemoteSnapshot = {
-      protocolVersion: 2,
+      protocolVersion: 3,
       machine: {
         version: 1,
         id: machine.id,
@@ -69,7 +89,7 @@ describe("peer projection cache", () => {
       createdAt: "2026-08-26T00:00:00.000Z",
     };
     const projection = (observedAt: string, phase: "idle" | "working"): RemoteSnapshot => ({
-      protocolVersion: 2,
+      protocolVersion: 3,
       machine: {
         version: 1,
         id: machine.id,
@@ -85,8 +105,7 @@ describe("peer projection cache", () => {
           project: "project",
           name: "task",
           agent: "codex",
-          phase,
-          activity: phase === "working" ? "working" : "not_started",
+          view: taskView(phase === "working"),
           runtimeState: "running",
         },
       ],

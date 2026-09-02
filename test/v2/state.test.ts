@@ -309,14 +309,13 @@ describe("durable task state", () => {
     const { project, task } = fixture();
     updateTaskState(project, task, { hasUnmergedChanges: true }, "git");
     expect(captureStateProjection().tasks[0]).toMatchObject({
-      needsAttention: false,
-      hasUnmergedChanges: true,
+      view: { agent: { label: "Not started" }, changes: { state: "unmerged" } },
     });
     const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
     await expect(status(task.name, false)).resolves.toBe(0);
     const output = String(stdout.mock.calls.at(-1)?.[0]);
-    expect(output).toContain("Needs attention: no");
-    expect(output).toContain("Unmerged changes: yes");
+    expect(output).toContain("Agent: Not started");
+    expect(output).toContain("Changes: Unmerged changes can be promoted");
   });
 
   it("projects provider turns and settlement outcomes as distinct phases", () => {
@@ -334,9 +333,8 @@ describe("durable task state", () => {
       source: { provider: "codex", hookEvent: "Stop", rawBytes: 20 },
     });
     expect(captureStateProjection().tasks[0]).toMatchObject({
-      activity: "awaiting_input",
-      phase: "awaiting_input",
-      needsAttention: true,
+      view: { agent: { state: "awaiting_input", label: "Ready for input" } },
+      internal: { phase: "awaiting_input" },
     });
     updateTaskState(project, task, {
       settlement: {
@@ -347,7 +345,7 @@ describe("durable task state", () => {
         updatedAt: "2030-01-01T00:00:02.000Z",
       },
     });
-    expect(captureStateProjection().tasks[0]?.phase).toBe("checking");
+    expect(captureStateProjection().tasks[0]?.internal?.phase).toBe("checking");
     updateTaskState(project, task, {
       settlement: {
         runId: "run",
@@ -365,7 +363,7 @@ describe("durable task state", () => {
         results: [],
       },
     });
-    expect(captureStateProjection().tasks[0]?.phase).toBe("check_failed");
+    expect(captureStateProjection().tasks[0]?.internal?.phase).toBe("check_failed");
     recordLifecycleEvent(project, task, {
       version: 1,
       sequence: 2,
@@ -380,9 +378,8 @@ describe("durable task state", () => {
       source: { provider: "codex", hookEvent: "UserPromptSubmit", rawBytes: 20 },
     });
     expect(captureStateProjection().tasks[0]).toMatchObject({
-      activity: "working",
-      phase: "working",
-      needsAttention: false,
+      view: { agent: { state: "working", label: "Generating" } },
+      internal: { phase: "working" },
     });
   });
 
@@ -396,7 +393,7 @@ describe("durable task state", () => {
     const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
     await expect(status(task.name, false)).resolves.toBe(0);
     expect(String(stdout.mock.calls.at(-1)?.[0])).toContain(
-      '; as of that observation, last commit on main: "Deliver the task", no other changes by this task',
+      'Delivery: Promoted to main as abc123 "Deliver the task"',
     );
   });
 

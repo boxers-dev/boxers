@@ -325,6 +325,7 @@ export function parseDaemonIntent(args: string[]): { task: string; intent: TaskI
       return { task, intent: { kind: "refresh", json: rest.includes("--json") } };
     case "sync":
     case "check":
+    case "setup":
       if (rest.length) throw new Error(`${command} does not accept arguments.`);
       return { task, intent: { kind: command } };
     case "review":

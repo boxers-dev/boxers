@@ -43,7 +43,26 @@ boxers fix-parser attach
 ```
 
 Task names are unique on a machine, and task commands can be run from any
-directory.
+directory. Status and list use one structured view: agent activity, Boxers
+operations, setup, reconciliation, changes, checks, delivery, removal safety,
+specific issues, and concrete next commands are reported independently. A
+finished provider turn is shown as `Agent: Ready for input`, not as a generic
+failure or attention flag. Plain status and list read recorded state; use
+`status --refresh` when workspace facts are unknown or stale.
+
+For example, the compact list and detailed status agree on the same facts:
+
+```text
+MACHINE  PROJECT  TASK        AGENT            CHANGES  CHECKS  NEXT
+local    boxers   fix-parser  Ready for input  Unmerged Passed  review
+
+fix-parser
+
+Agent: Ready for input
+Changes: Unmerged changes can be promoted
+Checks: All checks passed for the current changes
+Removal: Cannot be discarded safely - unmerged changes remain
+```
 
 When the work is ready:
 
@@ -68,12 +87,29 @@ Other useful task commands:
 boxers fix-parser sync
 boxers fix-parser preview
 boxers fix-parser preview logs
+boxers fix-parser setup
 boxers fix-parser discard
 ```
 
 `sync` reconciles a task with its configured base. Preview commands are
-available when preview support was enabled for the project. `discard` removes
-a task and refuses to lose unpromoted work.
+available when preview support was enabled for the project. If task setup fails
+or times out, inspect the setup log shown by `status`, repair the cause in the
+existing agent session, and run `setup` to retry the configured command.
+
+```text
+Setup: Failed after 2 attempts
+Issues:
+  Setup failed after 2 attempts.
+  Log: ~/.local/state/boxers/.../setup.log
+Next:
+  boxers fix-parser setup    Diagnose the setup log, then rerun setup.
+```
+
+`discard` uses the recorded removal disposition: a causally current clean Git
+observation takes the fast path without setup, reconciliation, checks, or
+another Sandbox inspection; unmerged work requires promotion or `--force`.
+After a verified delivery, status reports `Removal: Can be discarded safely`
+and offers `boxers fix-parser discard` without another workspace inspection.
 
 To see the available task environments:
 

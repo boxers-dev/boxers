@@ -25,6 +25,7 @@ afterEach(async () => {
 describe("CLI daemon boundary", () => {
   it("keeps daemon lifecycle commands on the direct CLI path", () => {
     expect(isDaemonBackedTaskInvocation(["feature", "check"])).toBe(true);
+    expect(isDaemonBackedTaskInvocation(["feature", "setup"])).toBe(true);
     expect(isDaemonBackedTaskInvocation(["feature", "status", "--refresh"])).toBe(true);
     expect(isDaemonBackedTaskInvocation(["daemon", "stop"])).toBe(false);
     expect(isDaemonBackedTaskInvocation(["daemon", "start"])).toBe(false);

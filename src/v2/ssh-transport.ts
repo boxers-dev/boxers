@@ -65,6 +65,7 @@ function requiredRole(args: readonly string[]): PeerRole {
   if (
     taskCommand === "attach" ||
     taskCommand === "check" ||
+    taskCommand === "setup" ||
     taskCommand === "sync" ||
     taskCommand === "preview"
   )

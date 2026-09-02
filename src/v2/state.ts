@@ -6,6 +6,8 @@ import type {
   ObservationSource,
   CandidateCommitMessage,
   CheckRun,
+  CheckProgress,
+  DeliveryRecord,
   ProjectManifest,
   SetupStatus,
   TaskManifest,
@@ -17,8 +19,18 @@ import type {
 import type { ConversationEventRecord } from "./conversation.ts";
 import { settlementPublicationAllowed } from "./settlement-publication.ts";
 
-function observation<T>(value: T, observedAt: string, source: ObservationSource): Observation<T> {
-  return { value, observedAt, source };
+function observation<T>(
+  value: T,
+  observedAt: string,
+  source: ObservationSource,
+  conversationSequence?: number,
+): Observation<T> {
+  return {
+    value,
+    observedAt,
+    source,
+    ...(conversationSequence === undefined ? {} : { conversationSequence }),
+  };
 }
 
 function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
@@ -50,11 +62,14 @@ function validObservation<T>(
   if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
   return (
-    hasOnlyKeys(record, ["value", "observedAt", "source"]) &&
+    hasOnlyKeys(record, ["value", "observedAt", "source", "conversationSequence"]) &&
     valid(record["value"]) &&
     typeof record["observedAt"] === "string" &&
     Number.isFinite(Date.parse(record["observedAt"])) &&
-    ["command", "daemon", "worker", "git", "initial"].includes(String(record["source"]))
+    ["command", "daemon", "worker", "git", "initial"].includes(String(record["source"])) &&
+    (record["conversationSequence"] === undefined ||
+      (Number.isSafeInteger(record["conversationSequence"]) &&
+        Number(record["conversationSequence"]) >= 0))
   );
 }
 
@@ -70,6 +85,8 @@ function validSetup(value: unknown): value is SetupStatus {
       "pid",
       "exitCode",
       "logPath",
+      "attempt",
+      "maxAttempts",
     ]) &&
     ["running", "passed", "failed", "timed_out"].includes(String(setup.state)) &&
     typeof setup.command === "string" &&
@@ -77,7 +94,37 @@ function validSetup(value: unknown): value is SetupStatus {
     typeof setup.logPath === "string" &&
     (setup.finishedAt === undefined || typeof setup.finishedAt === "string") &&
     (setup.pid === undefined || typeof setup.pid === "number") &&
-    (setup.exitCode === undefined || typeof setup.exitCode === "number")
+    (setup.exitCode === undefined || typeof setup.exitCode === "number") &&
+    (setup.attempt === undefined ||
+      (Number.isSafeInteger(setup.attempt) && Number(setup.attempt) > 0)) &&
+    (setup.maxAttempts === undefined ||
+      (Number.isSafeInteger(setup.maxAttempts) && Number(setup.maxAttempts) > 0))
+  );
+}
+
+function validCheckProgress(value: unknown): value is CheckProgress {
+  if (!value || typeof value !== "object") return false;
+  const progress = value as Record<string, unknown>;
+  return (
+    hasOnlyKeys(progress, [
+      "targetOid",
+      "candidateTreeOid",
+      "configHash",
+      "total",
+      "completed",
+      "current",
+      "startedAt",
+    ]) &&
+    typeof progress.targetOid === "string" &&
+    typeof progress.candidateTreeOid === "string" &&
+    typeof progress.configHash === "string" &&
+    Number.isSafeInteger(progress.total) &&
+    Number(progress.total) >= 0 &&
+    Number.isSafeInteger(progress.completed) &&
+    Number(progress.completed) >= 0 &&
+    Number(progress.completed) <= Number(progress.total) &&
+    (progress.current === undefined || typeof progress.current === "string") &&
+    typeof progress.startedAt === "string"
   );
 }
 
@@ -167,6 +214,10 @@ export function isTaskState(value: unknown, taskId: string): value is TaskState 
       "lastDelivery",
       "setup",
       "check",
+      "checkProgress",
+      "checksConfigured",
+      "checkConfigHash",
+      "setupConfigured",
       "commitMessage",
       "summary",
       "failure",
@@ -204,21 +255,34 @@ export function isTaskState(value: unknown, taskId: string): value is TaskState 
     ) &&
     (state.setup === undefined || validSetup(state.setup)) &&
     (state.check === undefined || validCheck(state.check)) &&
+    (state.checkProgress === undefined || validCheckProgress(state.checkProgress)) &&
+    (state.checksConfigured === undefined || typeof state.checksConfigured === "boolean") &&
+    (state.checkConfigHash === undefined || typeof state.checkConfigHash === "string") &&
+    (state.setupConfigured === undefined || typeof state.setupConfigured === "boolean") &&
     (state.commitMessage === undefined || validCandidateCommitMessage(state.commitMessage)) &&
     (state.lastDelivery === undefined ||
-      validObservation(
-        state.lastDelivery,
-        (candidate): candidate is { ref: string; oid: string; subject: string } => {
-          if (!candidate || typeof candidate !== "object") return false;
-          const delivery = candidate as Record<string, unknown>;
-          return (
-            hasOnlyKeys(delivery, ["ref", "oid", "subject"]) &&
-            typeof delivery.ref === "string" &&
-            typeof delivery.oid === "string" &&
-            typeof delivery.subject === "string"
-          );
-        },
-      )) &&
+      validObservation(state.lastDelivery, (candidate): candidate is DeliveryRecord => {
+        if (!candidate || typeof candidate !== "object") return false;
+        const delivery = candidate as Record<string, unknown>;
+        return (
+          hasOnlyKeys(delivery, [
+            "ref",
+            "oid",
+            "subject",
+            "deliveredAt",
+            "conversationSequence",
+            "checks",
+          ]) &&
+          typeof delivery.ref === "string" &&
+          typeof delivery.oid === "string" &&
+          typeof delivery.subject === "string" &&
+          (delivery.deliveredAt === undefined || typeof delivery.deliveredAt === "string") &&
+          (delivery.conversationSequence === undefined ||
+            Number.isSafeInteger(delivery.conversationSequence)) &&
+          (delivery.checks === undefined ||
+            ["passed", "skipped", "not_configured"].includes(String(delivery.checks)))
+        );
+      })) &&
     [state.baseOid, state.candidateTreeOid, state.summary, state.failure].every(
       (candidate) => candidate === undefined || typeof candidate === "string",
     )
@@ -297,9 +361,13 @@ export interface TaskStateUpdate {
   candidateTreeOid?: string | null;
   setup?: TaskSnapshot["setup"] | null;
   check?: TaskSnapshot["check"] | null;
+  checkProgress?: CheckProgress | null;
+  checksConfigured?: boolean;
+  checkConfigHash?: string | null;
+  setupConfigured?: boolean;
   summary?: string | null;
   failure?: string | null;
-  lastDelivery?: { ref: string; oid: string; subject: string };
+  lastDelivery?: DeliveryRecord | { ref: string; oid: string; subject: string };
   settlement?: PersistedSettlementState | null;
   lifecycleDiagnostic?: string | null;
   promotionConversationCheckpoint?: number;
@@ -325,10 +393,28 @@ export function updateTaskState(
       ...(update.hasUnmergedChanges === undefined
         ? {}
         : {
-            hasUnmergedChanges: observation(update.hasUnmergedChanges, observedAt, source),
+            hasUnmergedChanges: observation(
+              update.hasUnmergedChanges,
+              observedAt,
+              source,
+              source === "git" ? previous.conversationHighWaterSequence : undefined,
+            ),
           }),
       ...(update.lastDelivery
-        ? { lastDelivery: observation(update.lastDelivery, observedAt, source) }
+        ? {
+            lastDelivery: observation(
+              "deliveredAt" in update.lastDelivery
+                ? update.lastDelivery
+                : {
+                    ...update.lastDelivery,
+                    deliveredAt: observedAt,
+                    conversationSequence: previous.conversationHighWaterSequence,
+                    checks: "not_configured" as const,
+                  },
+              observedAt,
+              source,
+            ),
+          }
         : {}),
     };
     for (const [field, value] of [
@@ -336,6 +422,10 @@ export function updateTaskState(
       ["candidateTreeOid", update.candidateTreeOid],
       ["setup", update.setup],
       ["check", update.check],
+      ["checkProgress", update.checkProgress],
+      ["checksConfigured", update.checksConfigured],
+      ["checkConfigHash", update.checkConfigHash],
+      ["setupConfigured", update.setupConfigured],
       ["summary", update.summary],
       ["failure", update.failure],
       ["settlement", update.settlement],
@@ -384,16 +474,6 @@ export function recordCandidateCommitMessage(
     } satisfies TaskState);
     return true;
   });
-}
-
-export function taskNeedsAttention(state: TaskState): boolean {
-  if (state.agentTurnState === "working") return false;
-  return (
-    state.agentTurnState === "awaiting_input" ||
-    Boolean(state.failure) ||
-    state.settlement?.phase === "failed" ||
-    state.settlement?.phase === "needs_input"
-  );
 }
 
 /** Record the daemon-owned durable provider process reaching a terminal state. */
@@ -495,7 +575,7 @@ export function recordTaskSnapshot(
     workspaceRelation?: WorkspaceRelation;
     observedAt?: string;
     publishSnapshot?: boolean;
-    lastDelivery?: { ref: string; oid: string; subject: string };
+    lastDelivery?: DeliveryRecord | { ref: string; oid: string; subject: string };
   } = {},
 ): TaskState {
   const relation = options.workspaceRelation;
@@ -524,7 +604,7 @@ export function recordTaskSnapshot(
       ...(publish ? { summary: snapshot.summary ?? null, failure: snapshot.failure ?? null } : {}),
       ...(options.lastDelivery ? { lastDelivery: options.lastDelivery } : {}),
     },
-    options.source ?? "command",
+    options.source ?? (relation === undefined ? "command" : "git"),
     options.observedAt,
   );
 }

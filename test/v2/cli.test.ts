@@ -19,6 +19,7 @@ vi.mock("../../src/v2/commands.ts", () => ({
   debugShell: vi.fn(),
   status: vi.fn(),
   sync: vi.fn(),
+  setup: vi.fn(),
 }));
 
 vi.mock("../../src/v2/machines.ts", () => ({
@@ -116,6 +117,7 @@ describe("v2 CLI", () => {
     expect(output).toContain("boxers <task> new");
     expect(output).toContain("boxers [<machine>/]<task> status");
     expect(output).toContain("boxers [<machine>/]<task> sync|review|check");
+    expect(output).toContain("sync|review|check|setup");
     expect(output).toContain("boxers [<machine>/]<task> preview");
     expect(output).toContain("boxers [<machine>/]<task> discard");
     expect(output).toContain("boxers debug shell <task>");
@@ -519,6 +521,8 @@ describe("v2 CLI", () => {
   it("dispatches check and parses the explicit promotion check override", async () => {
     await dispatch(["task", "check"]);
     expect(commands.check).toHaveBeenCalledWith("task");
+    await dispatch(["task", "setup"]);
+    expect(commands.setup).toHaveBeenCalledWith("task");
 
     await dispatch(["task", "promote", "--skip-checks", "--message", "Ship candidate"]);
     expect(commands.promote).toHaveBeenCalledWith("task", "Ship candidate", true);

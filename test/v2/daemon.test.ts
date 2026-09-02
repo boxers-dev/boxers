@@ -31,6 +31,7 @@ import {
 import { listProjects, listTasks } from "../../src/v2/registry.ts";
 import { readTaskState, recordLifecycleEvent, updateTaskState } from "../../src/v2/state.ts";
 import { encodeLifecycleWakeFrame } from "../../src/v2/pty-control.ts";
+import { readTaskIntentOperations } from "../../src/v2/leases.ts";
 
 const cleanupDirs: string[] = [];
 let daemon: DaemonHandle | undefined;
@@ -720,6 +721,11 @@ describe("daemon session lifecycle", () => {
       task: "ordered",
       intent: { kind: "check" },
     });
+    await waitUntil(() => readTaskIntentOperations("ordered").length === 2);
+    expect(readTaskIntentOperations("ordered")).toMatchObject([
+      { intentId: "first", kind: "reviewing", state: "running", startedAt: expect.any(String) },
+      { intentId: "second", kind: "running_checks", state: "queued" },
+    ]);
     await client.next(
       (message) => message.type === "intent_exited" && message.intentId === "first",
     );

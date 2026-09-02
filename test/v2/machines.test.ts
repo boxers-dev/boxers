@@ -1,9 +1,23 @@
 import { describe, expect, it } from "vitest";
 import { formatMachineViews, parseRemoteSnapshot } from "../../src/v2/machines.ts";
-import type { RemoteSnapshot } from "../../src/v2/types.ts";
+import type { RemoteSnapshot, TaskView } from "../../src/v2/types.ts";
+
+const view = (changes: TaskView["changes"]["state"] = "unknown"): TaskView => ({
+  agent: { state: "awaiting_input", label: "Ready for input" },
+  operations: [],
+  setup: { state: "not_configured" },
+  reconciliation: { state: "not_needed" },
+  changes: { state: changes },
+  checks: { state: "not_configured" },
+  removal: { state: "verification_required", reason: "verification required" },
+  issues: [],
+  actions: [
+    { kind: "attach", label: "Attach", command: "boxers task attach", reason: "Continue." },
+  ],
+});
 
 const snapshot: RemoteSnapshot = {
-  protocolVersion: 2,
+  protocolVersion: 3,
   machine: {
     version: 1,
     id: "host-id",
@@ -28,15 +42,14 @@ const snapshot: RemoteSnapshot = {
       project: "boxers",
       name: "multi-host",
       agent: "codex",
-      phase: "needs_input",
-      activity: "awaiting_input",
+      view: view(),
       runtimeState: "running",
     },
   ],
 };
 
 describe("multi-machine protocol", () => {
-  it("accepts protocol v2 and rejects malformed or incompatible snapshots", () => {
+  it("accepts protocol v3 and rejects flattened or incompatible snapshots", () => {
     expect(parseRemoteSnapshot(JSON.stringify(snapshot))).toEqual(snapshot);
     expect(
       parseRemoteSnapshot(
@@ -45,12 +58,22 @@ describe("multi-machine protocol", () => {
           tasks: [
             {
               ...snapshot.tasks[0],
-              lastDelivery: { ref: "main", oid: "abc123", subject: "Improve status" },
+              view: {
+                ...snapshot.tasks[0]!.view,
+                delivery: {
+                  ref: "main",
+                  oid: "abc123",
+                  subject: "Improve status",
+                  deliveredAt: "2026-08-10T00:00:00.000Z",
+                  conversationSequence: 1,
+                  checks: "passed",
+                },
+              },
             },
           ],
         }),
-      ).tasks[0]?.lastDelivery,
-    ).toEqual({ ref: "main", oid: "abc123", subject: "Improve status" });
+      ).tasks[0]?.view.delivery,
+    ).toMatchObject({ ref: "main", oid: "abc123", subject: "Improve status", checks: "passed" });
     const flattened = {
       ...snapshot,
       tasks: snapshot.tasks.map(({ runtimeState: _runtimeState, ...task }) => ({
@@ -63,16 +86,16 @@ describe("multi-machine protocol", () => {
     });
     expect(() => parseRemoteSnapshot("not json")).toThrow("invalid JSON");
     expect(() => parseRemoteSnapshot(JSON.stringify({ ...snapshot, protocolVersion: 1 }))).toThrow(
-      "Unsupported remote protocol version 1",
+      "Unsupported remote task-view protocol version 1",
     );
-    expect(() => parseRemoteSnapshot(JSON.stringify({ protocolVersion: 2 }))).toThrow(
+    expect(() => parseRemoteSnapshot(JSON.stringify({ protocolVersion: 3 }))).toThrow(
       "invalid snapshot",
     );
     expect(() =>
       parseRemoteSnapshot(
         JSON.stringify({
           ...snapshot,
-          tasks: [{ ...snapshot.tasks[0], state: { version: 1, taskId: "wrong" } }],
+          tasks: [{ ...snapshot.tasks[0], internal: { state: { version: 1, taskId: "wrong" } } }],
         }),
       ),
     ).toThrow("invalid task snapshot");
@@ -103,7 +126,7 @@ describe("multi-machine protocol", () => {
       parseRemoteSnapshot(
         JSON.stringify({
           ...snapshot,
-          tasks: [{ ...snapshot.tasks[0], lastDelivery: { ref: "main", oid: "abc123" } }],
+          tasks: [{ ...snapshot.tasks[0], phase: "needs_input", needsAttention: true }],
         }),
       ),
     ).toThrow("invalid task snapshot");
@@ -116,9 +139,10 @@ describe("multi-machine protocol", () => {
     ]);
     expect(output).toContain("desktop");
     expect(output).toContain("multi-host");
-    expect(output).toContain("NEEDS_ATTENTION");
-    expect(output).toContain("UNMERGED_CHANGES");
-    expect(output).toMatch(/multi-host\s+codex\s+yes/);
+    expect(output).toContain("CHANGES");
+    expect(output).toContain("CHECKS");
+    expect(output).toContain("NEXT");
+    expect(output).toMatch(/multi-host\s+Ready for input\s+Unknown/);
     expect(output).toMatch(/laptop\s+offline\s+—/);
   });
 
@@ -131,14 +155,14 @@ describe("multi-machine protocol", () => {
         snapshot: {
           ...snapshot,
           tasks: [
-            { ...snapshot.tasks[0]!, name: "integrated", hasUnmergedChanges: false },
-            { ...snapshot.tasks[0]!, name: "outstanding", hasUnmergedChanges: true },
+            { ...snapshot.tasks[0]!, name: "integrated", view: view("none") },
+            { ...snapshot.tasks[0]!, name: "outstanding", view: view("unmerged") },
           ],
         },
       },
     ]);
-    expect(output).toMatch(/integrated\s+codex\s+yes\s+no/);
-    expect(output).toMatch(/outstanding\s+codex\s+yes\s+yes/);
+    expect(output).toMatch(/integrated\s+Ready for input\s+None/);
+    expect(output).toMatch(/outstanding\s+Ready for input\s+Unmerged/);
   });
 
   it("describes the last delivery for a task with no other changes", () => {
@@ -152,14 +176,23 @@ describe("multi-machine protocol", () => {
           tasks: [
             {
               ...snapshot.tasks[0]!,
-              hasUnmergedChanges: false,
-              lastDelivery: { ref: "main", oid: "abc123", subject: "Improve task status" },
+              view: {
+                ...view("none"),
+                delivery: {
+                  ref: "main",
+                  oid: "abc123",
+                  subject: "Improve task status",
+                  deliveredAt: "2026-08-10T00:00:00.000Z",
+                  conversationSequence: 1,
+                  checks: "passed",
+                },
+              },
             },
           ],
         },
       },
     ]);
-    expect(output).toContain("Last commit on main; no other changes by this task");
+    expect(output).toContain("None");
     expect(output).not.toContain("Improve task status");
   });
 });
