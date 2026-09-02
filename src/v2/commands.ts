@@ -5,6 +5,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -995,13 +996,42 @@ export async function cloneAndInitializeProject(
   destination: string,
 ): Promise<number> {
   if (!isAbsolute(destination)) throw new Error("Remote clone destination must be absolute.");
-  if (existsSync(destination)) throw new Error(`Clone destination already exists: ${destination}`);
-  requireSuccess(
-    command("git", ["clone", "--branch", base, "--", source, destination], { stdio: "inherit" }),
-    `Could not clone ${source}`,
-  );
+  if (existsSync(destination)) {
+    const root = command("git", ["-C", destination, "rev-parse", "--show-toplevel"]);
+    if (
+      root.status !== 0 ||
+      !root.stdout.trim() ||
+      realpathSync(root.stdout.trim()) !== realpathSync(destination)
+    )
+      throw new Error(
+        `Clone destination already exists but is not a Git checkout root: ${destination}`,
+      );
+    const remotes = command("git", ["-C", destination, "remote"]);
+    const expectedSource = canonicalizeProjectSource(source);
+    const matchesSource =
+      remotes.status === 0 &&
+      remotes.stdout
+        .split("\n")
+        .filter(Boolean)
+        .some((remote) => {
+          const url = command("git", ["-C", destination, "remote", "get-url", remote]);
+          return (
+            url.status === 0 && canonicalizeProjectSource(url.stdout.trim()) === expectedSource
+          );
+        });
+    if (!matchesSource)
+      throw new Error(
+        `Clone destination already exists but does not have a remote for ${expectedSource}: ${destination}`,
+      );
+    writeStdout(`Reusing existing checkout at ${destination}.\n`);
+  } else {
+    requireSuccess(
+      command("git", ["clone", "--branch", base, "--", source, destination], { stdio: "inherit" }),
+      `Could not clone ${source}`,
+    );
+  }
   process.chdir(destination);
-  return initialize({ yes: true });
+  return initialize({ yes: true, base });
 }
 
 function projectedTaskRecord(task: TaskManifest): TaskManifest {

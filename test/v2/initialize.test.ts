@@ -1,5 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -20,7 +28,11 @@ vi.mock("../../src/v2/auth.ts", async (importOriginal) => ({
 }));
 
 import { parseProjectConfig } from "../../src/v2/config.ts";
-import { initialize, requireOrRegisterProject } from "../../src/v2/commands.ts";
+import {
+  cloneAndInitializeProject,
+  initialize,
+  requireOrRegisterProject,
+} from "../../src/v2/commands.ts";
 import { listProjects } from "../../src/v2/registry.ts";
 
 const cleanup: string[] = [];
@@ -47,6 +59,50 @@ function git(cwd: string, ...args: string[]): void {
 }
 
 describe("boxers project init", () => {
+  it("reuses an existing checkout when its Git remote matches the clone source", async () => {
+    const source = mkdtempSync(join(tmpdir(), "boxers-clone-source-"));
+    const destination = mkdtempSync(join(tmpdir(), "boxers-clone-destination-"));
+    const state = mkdtempSync(join(tmpdir(), "boxers-clone-state-"));
+    cleanup.push(source, destination, state);
+    process.env["BOXERS_HOME"] = state;
+    git(source, "init", "-q", "-b", "main");
+    git(source, "config", "user.name", "Test User");
+    git(source, "config", "user.email", "test@example.invalid");
+    writeFileSync(join(source, "README.md"), "base\n");
+    git(source, "add", "README.md");
+    git(source, "commit", "-q", "-m", "base");
+    execFileSync("git", ["clone", "-q", "--branch", "main", "--", source, destination]);
+    const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+
+    await expect(cloneAndInitializeProject(source, "main", destination)).resolves.toBe(0);
+
+    expect(listProjects()).toHaveLength(1);
+    expect(listProjects()[0]?.root).toBe(realpathSync(destination));
+    expect(stdout.mock.calls.flat().join("")).toContain(
+      `Reusing existing checkout at ${destination}.`,
+    );
+  });
+
+  it("does not reuse an existing checkout for a different clone source", async () => {
+    const source = mkdtempSync(join(tmpdir(), "boxers-clone-source-"));
+    const otherSource = mkdtempSync(join(tmpdir(), "boxers-other-source-"));
+    const destination = mkdtempSync(join(tmpdir(), "boxers-clone-destination-"));
+    cleanup.push(source, otherSource, destination);
+    for (const root of [source, otherSource]) {
+      git(root, "init", "-q", "-b", "main");
+      git(root, "config", "user.name", "Test User");
+      git(root, "config", "user.email", "test@example.invalid");
+      writeFileSync(join(root, "README.md"), `${root}\n`);
+      git(root, "add", "README.md");
+      git(root, "commit", "-q", "-m", "base");
+    }
+    execFileSync("git", ["clone", "-q", "--branch", "main", "--", otherSource, destination]);
+
+    await expect(cloneAndInitializeProject(source, "main", destination)).rejects.toThrow(
+      "does not have a remote",
+    );
+  });
+
   it("refuses to register a project whose configured remote is unreachable", async () => {
     const root = mkdtempSync(join(tmpdir(), "boxers-initialize-unreachable-"));
     const state = mkdtempSync(join(tmpdir(), "boxers-state-unreachable-"));
