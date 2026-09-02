@@ -163,9 +163,13 @@ the current project's configured clone URL and base branch, then clones and
 initializes it under the remote machine's state directory at
 `$BOXERS_HOME/checkouts/my-project` (normally
 `~/.local/state/boxers/checkouts/my-project`). Existing registered projects are
-reused. The clone deliberately uses Git on the remote host, so the command
-fails with Git's error if that host cannot reach the repository or its Git
-credentials are not configured.
+reused. The clone deliberately uses Git and Git credentials on the remote host;
+Boxers does not forward personal SSH keys from the initiating machine. It names
+the remote account before cloning and disables interactive Git credential
+prompts, so a passphrase request cannot be mistaken for a local one. If access
+is not configured, connect to that host and verify `git ls-remote <clone-url>`.
+For an SSH clone URL, the remote account's key must be usable non-interactively,
+for example through an SSH agent available to non-interactive sessions.
 
 To choose the checkout location when Boxers first provisions the project, pass
 an absolute remote path:

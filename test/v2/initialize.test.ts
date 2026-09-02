@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const prompts = vi.hoisted(() => ({
@@ -38,6 +38,9 @@ import { listProjects } from "../../src/v2/registry.ts";
 const cleanup: string[] = [];
 const originalCwd = process.cwd();
 const originalHome = process.env["BOXERS_HOME"];
+const originalSshConnection = process.env["SSH_CONNECTION"];
+const originalGitSshCommand = process.env["GIT_SSH_COMMAND"];
+const originalGitTerminalPrompt = process.env["GIT_TERMINAL_PROMPT"];
 
 beforeEach(() => {
   prompts.answers = [];
@@ -50,6 +53,12 @@ afterEach(() => {
   process.chdir(originalCwd);
   if (originalHome === undefined) delete process.env["BOXERS_HOME"];
   else process.env["BOXERS_HOME"] = originalHome;
+  if (originalSshConnection === undefined) delete process.env["SSH_CONNECTION"];
+  else process.env["SSH_CONNECTION"] = originalSshConnection;
+  if (originalGitSshCommand === undefined) delete process.env["GIT_SSH_COMMAND"];
+  else process.env["GIT_SSH_COMMAND"] = originalGitSshCommand;
+  if (originalGitTerminalPrompt === undefined) delete process.env["GIT_TERMINAL_PROMPT"];
+  else process.env["GIT_TERMINAL_PROMPT"] = originalGitTerminalPrompt;
   for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
@@ -100,6 +109,22 @@ describe("boxers project init", () => {
 
     await expect(cloneAndInitializeProject(source, "main", destination)).rejects.toThrow(
       "does not have a remote",
+    );
+  });
+
+  it("identifies remote-host Git authentication and disables passphrase prompts", async () => {
+    const destination = join(mkdtempSync(join(tmpdir(), "boxers-remote-clone-parent-")), "repo");
+    cleanup.push(dirname(destination));
+    process.env["SSH_CONNECTION"] = "client 123 host 22";
+    process.env["GIT_SSH_COMMAND"] = "false";
+    const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+
+    await expect(
+      cloneAndInitializeProject("git@example.invalid:owner/repo.git", "main", destination),
+    ).rejects.toThrow(/on .*@.* with that account's non-interactive Git credentials/);
+
+    expect(stdout.mock.calls.flat().join("")).toContain(
+      "Repository credentials and SSH keys are read on that machine",
     );
   });
 

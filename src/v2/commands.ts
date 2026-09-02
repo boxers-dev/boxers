@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir, userInfo } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { writeStderr, writeStdout } from "../core/output.ts";
@@ -1025,10 +1025,27 @@ export async function cloneAndInitializeProject(
       );
     writeStdout(`Reusing existing checkout at ${destination}.\n`);
   } else {
-    requireSuccess(
-      command("git", ["clone", "--branch", base, "--", source, destination], { stdio: "inherit" }),
-      `Could not clone ${source}`,
-    );
+    const remoteSession = isSshSession();
+    const remoteAccount = remoteSession ? `${userInfo().username}@${hostname()}` : undefined;
+    if (remoteAccount)
+      writeStdout(
+        `Preparing the Git checkout on ${remoteAccount}. Repository credentials and SSH keys are read on that machine; Boxers does not forward personal keys from the machine where this command was started.\n`,
+      );
+    const clone = command("git", ["clone", "--branch", base, "--", source, destination], {
+      stdio: "inherit",
+      env: remoteSession
+        ? {
+            ...process.env,
+            GIT_TERMINAL_PROMPT: "0",
+            GIT_SSH_COMMAND: `${process.env["GIT_SSH_COMMAND"] ?? "ssh"} -o BatchMode=yes`,
+          }
+        : process.env,
+    });
+    if (clone.status !== 0 && remoteAccount)
+      throw new Error(
+        `Could not clone the project on ${remoteAccount} with that account's non-interactive Git credentials. Connect to that machine and verify \`git ls-remote <clone-url>\` with the project's configured clone URL. For an SSH remote, its key must be usable there without a passphrase prompt (for example through an SSH agent available to non-interactive sessions).`,
+      );
+    requireSuccess(clone, `Could not clone ${source}`);
   }
   process.chdir(destination);
   return initialize({ yes: true, base });
