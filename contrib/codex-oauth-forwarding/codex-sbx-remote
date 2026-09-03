@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "usage: codex-sbx-remote PROJECT CHATGPT_ACCOUNT_ID [SANDBOX_NAME]" >&2
+  exit 2
+fi
+
+project=$1
+account_id=$2
+project_name=$(basename "$project")
+project_name=${project_name//[^[:alnum:].-]/-}
+name=${3:-codex-oauth-poc-$project_name}
+
+command -v sbx >/dev/null || { echo "codex-sbx-remote: sbx is not installed" >&2; exit 1; }
+command -v node >/dev/null || { echo "codex-sbx-remote: node is not installed" >&2; exit 1; }
+[[ -d $project ]] || { echo "codex-sbx-remote: project directory does not exist" >&2; exit 1; }
+[[ $account_id =~ ^[A-Za-z0-9_-]+$ ]] || { echo "codex-sbx-remote: invalid ChatGPT account ID" >&2; exit 1; }
+[[ $name =~ ^[A-Za-z0-9][A-Za-z0-9.-]+$ ]] || { echo "codex-sbx-remote: invalid sandbox name" >&2; exit 1; }
+
+if ! sbx ls --json | node -e '
+let input = "";
+process.stdin.on("data", (chunk) => input += chunk);
+process.stdin.on("end", () => {
+  const parsed = JSON.parse(input);
+  const rows = Array.isArray(parsed) ? parsed : parsed.sandboxes || [];
+  process.exit(rows.some((row) => (row.name || row.Name) === process.argv[1]) ? 0 : 1);
+});
+' "$name"; then
+  sbx create --clone --name "$name" codex "$project"
+fi
+
+# The command is fixed host configuration. The dedicated SSH identity is restricted
+# by the laptop's authorized_keys entry to the token helper only.
+sbx secret set openai \
+  --sandbox "$name" \
+  --command 'ssh -T -o BatchMode=yes -o ClearAllForwardings=yes codex-token-source' \
+  --refresh 45m
+
+# Build Codex's externally-managed ChatGPT auth shape using only Docker's
+# sandbox-visible sentinel and a non-secret account ID. No real token crosses stdin.
+sbx exec "$name" node -e '
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const placeholder = process.env.OPENAI_API_KEY;
+if (!placeholder) throw new Error("Docker did not expose the OpenAI proxy placeholder");
+const dir = path.join(os.homedir(), ".codex");
+fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+const auth = {
+  auth_mode: "chatgptAuthTokens",
+  OPENAI_API_KEY: null,
+  tokens: {
+    id_token: "e30.e30.e30",
+    access_token: placeholder,
+    refresh_token: "",
+    account_id: process.argv[1]
+  },
+  last_refresh: new Date().toISOString()
+};
+fs.writeFileSync(path.join(dir, "auth.json"), `${JSON.stringify(auth, null, 2)}\n`, { mode: 0o600 });
+' "$account_id"
+
+echo "Starting $name. The sandbox auth file contains only Docker's placeholder." >&2
+exec sbx run codex --name "$name"

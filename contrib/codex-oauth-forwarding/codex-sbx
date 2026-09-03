@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "usage: codex-sbx REMOTE PROJECT [SANDBOX_NAME]" >&2
+  exit 2
+fi
+
+remote=$1
+project=$2
+name=${3-}
+[[ $remote =~ ^[A-Za-z0-9_.@:-]+$ ]] || { echo "codex-sbx: invalid SSH destination" >&2; exit 1; }
+[[ $remote != -* ]] || { echo "codex-sbx: SSH destination must not start with a dash" >&2; exit 1; }
+[[ $project != *$'\n'* ]] || { echo "codex-sbx: project path must not contain a newline" >&2; exit 1; }
+[[ $name != *$'\n'* ]] || { echo "codex-sbx: sandbox name must not contain a newline" >&2; exit 1; }
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+account_id=$("$script_dir/codex-current-access-token.mjs" --account-id)
+
+printf -v remote_command 'codex-sbx-remote %q %q' "$project" "$account_id"
+if [[ -n $name ]]; then
+  printf -v quoted_name '%q' "$name"
+  remote_command+=" $quoted_name"
+fi
+
+exec ssh -t -o ClearAllForwardings=yes "$remote" "$remote_command"
