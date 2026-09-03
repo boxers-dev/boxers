@@ -34,7 +34,14 @@ import {
   enableDetectedChecks,
   renderConfig,
 } from "./init.ts";
-import { atomicWriteText, checkoutsDir, projectDir, taskDir, taskRepairLogPath } from "./paths.ts";
+import {
+  atomicWriteText,
+  checkoutsDir,
+  orphanedTaskDir,
+  projectDir,
+  taskDir,
+  taskRepairLogPath,
+} from "./paths.ts";
 import { command, commandWithInput, requireSuccess } from "./process.ts";
 import {
   assertTaskNameAvailable,
@@ -67,6 +74,7 @@ import {
   publishTaskPorts,
   reconcileTaskWorkspace,
   runtimeInventory,
+  runtimeInventoryAsync,
   inspectTaskJob,
   startTaskJob,
   startTaskPreview,
@@ -108,6 +116,10 @@ import {
 } from "./state.ts";
 import { captureStateProjection, projectTaskView } from "./projection.ts";
 import { formatTaskView } from "./task-view.ts";
+import {
+  archiveMissingTaskRegistrations,
+  missingTaskRegistrationCandidates,
+} from "./task-recovery.ts";
 import { defaultRuntime } from "./runtime/registry.ts";
 import type { RuntimeDiagnostic, RuntimeJobRequest } from "./runtime/types.ts";
 import { readCachedPeerViews } from "./peer-cache-store.ts";
@@ -744,34 +756,22 @@ export interface NewTaskOptions {
   detach: boolean;
 }
 
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-function reclaimAbortedCreation(name: string): void {
+function reclaimMissingTaskRegistration(name: string): void {
   const registered = listRegisteredTasks().find(
     ({ task }) => task.name.toLowerCase() === name.toLowerCase(),
   );
-  if (
-    !registered ||
-    registered.task.lastSnapshot?.phase !== "creating" ||
-    registered.task.creationPid === undefined ||
-    processIsAlive(registered.task.creationPid)
-  )
-    return;
-  const sandbox = findTaskRuntime(runtimeInventory(), registered.task);
-  if (sandbox) return;
-  rmSync(taskDir(registered.project.id, registered.task.id), { recursive: true, force: true });
-  note(`Recovered task name ${name} from interrupted runtime provisioning.`);
+  if (!registered) return;
+  const taskIds = missingTaskRegistrationCandidates({ name });
+  if (!taskIds.size) return;
+  const [archived] = archiveMissingTaskRegistrations(runtimeInventory(), { name, taskIds });
+  if (archived)
+    note(
+      `Recovered task name ${name}: Sandbox ${archived.task.runtime.id} no longer exists. Preserved its Boxers metadata in ${orphanedTaskDir(archived.project.id, archived.task.id)}.`,
+    );
 }
 
 export async function newTask(name: string, options: NewTaskOptions): Promise<number> {
-  reclaimAbortedCreation(name);
+  reclaimMissingTaskRegistration(name);
   assertTaskNameAvailable(name);
   const runtime = defaultRuntime();
   const runtimeFailure = runtime
@@ -1072,6 +1072,14 @@ export type TaskGitStatus =
   | { available: false; reason: string };
 
 export async function list(json: boolean): Promise<number> {
+  const taskIds = missingTaskRegistrationCandidates();
+  const archived = taskIds.size
+    ? archiveMissingTaskRegistrations(await runtimeInventoryAsync(), { taskIds })
+    : [];
+  for (const { project, task } of archived)
+    note(
+      `Removed stale task ${task.name} from the active list because Sandbox ${task.runtime.id} no longer exists. Preserved its Boxers metadata in ${orphanedTaskDir(project.id, task.id)}.`,
+    );
   const localSnapshot = captureStateProjection();
   const localView = {
     id: localSnapshot.machine.id,

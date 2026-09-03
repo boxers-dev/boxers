@@ -704,7 +704,7 @@ exec "$FAKE_REAL_GIT" "$@"
       internal: { state: expect.any(Object) },
     });
     expect(listedTask).not.toHaveProperty("git");
-    expect(existsSync(sbxLog)).toBe(false);
+    expect(readFileSync(sbxLog, "utf8")).toBe("ls <--json>\n");
   });
 
   it("keeps the removal guard when stop finds uncommitted changes", async () => {

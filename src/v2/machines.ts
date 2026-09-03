@@ -8,6 +8,11 @@ import { isTaskState } from "./state.ts";
 import { isTaskView } from "./task-view.ts";
 import { collectHostStatus, isHostStatusObservation, readHostStatus } from "./host-status.ts";
 import { managedSshArgs } from "./ssh-transport.ts";
+import { runtimeInventoryAsync } from "./runtime/task.ts";
+import {
+  archiveMissingTaskRegistrations,
+  missingTaskRegistrationCandidates,
+} from "./task-recovery.ts";
 export type { MachineView } from "./types.ts";
 
 const SNAPSHOT_TIMEOUT_MS = 10_000;
@@ -354,6 +359,8 @@ export function runRemoteCommand(reference: string, args: readonly string[], tty
 
 export async function remoteSnapshot(refreshStatus = false): Promise<number> {
   if (refreshStatus || !readHostStatus()) collectHostStatus();
+  const taskIds = missingTaskRegistrationCandidates();
+  if (taskIds.size) archiveMissingTaskRegistrations(await runtimeInventoryAsync(), { taskIds });
   process.stdout.write(`${JSON.stringify(captureStateProjection())}\n`);
   return 0;
 }

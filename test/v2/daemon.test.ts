@@ -27,6 +27,7 @@ import {
   daemonPidPath,
   daemonSocketPath,
   fleetPath,
+  orphanedTaskDir,
 } from "../../src/v2/paths.ts";
 import { listProjects, listTasks } from "../../src/v2/registry.ts";
 import { readTaskState, recordLifecycleEvent } from "../../src/v2/state.ts";
@@ -348,6 +349,21 @@ describe("daemon session lifecycle", () => {
 
     expect(stopped).toEqual(["runtime-orphan"]);
     expect(readTaskState(project, task).agentTurnState).toBe("exited");
+  });
+
+  it("archives task registrations whose runtime is missing during startup recovery", async () => {
+    const state = useTemporaryState();
+    registerTask(state, "missing", "runtime-missing");
+    const project = listProjects()[0]!;
+    const task = listTasks(project)[0]!;
+    daemon = runDaemon(tempSocketPath(), {
+      startupInventory: async () => [],
+      ingestLifecycle: async () => [],
+    });
+
+    await waitUntil(() => listTasks(project).length === 0);
+
+    expect(existsSync(orphanedTaskDir(project.id, task.id))).toBe(true);
   });
 
   it("drains a lifecycle wake and starts one post-turn job for a duplicate Stop", async () => {

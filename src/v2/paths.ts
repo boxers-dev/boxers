@@ -63,6 +63,11 @@ export function taskDir(projectId: string, taskId: string): string {
   return join(projectDir(projectId), "tasks", taskId);
 }
 
+/** Host metadata retained after its Docker Sandbox disappeared externally. */
+export function orphanedTaskDir(projectId: string, taskId: string): string {
+  return join(projectDir(projectId), "orphaned-tasks", taskId);
+}
+
 export function taskStatePath(projectId: string, taskId: string): string {
   return join(taskDir(projectId, taskId), "state.json");
 }

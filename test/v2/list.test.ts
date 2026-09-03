@@ -1,16 +1,16 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { list } from "../../src/v2/commands.ts";
-import { atomicWriteJson, taskDir } from "../../src/v2/paths.ts";
+import { atomicWriteJson, orphanedTaskDir, taskDir } from "../../src/v2/paths.ts";
 import { createTaskManifest, initProject, updateTask } from "../../src/v2/registry.ts";
 import { enrollFleetMember, ensureFleet } from "../../src/v2/fleet.ts";
 import { canonicalSshPublicKey, ensureManagedSshIdentity } from "../../src/v2/ssh-identity.ts";
 
 describe("task list", () => {
-  it("lists cached task state without contacting Docker Sandboxes", async () => {
+  it("reconciles cached tasks with Docker Sandboxes before listing", async () => {
     const root = mkdtempSync(join(tmpdir(), "boxers-list-project-"));
     const state = mkdtempSync(join(tmpdir(), "boxers-list-state-"));
     const bin = mkdtempSync(join(tmpdir(), "boxers-list-bin-"));
@@ -31,6 +31,8 @@ describe("task list", () => {
         agent: "codex",
         preview: { state: "running", urls: ["http://localhost:45173"] },
       });
+      const stale = createTaskManifest(project, "stale-task", "codex");
+      updateTask(project, stale, { phase: "idle", agent: "codex" });
       atomicWriteJson(join(state, "machines.json"), [
         {
           version: 1,
@@ -45,7 +47,7 @@ describe("task list", () => {
       const executable = join(bin, "sbx");
       writeFileSync(
         executable,
-        `#!/bin/sh\ntouch "${marker}"\nprintf '{"sandboxes":[{"name":"boxers-my-project-cached-task","status":"stopped"}]}'\n`,
+        `#!/bin/sh\ntouch "${marker}"\nprintf '{"sandboxes":[{"name":"${task.runtime.id}","status":"stopped"}]}'\n`,
       );
       chmodSync(executable, 0o755);
       const gitProbe = join(bin, "git");
@@ -61,8 +63,11 @@ describe("task list", () => {
       expect(output).toContain("PREVIEW");
       expect(output).toContain("http://localhost:45173");
       expect(output).toMatch(/cached-task\s+Not started\s+None\s+None/);
+      expect(output).not.toContain("stale-task");
       expect(output).not.toContain("legacy-remote");
-      expect(existsSync(marker)).toBe(false);
+      expect(existsSync(marker)).toBe(true);
+      expect(existsSync(taskDir(project.id, stale.id))).toBe(false);
+      expect(existsSync(orphanedTaskDir(project.id, stale.id))).toBe(true);
       write.mockRestore();
     } finally {
       vi.restoreAllMocks();
@@ -145,7 +150,7 @@ describe("task list", () => {
     }
   });
 
-  it("never probes setup-running tasks while listing", async () => {
+  it("only inventories runtimes while listing setup-running tasks", async () => {
     const root = mkdtempSync(join(tmpdir(), "boxers-list-lease-project-"));
     const state = mkdtempSync(join(tmpdir(), "boxers-list-lease-state-"));
     const bin = mkdtempSync(join(tmpdir(), "boxers-list-lease-bin-"));
@@ -208,7 +213,7 @@ describe("task list", () => {
           };
         }>;
       };
-      expect(existsSync(calls)).toBe(false);
+      expect(readFileSync(calls, "utf8")).toBe("ls --json\n");
       const local = parsed.machines.find((machine) => machine.name === "local");
       const projected = local?.snapshot?.tasks.find((candidate) => candidate.name === task.name);
       expect(projected?.runtime).toEqual({ kind: "docker-sandboxes", id: task.runtime.id });

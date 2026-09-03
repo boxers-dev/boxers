@@ -50,6 +50,10 @@ import {
 import { processIsBoxersDaemon } from "./daemon-identity.ts";
 import { PtyControlParser } from "./pty-control.ts";
 import { debugValue, writeDaemonDebug } from "./daemon-debug.ts";
+import {
+  archiveMissingTaskRegistrations,
+  missingTaskRegistrationCandidates,
+} from "./task-recovery.ts";
 
 const REPLAY_BUFFER_BYTES = 200_000;
 const MAX_VIEWER_BUFFER_BYTES = 1_000_000;
@@ -964,6 +968,7 @@ export function runDaemon(
     (socketPath === daemonSocketPath() ? startPeerObservers : undefined);
   peerObservers = peerObserverFactory?.(() => publishChange("peer-cache"), debug);
   const startupInventory = options.startupInventory ?? runtimeInventoryAsync;
+  const startupTaskIds = missingTaskRegistrationCandidates();
   const startupRecovery =
     socketPath === daemonSocketPath() || options.startupInventory
       ? startupInventory()
@@ -971,6 +976,13 @@ export function runDaemon(
             debug(
               `Checked ${inventory.length} sandbox runtime${inventory.length === 1 ? "" : "s"} during startup recovery.`,
             );
+            const archived = archiveMissingTaskRegistrations(inventory, {
+              taskIds: startupTaskIds,
+            });
+            for (const { task } of archived)
+              debug(
+                `Archived stale task ${debugValue(task.name)} because runtime ${debugValue(task.runtime.id)} no longer exists.`,
+              );
             for (const project of listProjects())
               for (const task of listTasks(project)) {
                 if (!isRuntimeRunning(findTaskRuntime(inventory, task))) continue;
