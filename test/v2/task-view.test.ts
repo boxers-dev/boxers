@@ -41,7 +41,7 @@ describe("structured task view", () => {
         setup: "running",
         changes: "unknown",
         checks: "awaiting_setup",
-        action: "wait",
+        action: "attach",
       },
     },
     {
@@ -230,14 +230,14 @@ describe("structured task view", () => {
       },
     },
     {
-      name: "unknown activity and workspace require refresh",
+      name: "unknown workspace state offers verified discard",
       input: state({ agentTurnState: "unknown" }),
       expected: {
         agent: "Activity unknown",
         setup: "not_configured",
         changes: "unknown",
         checks: "awaiting_candidate",
-        action: "refresh",
+        action: "discard",
       },
     },
   ])("$name", ({ input, expected }) => {
@@ -296,6 +296,39 @@ describe("structured task view", () => {
         state: { ...clean, conversationHighWaterSequence: 5, lifecycleDrainSequence: 5 },
       }).removal.state,
     ).toBe("verification_required");
+  });
+
+  it("reports setup independently without letting it block discard", () => {
+    const view = deriveTaskView({
+      name: "task",
+      state: state({
+        agentTurnState: "not_started",
+        baseOid: "base",
+        setup: {
+          ...setupIdentity,
+          state: "running",
+          command: "npm ci",
+          startedAt: now,
+          logPath: "/setup.log",
+        },
+        hasUnmergedChanges: {
+          value: false,
+          observedAt: now,
+          source: "git",
+          conversationSequence: 4,
+        },
+      }),
+      setupConfigured: true,
+    });
+
+    expect(view.operations).toEqual([
+      { kind: "setup", state: "running", startedAt: now, detail: "npm ci" },
+    ]);
+    expect(view.removal).toEqual({
+      state: "safe",
+      reason: "A current causal Git observation proves the workspace clean.",
+    });
+    expect(view.actions[0]?.kind).toBe("discard");
   });
 
   it("renders precise failed check details and commands", () => {

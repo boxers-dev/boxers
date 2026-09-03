@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,6 +8,7 @@ import {
   readSetupStatus,
   retryTaskSetup,
   startBackgroundSetup,
+  stopBackgroundSetup,
   waitForSetup,
 } from "../../src/v2/setup.ts";
 import type { ProjectManifest, TaskManifest } from "../../src/v2/types.ts";
@@ -31,6 +32,7 @@ function fixture(name: string): {
   project: ProjectManifest;
   task: TaskManifest;
   calls: string;
+  sandboxHome: string;
 } {
   const root = mkdtempSync(join(tmpdir(), `boxers-setup-${name}-project-`));
   const state = mkdtempSync(join(tmpdir(), `boxers-setup-${name}-state-`));
@@ -72,7 +74,7 @@ exec "$@"
   process.env.SBX_ARGS = calls;
   process.env.SBX_FAKE_HOME = sandboxHome;
   process.env.SBX_WORKSPACE = root;
-  return { root, project, task, calls };
+  return { root, project, task, calls, sandboxHome };
 }
 
 describe("Sandbox-owned task setup", () => {
@@ -117,5 +119,31 @@ describe("Sandbox-owned task setup", () => {
     expect(result.configHash).not.toBe(failedHash);
     expect(streamed).toBe("retry bytes\n");
     expect(readFileSync(result.logPath, "utf8")).toBe(streamed);
+  });
+
+  it("observes completed setup and cancels running setup for discard", async () => {
+    const { task, sandboxHome } = fixture("discard");
+    const completed = startBackgroundSetup(task, {
+      run: "printf 'done\\n'",
+      timeoutMs: 10_000,
+    });
+    const resultPath = join(
+      sandboxHome,
+      ".boxers",
+      "jobs",
+      task.id,
+      completed.jobId,
+      "result.json",
+    );
+    const completionDeadline = Date.now() + 2_000;
+    while (!existsSync(resultPath)) {
+      if (Date.now() >= completionDeadline) throw new Error("Setup job did not complete.");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(readSetupStatus(task)?.state).toBe("running");
+    await expect(stopBackgroundSetup(task)).resolves.toMatchObject({ state: "passed" });
+
+    startBackgroundSetup(task, { run: "sleep 30", timeoutMs: 60_000 });
+    await expect(stopBackgroundSetup(task)).resolves.toMatchObject({ state: "interrupted" });
   });
 });

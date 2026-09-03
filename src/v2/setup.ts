@@ -6,6 +6,7 @@ import { atomicWriteJson, readJson, taskDir } from "./paths.ts";
 import { listProjects, listTasks, updateTask } from "./registry.ts";
 import { notifyDaemonSetupCompleted, notifyDaemonStateChanged } from "./daemon-client.ts";
 import {
+  cancelTaskJob,
   inspectTaskJob,
   runTaskShell,
   startTaskJob,
@@ -276,6 +277,28 @@ export async function waitForSetup(
       streamedBytes = log.length;
     }
     if (status?.state === "running") await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return status;
+}
+
+/** Stop disposable setup work so another command can inspect a stable workspace. */
+export async function stopBackgroundSetup(
+  task: TaskManifest,
+  previewRun?: string,
+): Promise<SetupStatus | undefined> {
+  let status = refreshSetupStatus(task, previewRun);
+  if (status?.state !== "running") return status;
+
+  const deadline = Date.now() + 10_000;
+  while (status?.state === "running") {
+    // The detached wrapper may not have created its job directory yet. Retry
+    // cancellation alongside observation until either side reports terminal.
+    cancelTaskJob(task, status.jobId);
+    status = refreshSetupStatus(task, previewRun);
+    if (status?.state !== "running") return status;
+    if (Date.now() >= deadline)
+      throw new Error(`Could not stop background setup for ${task.name}.`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
   return status;
 }

@@ -106,6 +106,7 @@ import {
   refreshSetupStatus,
   retryTaskSetup,
   startBackgroundSetup,
+  stopBackgroundSetup,
   waitForSetup,
 } from "./setup.ts";
 import { formatMachineViews } from "./machines.ts";
@@ -1262,8 +1263,41 @@ export async function discard(name: string, force: boolean): Promise<number> {
     throw new Error(
       `Task ${name} contains unmerged work; promote it or use --force to discard it.`,
     );
-  if (!force) await waitForSetup(task);
+  if (!force) {
+    const preview = task.lastSnapshot?.preview;
+    if (preview?.jobId && ["starting", "running"].includes(preview.state)) {
+      stopTaskPreview(task, preview.jobId);
+      task = updateTask(
+        project,
+        task,
+        {
+          ...(task.lastSnapshot ?? { phase: "idle", agent: task.agent }),
+          preview: {
+            ...preview,
+            state: "stopped",
+            observedAt: new Date().toISOString(),
+            source: "command",
+            failure: undefined,
+          },
+        },
+        undefined,
+        "command",
+      );
+    }
+    await stopBackgroundSetup(task);
+  }
   if (!force) ({ project, task } = requireRegisteredTask(name));
+  if (!force) {
+    drainTaskLifecycleEvents(project, task);
+    const currentRemoval = projectTaskView(project, task).removal;
+    if (currentRemoval.state === "blocked_by_activity")
+      throw new Error(`Task ${name} is active and cannot be discarded safely.`);
+    if (currentRemoval.state === "blocked_by_unmerged_changes")
+      throw new Error(
+        `Task ${name} contains unmerged work; promote it or use --force to discard it.`,
+      );
+    ensureAgentWorkspaceStable(project, task);
+  }
   if (!force) writeStdout(`Checking the task workspace against ${project.integration.base}...\n`);
   if (!force && task.lastSnapshot?.targetOid) {
     const targetOid = refreshSeed(project);

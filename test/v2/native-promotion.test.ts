@@ -473,6 +473,44 @@ exec "$FAKE_REAL_GIT" "$@"
     stdout.mockClear();
     await expect(discard("forced", true)).resolves.toBe(0);
     expect(stdout.mock.calls.map(([message]) => message)).toEqual(["Discarded task forced.\n"]);
+
+    const settingUp = createTaskManifest(project, "setting-up", "codex");
+    useFakeRuntime(settingUp);
+    const targetOid = git(root, "rev-parse", "HEAD");
+    let current = updateTask(
+      project,
+      settingUp,
+      { phase: "idle", agent: "codex", targetOid },
+      false,
+      "git",
+    );
+    const runningSetup = {
+      state: "running" as const,
+      command: "npm ci",
+      startedAt: new Date().toISOString(),
+      logPath: join(taskDir(project.id, current.id), "setup.log"),
+      jobId: "setup-job",
+      configHash: "setup-config",
+    };
+    writeFileSync(
+      join(taskDir(project.id, current.id), "setup.json"),
+      JSON.stringify(runningSetup),
+    );
+    current = updateTask(
+      project,
+      current,
+      { ...current.lastSnapshot!, setup: runningSetup },
+      undefined,
+      "worker",
+    );
+    expect(projectTaskView(project, current).removal.state).toBe("safe");
+
+    stdout.mockClear();
+    await expect(discard("setting-up", false)).resolves.toBe(0);
+    expect(stdout.mock.calls.map(([message]) => message)).toEqual([
+      "Unmerged changes: no\nNo other changes by this task\n",
+      "Discarded task setting-up.\n",
+    ]);
   });
 
   it("reuses a recorded delivery only while lifecycle state permits it", async () => {

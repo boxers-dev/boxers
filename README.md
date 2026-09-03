@@ -107,7 +107,10 @@ Next:
 
 `discard` uses the recorded removal disposition: a causally current clean Git
 observation takes the fast path without setup, reconciliation, checks, or
-another Sandbox inspection; unmerged work requires promotion or `--force`.
+another Sandbox inspection. Only an agent that is generating or unmerged work
+blocks normal discard. Setup and other Boxers-owned background work are
+disposable; discard stops them before verifying an otherwise-unknown workspace.
+Unmerged work requires promotion or `--force`.
 After a verified delivery, status reports `Removal: Can be discarded safely`
 and offers `boxers fix-parser discard` without another workspace inspection.
 

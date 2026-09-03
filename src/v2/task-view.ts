@@ -237,7 +237,7 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
       remediation: action("doctor", "Diagnose runtime", "Inspect runtime health.", "boxers doctor"),
     });
 
-  const mutationActive = operations.length > 0;
+  const foregroundOperationActive = Boolean(input.operations?.length);
   const causalClean =
     Boolean(state.baseOid) &&
     state.hasUnmergedChanges.value === false &&
@@ -245,12 +245,15 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
     state.hasUnmergedChanges.conversationSequence !== undefined &&
     state.hasUnmergedChanges.conversationSequence === state.conversationHighWaterSequence;
   const removal: TaskView["removal"] =
-    mutationActive || state.agentTurnState === "working"
-      ? { state: "blocked_by_activity", reason: "A task mutation or agent turn is active." }
+    state.agentTurnState === "working"
+      ? { state: "blocked_by_activity", reason: "The agent is generating." }
       : changes.state === "unmerged" || changes.state === "conflicted"
         ? { state: "blocked_by_unmerged_changes", reason: "Unmerged task changes remain." }
         : changes.state === "unknown"
-          ? { state: "unknown", reason: "Workspace state is unknown; refresh is required." }
+          ? {
+              state: "verification_required",
+              reason: "The workspace must be verified before removal.",
+            }
           : causalClean &&
               !["queued", "running", "conflicted", "failed"].includes(reconciliation.state)
             ? {
@@ -263,7 +266,8 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
               };
 
   const actions: TaskActionView[] = [];
-  if (mutationActive) actions.push(action("wait", "Wait", "A Boxers operation is in progress."));
+  if (foregroundOperationActive)
+    actions.push(action("wait", "Wait", "A Boxers operation is in progress."));
   else if (conflicted)
     actions.push(
       action(
@@ -354,7 +358,15 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
     actions.push(
       action("attach", "Attach", "Continue the existing conversation.", `boxers ${name} attach`),
     );
-  } else if (changes.state === "unknown" || removal.state === "verification_required")
+  } else if (removal.state === "verification_required") {
+    actions.push(
+      action(
+        "discard",
+        "Discard task",
+        "Verify the current workspace and remove it if clean.",
+        `boxers ${name} discard`,
+      ),
+    );
     actions.push(
       action(
         "refresh",
@@ -363,13 +375,28 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
         `boxers ${name} status --refresh`,
       ),
     );
-  else
+  } else
     actions.push(
       action(
         "attach",
         "Attach",
         "Start or continue the task conversation.",
         `boxers ${name} attach`,
+      ),
+    );
+
+  if (
+    !foregroundOperationActive &&
+    removal.state === "verification_required" &&
+    input.runtimeState !== "missing" &&
+    !actions.some((next) => next.kind === "discard")
+  )
+    actions.push(
+      action(
+        "discard",
+        "Discard task",
+        "Verify the current workspace and remove it if clean.",
+        `boxers ${name} discard`,
       ),
     );
 
@@ -639,7 +666,7 @@ const removalLabel = (state: TaskView["removal"]["state"]): string =>
   ({
     safe: "Can be discarded safely",
     verification_required: "Workspace verification required",
-    blocked_by_activity: "Cannot be discarded safely - activity remains",
+    blocked_by_activity: "Cannot be discarded safely - agent is generating",
     blocked_by_unmerged_changes: "Cannot be discarded safely - unmerged changes remain",
     unknown: "Unknown - refresh required",
   })[state];
