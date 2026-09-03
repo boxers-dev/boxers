@@ -9,6 +9,7 @@ import {
   localHostKey,
   mergeFleetSnapshot,
   readFleet,
+  renameLocalFleetMember,
   removeFleetMember,
   updateLocalFleetMember,
   validateFleetMember,
@@ -370,6 +371,11 @@ export function currentFleetSyncPayload(): FleetSyncPayload | undefined {
   };
 }
 
+export function renameLocalHost(name: string): FleetSyncPayload {
+  renameLocalFleetMember(name);
+  return currentFleetSyncPayload() as FleetSyncPayload;
+}
+
 export function encodeFleetSync(payload: FleetSyncPayload): string {
   return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
 }
@@ -670,6 +676,50 @@ export async function disconnectHost(reference: string): Promise<number> {
   for (const failure of gossip.failures)
     process.stderr.write(
       `warning: ${failure.machine.name} did not receive the fleet removal yet; daemon gossip will retry: ${failure.detail}\n`,
+    );
+  return 0;
+}
+
+export async function renameHost(reference: string, name: string): Promise<number> {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name))
+    throw new Error("Machine names may contain letters, numbers, dots, underscores, and hyphens.");
+  const fleet = readFleet();
+  if (!fleet) throw new Error("This host is not enrolled in a Boxers fleet.");
+  const normalized = reference.toLowerCase();
+  const localId = localMachineIdentity().id;
+  const matches = fleet.members.filter(
+    (candidate) =>
+      (normalized === "local" && candidate.hostId === localId) ||
+      candidate.hostId.toLowerCase() === normalized ||
+      candidate.name.toLowerCase() === normalized ||
+      candidate.endpoints.some((endpoint) => endpoint.target.toLowerCase() === normalized),
+  );
+  if (!matches.length) throw new Error(`Unknown fleet host "${reference}".`);
+  if (matches.length > 1) throw new Error(`Fleet host reference "${reference}" is ambiguous.`);
+  const member = matches[0]!;
+  const collision = fleet.members.find(
+    (candidate) =>
+      candidate.hostId !== member.hostId && candidate.name.toLowerCase() === name.toLowerCase(),
+  );
+  if (collision) throw new Error(`Fleet host name "${name}" is already in use.`);
+
+  if (member.hostId === localId) {
+    renameLocalHost(name);
+  } else {
+    const machine = listRemoteMachines().find((candidate) => candidate.id === member.hostId);
+    if (!machine) throw new Error(`Fleet host "${reference}" has no SSH endpoint.`);
+    const response = await runManagedSshCaptured(machine.sshHost, ["remote", "rename-host", name]);
+    acceptFleetSyncResponse(response);
+  }
+
+  const renamed = readFleet()?.members.find((candidate) => candidate.hostId === member.hostId);
+  if (renamed?.name !== name)
+    throw new Error(`Fleet host "${reference}" did not confirm its new name.`);
+  const gossip = await gossipFleetMembership();
+  process.stdout.write(`Renamed ${member.name} to ${name}.\n`);
+  for (const failure of gossip.failures)
+    process.stderr.write(
+      `warning: ${failure.machine.name} did not receive the renamed fleet member yet; daemon gossip will retry: ${failure.detail}\n`,
     );
   return 0;
 }

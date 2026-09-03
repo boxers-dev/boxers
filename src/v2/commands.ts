@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
-import { hostname, tmpdir, userInfo } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { writeStderr, writeStdout } from "../core/output.ts";
@@ -46,6 +46,7 @@ import {
   listProjects,
   listRegisteredTasks,
   listTasks,
+  localMachineIdentity,
   markTaskSessionStarted,
   refreshSeed,
   repositoryRoot,
@@ -1026,7 +1027,9 @@ export async function cloneAndInitializeProject(
     writeStdout(`Reusing existing checkout at ${destination}.\n`);
   } else {
     const remoteSession = isSshSession();
-    const remoteAccount = remoteSession ? `${userInfo().username}@${hostname()}` : undefined;
+    const remoteAccount = remoteSession
+      ? `${userInfo().username}@${localMachineIdentity().name}`
+      : undefined;
     if (remoteAccount)
       writeStdout(
         `Preparing the Git checkout on ${remoteAccount}. Repository credentials and SSH keys are read on that machine; Boxers does not forward personal keys from the machine where this command was started.\n`,

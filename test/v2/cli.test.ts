@@ -44,6 +44,8 @@ vi.mock("../../src/v2/fleet-connect.ts", () => ({
   acceptUnenrollment: vi.fn(),
   connectHost: vi.fn(() => 0),
   disconnectHost: vi.fn(() => 0),
+  renameHost: vi.fn(() => 0),
+  renameLocalHost: vi.fn(() => ({ version: 1, fleetId: "fleet", members: [] })),
   remoteIdentity: vi.fn(() => ({ protocolVersion: 1 })),
   verifyEnrolledPeer: vi.fn(() => 0),
 }));
@@ -131,6 +133,7 @@ describe("v2 CLI", () => {
     expect(output).toContain("boxers project init");
     expect(output).toContain("boxers init");
     expect(output).toContain("boxers list templates [--json]");
+    expect(output).toContain("boxers hosts rename <machine> <new-name>");
     expect(output).toContain("boxers [<machine>/]<task> attach");
     expect(output).not.toContain("boxers <machine>/<task> attach");
     expect(output).not.toContain("boxers <task> stop");
@@ -378,6 +381,9 @@ describe("v2 CLI", () => {
       admin: false,
     });
 
+    await dispatch(["hosts", "rename", "build-box", "builder"]);
+    expect(fleetConnect.renameHost).toHaveBeenCalledWith("build-box", "builder");
+
     await dispatch(["disconnect", "build-box"]);
     expect(fleetConnect.disconnectHost).toHaveBeenCalledWith("build-box");
 
@@ -400,6 +406,9 @@ describe("v2 CLI", () => {
     await dispatch(["remote", "sync-fleet", "payload"]);
     expect(fleetConnect.acceptFleetSync).toHaveBeenCalledWith("payload");
     expect(write).toHaveBeenCalledWith(expect.stringContaining('"fleetId":"fleet"'));
+
+    await dispatch(["remote", "rename-host", "builder"]);
+    expect(fleetConnect.renameLocalHost).toHaveBeenCalledWith("builder");
 
     await dispatch(["remote", "install-release", "signed-state"]);
     expect(fleetRelease.acceptFleetRelease).toHaveBeenCalledWith("signed-state");

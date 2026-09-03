@@ -3,8 +3,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readVersion } from "../../src/core/version.ts";
-import { connectHost, disconnectHost, remoteIdentity } from "../../src/v2/fleet-connect.ts";
-import { ensureFleet, localFleetMember, localHostKey, readFleet } from "../../src/v2/fleet.ts";
+import {
+  connectHost,
+  disconnectHost,
+  remoteIdentity,
+  renameHost,
+} from "../../src/v2/fleet-connect.ts";
+import {
+  enrollFleetMember,
+  ensureFleet,
+  localFleetMember,
+  localHostKey,
+  readFleet,
+} from "../../src/v2/fleet.ts";
 import { localMachineIdentity } from "../../src/v2/registry.ts";
 import { listRemoteMachines } from "../../src/v2/machines.ts";
 import { ensureManagedSshIdentity } from "../../src/v2/ssh-identity.ts";
@@ -110,6 +121,7 @@ case "$*" in
     decoded=$(node -e 'const value=JSON.parse(Buffer.from(process.argv[1], "base64url")); process.stdout.write(value.args.join(" "))' "$token")
     case "$decoded" in
       "remote sync-fleet "*) printf '%s\n' "$FAKE_REMOTE_FLEET" ;;
+      "remote rename-host "*) printf '%s\n' "$FAKE_REMOTE_FLEET" ;;
       "remote verify-peer "*) test -z "$FAKE_VERIFY_FAIL" ;;
       "remote unenroll "*) test -z "$FAKE_UNENROLL_FAIL" ;;
       "service install "*) test -z "$FAKE_SERVICE_FAIL" ;;
@@ -232,6 +244,26 @@ describe("reciprocal fleet connection", () => {
     expect(calls).toContain("remote authorize-peer");
     expect(calls).toContain("IdentitiesOnly=yes");
     expect(calls).toContain("boxers-gateway-request");
+  });
+
+  it("renames a host on its owning machine and applies the returned fleet record", async () => {
+    const { remoteId } = fixture();
+    vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const payload = JSON.parse(process.env.FAKE_REMOTE_FLEET!) as {
+      members: ReturnType<typeof localFleetMember>[];
+    };
+    enrollFleetMember("fleet-id", payload.members[0]!);
+    payload.members[0] = {
+      ...payload.members[0]!,
+      name: "builder",
+      enrolledAt: "2099-01-01T00:00:00.000Z",
+    };
+    process.env.FAKE_REMOTE_FLEET = JSON.stringify(payload);
+
+    await expect(renameHost("remote-box", "builder")).resolves.toBe(0);
+
+    expect(readFleet()?.members.find((member) => member.hostId === remoteId)?.name).toBe("builder");
   });
 
   it("cleans up failed reverse enrollment and propagates an offline disconnect honestly", async () => {

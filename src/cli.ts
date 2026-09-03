@@ -49,6 +49,8 @@ import {
   acceptUnenrollment,
   connectHost,
   disconnectHost,
+  renameHost,
+  renameLocalHost,
   remoteIdentity,
   verifyEnrolledPeer,
 } from "./v2/fleet-connect.ts";
@@ -97,6 +99,7 @@ Fleet
   boxers connect <ssh-target> [--name <name>] [--reverse-host <target>]
       [--no-install] [--observe-only]
   boxers hosts
+  boxers hosts rename <machine> <new-name>
   boxers disconnect <name-or-id>
 
 Tasks
@@ -564,6 +567,12 @@ export async function dispatch(argv: string[]): Promise<number> {
     });
   }
   if (first === "hosts") {
+    if (rest[0] === "rename") {
+      const [, machine, name, ...unexpected] = rest;
+      if (!machine || !name || unexpected.length)
+        throw new UsageError("hosts rename requires <machine> <new-name>.");
+      return renameHost(machine, name);
+    }
     only(rest, ["--json"], "hosts");
     const fleet = readFleet();
     if (rest.includes("--json")) process.stdout.write(`${JSON.stringify({ fleet })}\n`);
@@ -687,6 +696,11 @@ export async function dispatch(argv: string[]): Promise<number> {
     if (command === "sync-fleet") {
       if (args.length !== 1) throw new UsageError("remote sync-fleet requires one payload.");
       process.stdout.write(`${JSON.stringify(acceptFleetSync(args[0] as string))}\n`);
+      return 0;
+    }
+    if (command === "rename-host") {
+      if (args.length !== 1) throw new UsageError("remote rename-host requires one name.");
+      process.stdout.write(`${JSON.stringify(renameLocalHost(args[0] as string))}\n`);
       return 0;
     }
     if (command === "verify-peer") {

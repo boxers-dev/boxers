@@ -9,6 +9,7 @@ import {
   createTaskManifest,
   initProject,
   localMachineIdentity,
+  renameLocalMachine,
   requireRegisteredTask,
 } from "../../src/v2/registry.ts";
 import { taskDir } from "../../src/v2/paths.ts";
@@ -35,6 +36,17 @@ describe("sanitized project seed", () => {
     const identity = localMachineIdentity();
     expect(localMachineIdentity()).toEqual(identity);
     expect(identity.id).toBeTruthy();
+  });
+
+  it("renames a machine without replacing its durable identity", () => {
+    const state = mkdtempSync(join(tmpdir(), "boxers-state-"));
+    paths.push(state);
+    process.env.BOXERS_HOME = state;
+    const identity = localMachineIdentity();
+
+    expect(renameLocalMachine("build-box")).toEqual({ ...identity, name: "build-box" });
+    expect(localMachineIdentity()).toEqual({ ...identity, name: "build-box" });
+    expect(() => renameLocalMachine("bad name")).toThrow("Machine names may contain");
   });
 
   it("contains committed tracked content but no real-worktree secrets or host Git settings", () => {

@@ -9,12 +9,14 @@ import {
   localHostKey,
   readFleet,
   recordFleetRemoval,
+  renameLocalFleetMember,
   signHostProjection,
   updateLocalFleetMember,
   verifyHostProjection,
 } from "../../src/v2/fleet.ts";
 import { decodeAdminRequest, encodeAdminRequest } from "../../src/v2/fleet-admin.ts";
 import { fleetAdminStateLockPath, fleetLockPath, fleetPath } from "../../src/v2/paths.ts";
+import { localMachineIdentity } from "../../src/v2/registry.ts";
 import {
   acceptEnrollment,
   acceptFleetSync,
@@ -42,6 +44,18 @@ afterEach(() => {
 });
 
 describe("fleet identity and administration", () => {
+  it("publishes a renamed local identity as a newer fleet member", () => {
+    process.env.BOXERS_HOME = stateDirectory();
+    const before = ensureFleet().members[0]!;
+
+    const renamed = renameLocalFleetMember("build-box");
+    const member = renamed.members.find((candidate) => candidate.hostId === before.hostId);
+
+    expect(member).toMatchObject({ hostId: before.hostId, name: "build-box" });
+    expect(Date.parse(member!.enrolledAt)).toBeGreaterThan(Date.parse(before.enrolledAt));
+    expect(localMachineIdentity().name).toBe("build-box");
+  });
+
   it("migrates a persisted local member that predates managed SSH", () => {
     process.env.BOXERS_HOME = stateDirectory();
     const fleet = ensureFleet();

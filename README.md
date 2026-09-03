@@ -127,6 +127,16 @@ boxers hosts
 boxers list
 ```
 
+Give an already connected machine a new fleet-wide name without reconnecting it:
+
+```sh
+boxers hosts rename <machine> <new-name>
+```
+
+`<machine>` may be its current name, ID, or SSH endpoint. The new name is stored
+on the owning machine and propagated to the rest of the fleet. Use `local` to
+rename the machine running the command.
+
 On the first connection, Boxers installs the matching CLI release in the
 remote user's account and opens the normal interactive machine setup over SSH.
 That setup installs and authenticates Docker Sandboxes, initializes its network

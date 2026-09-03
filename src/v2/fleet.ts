@@ -10,7 +10,7 @@ import {
   readJson,
 } from "./paths.ts";
 import { withPidFileLock } from "./lock.ts";
-import { localMachineIdentity } from "./registry.ts";
+import { localMachineIdentity, renameLocalMachine } from "./registry.ts";
 import { notifyDaemonStateChanged } from "./daemon-client.ts";
 import type { FleetManifest, FleetMember, FleetRemoval, PeerRole } from "./types.ts";
 import {
@@ -304,6 +304,30 @@ export function updateLocalFleetMember(member: FleetMember): FleetManifest {
   )
     throw new Error("Local fleet member identity does not match this host.");
   return mergeFleet(fleet, [member], [], false);
+}
+
+/** Rename this host's durable identity and publish a fresh fleet membership record. */
+export function renameLocalFleetMember(name: string): FleetManifest {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name))
+    throw new Error("Machine names may contain letters, numbers, dots, underscores, and hyphens.");
+  return withPidFileLock(fleetLockPath(), () => {
+    const fleet = readFleetUnlocked();
+    if (!fleet) throw new Error("This host is not enrolled in a Boxers fleet.");
+    const localId = localMachineIdentity().id;
+    const member = fleet.members.find((candidate) => candidate.hostId === localId);
+    if (!member) throw new Error("The local host is missing from its Boxers fleet.");
+    const collision = fleet.members.find(
+      (candidate) =>
+        candidate.hostId !== localId && candidate.name.toLowerCase() === name.toLowerCase(),
+    );
+    if (collision) throw new Error(`Fleet host name "${name}" is already in use.`);
+    renameLocalMachine(name);
+    if (member.name === name) return fleet;
+    const enrolledAt = new Date(
+      Math.max(Date.now(), timestamp(member.enrolledAt, "fleet enrollment") + 1),
+    ).toISOString();
+    return mergeFleetUnlocked(fleet, [{ ...member, name, enrolledAt }], [], false);
+  });
 }
 
 export function mergeFleetSnapshot(

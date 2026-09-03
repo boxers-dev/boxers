@@ -65,6 +65,22 @@ export function localMachineIdentity(): MachineIdentity {
   });
 }
 
+export function renameLocalMachine(name: string): MachineIdentity {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name))
+    throw new Error("Machine names may contain letters, numbers, dots, underscores, and hyphens.");
+  localMachineIdentity();
+  return withPidFileLock(machineIdentityLockPath(), () => {
+    const path = machineIdentityPath();
+    const identity = readJson<MachineIdentity>(path);
+    const renamed = { ...identity, name };
+    if (!isDeepStrictEqual(identity, renamed)) {
+      atomicWriteJson(path, renamed);
+      notifyDaemonStateChanged();
+    }
+    return renamed;
+  });
+}
+
 export function repositoryRoot(cwd = process.cwd()): string {
   return requireSuccess(
     command("git", ["-C", cwd, "rev-parse", "--show-toplevel"]),
