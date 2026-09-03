@@ -27,7 +27,7 @@ describe("fleet host status", () => {
       boxersVersion: "1.2.3",
       health: "healthy",
       daemon: "running",
-      authentication: { codex: "configured", claude: "missing" },
+      authentication: { codex: "stored", claude: "missing" },
       checks: [],
     };
     atomicWriteJson(hostStatusPath(), status);
@@ -35,7 +35,7 @@ describe("fleet host status", () => {
     await expect(showFleetStatus({ refresh: false, json: false })).resolves.toBe(0);
     const output = write.mock.calls.map((call) => String(call[0])).join("");
     expect(output).toContain("healthy");
-    expect(output).toContain("configured");
+    expect(output).toContain("stored");
     expect(output).toContain("missing");
     write.mockClear();
     await expect(
@@ -49,8 +49,8 @@ describe("fleet host status", () => {
       showAuthenticationStatus({ refresh: false, all: false, json: false }),
     ).resolves.toBe(1);
     const authenticationOutput = write.mock.calls.map((call) => String(call[0])).join("");
-    expect(authenticationOutput).toContain("Host credentials for new tasks");
-    expect(authenticationOutput).toContain("boxers auth claude");
-    expect(authenticationOutput).toContain("task-local subscription login");
+    expect(authenticationOutput).toContain("Stored host credentials for new tasks");
+    expect(authenticationOutput).toContain("create or attach to a Claude task");
+    expect(authenticationOutput).toContain("provider validity is checked per task");
   });
 });

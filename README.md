@@ -239,19 +239,23 @@ boxers project status
 ```
 
 `status` is the overview for this machine and connected hosts. `doctor`
-performs detailed live diagnostics. Run the relevant `auth` command whenever
-an agent needs to be connected again. Authentication state belongs to the host
-that runs the Sandbox: remote API credentials are entered on that host through
-the restricted fleet connection and are never forwarded from the initiating
-machine.
+performs detailed live diagnostics. The `auth` commands manage optional host
+proxy credentials; their status reports whether a credential is stored, not
+whether the provider currently accepts it. Authentication state belongs to the
+host that runs the Sandbox: remote API credentials are entered on that host
+through the restricted fleet connection and are never forwarded from the
+initiating machine.
 
-ChatGPT and Claude subscription sessions can instead live inside an individual
-durable task Sandbox. When a task is created or attached without a usable host
-credential or task-local login, Boxers offers the provider-native flow before
-starting the agent: Codex device login or `claude auth login --claudeai`. It
-then runs the provider's native status command to verify the login. This also
-makes an existing task recover cleanly after its subscription session is
-logged out without replacing its resumable conversation.
+ChatGPT and Claude subscription sessions live inside an individual durable task
+Sandbox. On `new` and `attach`, Boxers checks that task-local session and offers
+the provider-native flow when it is missing or needs renewal: Codex device
+login or `claude auth login --claudeai`. Codex is checked through its structured
+account API with token refresh; Claude is checked with its native auth status.
+A Docker proxy credential is checked with a non-generating provider request.
+An accepted credential continues silently, a definite authentication rejection
+offers task login, and an inconclusive network check does not nag the user.
+After reauthentication, Boxers restarts only the daemon-owned provider process
+and resumes the existing provider-native conversation in the same Sandbox.
 
 Codex's global ChatGPT OAuth flow uses a localhost browser callback and is not
 available through the restricted fleet SSH connection. Use task-local device

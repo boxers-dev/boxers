@@ -1,4 +1,5 @@
 import { arch, platform, release } from "node:os";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { MIN_SBX_VERSION, type TaskManifest } from "../types.ts";
 import { command, commandWithInput, requireSuccess } from "../process.ts";
@@ -142,6 +143,191 @@ function serviceIsConfigured(output: string, service: string): boolean {
   return new RegExp(`(^|[^a-z0-9_-])${service}([^a-z0-9_-]|$)`, "im").test(output);
 }
 
+const CODEX_ACCOUNT_TIMEOUT_MS = 10_000;
+const EXTERNAL_AUTH_REJECTED = 11;
+const CODEX_CHATGPT_CONFIG_ARGS = [
+  "-c",
+  'forced_login_method="chatgpt"',
+  "-c",
+  'model_provider="openai"',
+] as const;
+
+const EXTERNAL_AUTH_PROBE = `
+agent="$1"
+if test "$agent" = codex; then
+  status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+    --connect-timeout 3 --max-time 5 \
+    --header "Authorization: Bearer $OPENAI_API_KEY" \
+    --header 'Content-Type: application/json' \
+    --data '{}' https://api.openai.com/v1/responses)" || exit 12
+else
+  status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+    --connect-timeout 3 --max-time 5 \
+    --header "x-api-key: $ANTHROPIC_API_KEY" \
+    --header 'anthropic-version: 2023-06-01' \
+    --header 'Content-Type: application/json' \
+    --data '{}' https://api.anthropic.com/v1/messages)" || exit 12
+fi
+test "$status" = 401 && exit 11
+test "$status" = 000 && exit 12
+exit 0
+`;
+
+function externalCredentialStatus(
+  runtimeId: string,
+  agent: TaskManifest["agent"],
+): RuntimeAuthenticationStatus {
+  const result = command("sbx", [
+    "exec",
+    runtimeId,
+    "sh",
+    "-c",
+    EXTERNAL_AUTH_PROBE,
+    "boxers-auth-probe",
+    agent,
+  ]);
+  if (result.status === 0)
+    return {
+      state: "ready",
+      detail: `${agent === "codex" ? "OpenAI" : "Anthropic"} proxy credential was accepted`,
+    };
+  if (result.status === EXTERNAL_AUTH_REJECTED)
+    return {
+      state: "reauth_required",
+      detail: `${agent === "codex" ? "OpenAI" : "Anthropic"} rejected the proxy credential`,
+    };
+  return {
+    state: "external_unverified",
+    detail: `${agent === "codex" ? "OpenAI" : "Anthropic"} proxy credential is stored; live verification was inconclusive`,
+  };
+}
+
+/**
+ * Ask Codex to read and refresh its task-local account. The Docker credential
+ * proxy is deliberately removed from this probe so its placeholder API key
+ * cannot be mistaken for a usable ChatGPT session.
+ */
+function codexTaskAccountStatus(runtimeId: string): Promise<RuntimeAuthenticationStatus> {
+  return new Promise((resolve) => {
+    const child = spawn(
+      "sbx",
+      [
+        "exec",
+        "--interactive",
+        runtimeId,
+        "env",
+        "-u",
+        "OPENAI_API_KEY",
+        "codex",
+        ...CODEX_CHATGPT_CONFIG_ARGS,
+        "app-server",
+      ],
+      { stdio: ["pipe", "pipe", "pipe"] },
+    );
+    const initializeId = "boxers-initialize";
+    const accountId = "boxers-account";
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let initialized = false;
+    let timer: ReturnType<typeof setTimeout>;
+    child.stdin.on("error", () => {
+      // A short-lived or older app-server may close stdin while the probe is
+      // being written. Its close/error result below owns the diagnostic.
+    });
+    const write = (message: unknown): void => {
+      if (!settled && child.stdin.writable) child.stdin.write(`${JSON.stringify(message)}\n`);
+    };
+    const finish = (status: RuntimeAuthenticationStatus): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stdin.end();
+      child.kill();
+      resolve(status);
+    };
+    const inspectLine = (line: string): void => {
+      let message: unknown;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (!message || typeof message !== "object") return;
+      const response = message as {
+        id?: unknown;
+        result?: { account?: unknown };
+        error?: { message?: unknown };
+      };
+      if (response.id === initializeId && !initialized) {
+        initialized = true;
+        write({ method: "initialized", params: {} });
+        write({ method: "account/read", id: accountId, params: { refreshToken: true } });
+        return;
+      }
+      if (response.id !== accountId) return;
+      if (response.error) {
+        const detail =
+          typeof response.error.message === "string"
+            ? response.error.message
+            : "Codex could not refresh the task-local account";
+        finish({ state: "reauth_required", detail });
+        return;
+      }
+      const account = response.result?.account;
+      if (account === null || account === undefined) {
+        finish({ state: "missing", detail: "no task-local Codex login is stored" });
+        return;
+      }
+      const type =
+        account && typeof account === "object" && "type" in account
+          ? String((account as { type: unknown }).type)
+          : "account";
+      finish({
+        state: "ready",
+        detail: `task-local Codex ${type === "chatgpt" ? "ChatGPT" : type} account refreshed`,
+      });
+    };
+    const consume = (): void => {
+      for (;;) {
+        const newline = stdout.indexOf("\n");
+        if (newline < 0) return;
+        const line = stdout.slice(0, newline);
+        stdout = stdout.slice(newline + 1);
+        inspectLine(line);
+      }
+    };
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+      consume();
+    });
+    child.stderr.on("data", (chunk: string) => (stderr += chunk));
+    child.on("error", (error) =>
+      finish({ state: "unknown", detail: `could not start the Codex account probe: ${error.message}` }),
+    );
+    child.on("close", () => {
+      if (settled) return;
+      if (stdout.trim()) inspectLine(stdout.trim());
+      if (!settled)
+        finish({
+          state: "unknown",
+          detail: (stderr || "Codex did not answer the task-local account probe").trim(),
+        });
+    });
+    timer = setTimeout(
+      () => finish({ state: "unknown", detail: "Codex account refresh timed out" }),
+      CODEX_ACCOUNT_TIMEOUT_MS,
+    );
+    write({
+      method: "initialize",
+      id: initializeId,
+      params: { clientInfo: { name: "boxers", title: "Boxers", version: "1" } },
+    });
+  });
+}
+
 export function dockerLoginDiagnostic(output: string): RuntimeDiagnostic {
   let parsed: unknown;
   try {
@@ -197,6 +383,7 @@ export function dockerLoginDiagnostic(output: string): RuntimeDiagnostic {
 
 export class DockerSandboxesRuntime implements TaskRuntime {
   readonly kind = "docker-sandboxes";
+  readonly #taskLocalAuthentication = new Set<string>();
 
   capabilities(): RuntimeCapabilities {
     return {
@@ -281,13 +468,13 @@ export class DockerSandboxesRuntime implements TaskRuntime {
                 `could not inspect ${provider} credentials`
               ).trim()
             : credentialAvailable
-              ? `${provider} host credential is available for new ${agent} tasks`
+              ? `${provider} host credential is stored for new ${agent} tasks (validity is checked only by the provider when a task starts)`
               : `${provider} host credential is not configured for new ${agent} tasks`,
         ...(secrets.status === 0 && !credentialAvailable
           ? {
               remediation: {
-                kind: "command" as const,
-                value: `boxers auth ${agent}`,
+                kind: "manual" as const,
+                value: `Create or attach to an interactive ${agent} task to sign in there.`,
                 interactive: true,
               },
             }
@@ -318,12 +505,38 @@ export class DockerSandboxesRuntime implements TaskRuntime {
   authenticateSubscription(runtimeId: string, agent: TaskManifest["agent"]): void {
     const result =
       agent === "codex"
-        ? command("sbx", ["exec", runtimeId, "codex", "login", "--device-auth"], {
-            stdio: "inherit",
-          })
+        ? command(
+            "sbx",
+            [
+              "exec",
+              "--interactive",
+              "--tty",
+              runtimeId,
+              "env",
+              "-u",
+              "OPENAI_API_KEY",
+              "codex",
+              ...CODEX_CHATGPT_CONFIG_ARGS,
+              "login",
+              "--device-auth",
+            ],
+            { stdio: "inherit" },
+          )
         : command(
             "sbx",
-            ["exec", "--interactive", "--tty", runtimeId, "claude", "auth", "login", "--claudeai"],
+            [
+              "exec",
+              "--interactive",
+              "--tty",
+              runtimeId,
+              "env",
+              "-u",
+              "ANTHROPIC_API_KEY",
+              "claude",
+              "auth",
+              "login",
+              "--claudeai",
+            ],
             { stdio: "inherit" },
           );
     if (result.status !== 0)
@@ -475,22 +688,49 @@ export class DockerSandboxesRuntime implements TaskRuntime {
     stopSandbox(dockerTask(task));
   }
 
-  agentAuthenticationStatus(task: TaskManifest): RuntimeAuthenticationStatus {
+  async agentAuthenticationStatus(task: TaskManifest): Promise<RuntimeAuthenticationStatus> {
     const authentication = harnessForAgent(task.agent).authentication;
     const id = runtimeId(task);
-    const scoped = command("sbx", ["secret", "ls", "--sandbox", id]);
-    if (scoped.status === 0 && serviceIsConfigured(scoped.stdout, authentication.service))
-      return {
-        state: "configured",
-        detail: `${authentication.service} credential is scoped to this task`,
-      };
+    const taskLocal =
+      task.agent === "codex"
+        ? await codexTaskAccountStatus(id)
+        : (() => {
+            const result = command("sbx", [
+              "exec",
+              id,
+              "env",
+              "-u",
+              "ANTHROPIC_API_KEY",
+              ...authentication.statusCommand,
+            ]);
+            if (result.status === 0)
+              return {
+                state: "ready" as const,
+                detail: "task-local Claude subscription is authenticated",
+              };
+            const detail = (result.stderr || result.stdout).trim();
+            if (
+              result.status === 126 ||
+              result.status === 127 ||
+              /not found|no such sandbox|cannot connect|connection refused/i.test(detail)
+            )
+              return { state: "unknown" as const, detail };
+            return { state: "missing" as const, detail: detail || "no task-local Claude login" };
+          })();
+    if (taskLocal.state === "ready") {
+      this.#taskLocalAuthentication.add(id);
+      return taskLocal;
+    }
+    this.#taskLocalAuthentication.delete(id);
+    if (taskLocal.state === "reauth_required") return taskLocal;
 
+    const scoped = command("sbx", ["secret", "ls", "--sandbox", id]);
     const native = command("sbx", ["exec", id, ...authentication.statusCommand]);
-    if (native.status === 0)
-      return {
-        state: "configured",
-        detail: `${task.agent} is authenticated inside this task`,
-      };
+    if (
+      native.status === 0 ||
+      (scoped.status === 0 && serviceIsConfigured(scoped.stdout, authentication.service))
+    )
+      return externalCredentialStatus(id, task.agent);
     const nativeDetail = (native.stderr || native.stdout).trim();
     if (
       scoped.status !== 0 ||
@@ -504,17 +744,17 @@ export class DockerSandboxesRuntime implements TaskRuntime {
       };
     return {
       state: "missing",
-      detail: `no ${authentication.service} host credential or task-local ${task.agent} login is available`,
+      detail: `no ${authentication.service} proxy credential or task-local ${task.agent} login is available`,
     };
   }
 
-  assertAgentCredential(task: TaskManifest): void {
-    const status = this.agentAuthenticationStatus(task);
-    if (status.state === "configured") return;
+  async assertAgentCredential(task: TaskManifest): Promise<void> {
+    const status = await this.agentAuthenticationStatus(task);
+    if (status.state === "ready" || status.state === "external_unverified") return;
     throw new Error(
       status.state === "unknown"
         ? `Could not verify ${task.agent} authentication for task ${task.name}: ${status.detail}`
-        : `${task.agent} authentication is required for task ${task.name}. Run "boxers ${task.name} attach" from an interactive terminal to sign in, or configure a host credential with "boxers auth ${task.agent}".`,
+        : `${task.agent} authentication is required for task ${task.name}. Run "boxers ${task.name} attach" from an interactive terminal to sign in.`,
     );
   }
 
@@ -526,9 +766,23 @@ export class DockerSandboxesRuntime implements TaskRuntime {
   }
 
   agentLaunchSpec(task: TaskManifest, args: readonly string[]) {
+    const taskLocalVariable = task.agent === "codex" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY";
     return {
       command: "sbx",
-      args: ["run", task.agent, "--name", runtimeId(task), "--", ...args],
+      args: [
+        "run",
+        task.agent,
+        "--name",
+        runtimeId(task),
+        ...(this.#taskLocalAuthentication.has(runtimeId(task))
+          ? ["--env", `${taskLocalVariable}=`]
+          : []),
+        "--",
+        ...(task.agent === "codex" && this.#taskLocalAuthentication.has(runtimeId(task))
+          ? CODEX_CHATGPT_CONFIG_ARGS
+          : []),
+        ...args,
+      ],
     };
   }
 

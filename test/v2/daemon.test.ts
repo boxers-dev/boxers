@@ -1373,8 +1373,10 @@ describe("daemon session lifecycle", () => {
       cols: 80,
       rows: 24,
     });
-    client.send({ type: "stop", sessionId: "task-d" });
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    client.send({ type: "stop", sessionId: "task-d", requestId: "stop-task-d" });
+    await client.next(
+      (message) => message.type === "session_stopped" && message.requestId === "stop-task-d",
+    );
 
     const status = await connectClient(socketPath);
     status.send({ type: "list" });

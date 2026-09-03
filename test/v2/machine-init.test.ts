@@ -8,7 +8,7 @@ const prompts = vi.hoisted(() => ({
   question: vi.fn<(text: string) => Promise<string>>(),
   close: vi.fn(),
 }));
-const auth = vi.hoisted(() => ({ authenticateAgent: vi.fn(), interactive: true }));
+const auth = vi.hoisted(() => ({ interactive: true }));
 const daemon = vi.hoisted(() => ({ start: vi.fn(async () => 0) }));
 const service = vi.hoisted(() => ({
   status: vi.fn(() => ({
@@ -26,8 +26,6 @@ vi.mock("node:readline/promises", () => ({
 }));
 vi.mock("../../src/v2/auth.ts", () => ({
   isInteractive: () => auth.interactive,
-  isSshSession: () => false,
-  authenticateAgent: auth.authenticateAgent,
 }));
 vi.mock("../../src/v2/daemon-commands.ts", () => ({ daemonStart: daemon.start }));
 vi.mock("../../src/v2/service.ts", () => ({
@@ -79,7 +77,6 @@ describe("machine initialization", () => {
     stateDir = mkdtempSync(join(tmpdir(), "boxers-machine-init-"));
     process.env.BOXERS_HOME = stateDir;
     auth.interactive = true;
-    auth.authenticateAgent.mockReset();
     daemon.start.mockClear();
     service.status.mockClear();
     prompts.answers = ["yes", "no"];
@@ -93,14 +90,12 @@ describe("machine initialization", () => {
     if (existsSync(stateDir)) rmSync(stateDir, { recursive: true, force: true });
   });
 
-  it("offers provider authentication independently and starts the daemon", async () => {
+  it("leaves provider authentication to tasks and starts the daemon", async () => {
     const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
 
     await expect(initializeMachine()).resolves.toBe(0);
 
     expect(isMachineSetupComplete()).toBe(true);
-    expect(auth.authenticateAgent).toHaveBeenCalledWith("codex", { mode: "oauth" });
-    expect(auth.authenticateAgent).not.toHaveBeenCalledWith("claude", expect.anything());
     expect(daemon.start).toHaveBeenCalledOnce();
     expect(write.mock.calls.flat().join("")).toContain("Boxers is ready");
   });

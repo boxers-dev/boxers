@@ -55,7 +55,16 @@ function task(agent: "codex" | "claude" = "codex"): TaskManifest {
   };
 }
 
-function fakeAuthenticationStatusSbx(state: "scoped" | "task" | "missing" | "unavailable") {
+function fakeAuthenticationStatusSbx(
+  state:
+    | "scoped"
+    | "task"
+    | "expired"
+    | "external_ready"
+    | "external_rejected"
+    | "missing"
+    | "unavailable",
+) {
   const bin = mkdtempSync(join(tmpdir(), "boxers-auth-status-bin-"));
   cleanup.push(bin);
   const executable = join(bin, "sbx");
@@ -65,10 +74,34 @@ function fakeAuthenticationStatusSbx(state: "scoped" | "task" | "missing" | "una
     `#!/bin/sh
 printf '%s\n' "$*" >> "$SBX_AUTH_ARGS"
 if [ "$1 $2" = "secret ls" ]; then
-  [ "$SBX_AUTH_TEST_STATE" = scoped ] && printf 'service openai configured\n'
+  case "$SBX_AUTH_TEST_STATE" in
+    scoped|external_ready|external_rejected) printf 'service openai configured\n' ;;
+  esac
   exit 0
 fi
 if [ "$1" = exec ]; then
+  case "$*" in
+    *"boxers-auth-probe"*)
+      [ "$SBX_AUTH_TEST_STATE" = external_ready ] && exit 0
+      [ "$SBX_AUTH_TEST_STATE" = external_rejected ] && exit 11
+      exit 12
+      ;;
+    *"codex "*"app-server"*)
+      if [ "$SBX_AUTH_TEST_STATE" = task ] || [ "$SBX_AUTH_TEST_STATE" = expired ]; then
+        IFS= read -r ignored
+        printf '{"id":"boxers-initialize","result":{"userAgent":"test"}}\n'
+        IFS= read -r ignored
+        IFS= read -r ignored
+        if [ "$SBX_AUTH_TEST_STATE" = expired ]; then
+          printf '{"id":"boxers-account","error":{"message":"refresh token expired"}}\n'
+        else
+          printf '{"id":"boxers-account","result":{"account":{"type":"chatgpt"}}}\n'
+        fi
+        exit 0
+      fi
+      exit 1
+      ;;
+  esac
   [ "$SBX_AUTH_TEST_STATE" = task ] && exit 0
   [ "$SBX_AUTH_TEST_STATE" = unavailable ] && { printf 'no such sandbox\n' >&2; exit 1; }
   printf 'Not logged in\n' >&2
@@ -117,7 +150,7 @@ describe("agent authentication", () => {
     const output = fakeSbx("openai");
     authenticateCodexSubscription("boxers-project-task");
     expect(readFileSync(output, "utf8")).toContain(
-      "exec boxers-project-task codex login --device-auth",
+      'exec --interactive --tty boxers-project-task env -u OPENAI_API_KEY codex -c forced_login_method="chatgpt" -c model_provider="openai" login --device-auth',
     );
   });
 
@@ -128,40 +161,89 @@ describe("agent authentication", () => {
     const args = readFileSync(output, "utf8");
     expect(args).toContain("secret set anthropic");
     expect(args).toContain(
-      "exec --interactive --tty boxers-project-task claude auth login --claudeai",
+      "exec --interactive --tty boxers-project-task env -u ANTHROPIC_API_KEY claude auth login --claudeai",
     );
   });
 
   it("provides provider-specific non-interactive remediation", () => {
     expect(remediationFor("codex")).toContain("device code");
-    expect(remediationFor("claude")).toContain("Anthropic API key");
+    expect(remediationFor("claude")).toContain("Claude subscription");
     expect(remediationFor("claude")).toContain("interactive terminal");
   });
 
-  it("distinguishes scoped credentials, task-local login, missing auth, and inspection failure", () => {
+  it("distinguishes proxy credentials, refreshed task login, expired auth, and failures", async () => {
     const runtime = new DockerSandboxesRuntime();
 
     const calls = fakeAuthenticationStatusSbx("scoped");
-    expect(runtime.agentAuthenticationStatus(task())).toMatchObject({
-      state: "configured",
-      detail: expect.stringContaining("scoped to this task"),
+    await expect(runtime.agentAuthenticationStatus(task())).resolves.toMatchObject({
+      state: "external_unverified",
+      detail: expect.stringContaining("inconclusive"),
+    });
+
+    process.env.SBX_AUTH_TEST_STATE = "external_ready";
+    await expect(runtime.agentAuthenticationStatus(task())).resolves.toMatchObject({
+      state: "ready",
+      detail: expect.stringContaining("accepted"),
+    });
+    expect(runtime.agentLaunchSpec(task(), []).args).not.toContain("OPENAI_API_KEY=");
+
+    process.env.SBX_AUTH_TEST_STATE = "external_rejected";
+    await expect(runtime.agentAuthenticationStatus(task())).resolves.toMatchObject({
+      state: "reauth_required",
+      detail: expect.stringContaining("rejected"),
     });
 
     process.env.SBX_AUTH_TEST_STATE = "task";
-    expect(runtime.agentAuthenticationStatus(task())).toMatchObject({
-      state: "configured",
-      detail: expect.stringContaining("inside this task"),
+    await expect(runtime.agentAuthenticationStatus(task())).resolves.toMatchObject({
+      state: "ready",
+      detail: expect.stringContaining("refreshed"),
+    });
+    expect(runtime.agentLaunchSpec(task(), [])).toMatchObject({
+      args: expect.arrayContaining([
+        "--env",
+        "OPENAI_API_KEY=",
+        'forced_login_method="chatgpt"',
+        'model_provider="openai"',
+      ]),
+    });
+
+    process.env.SBX_AUTH_TEST_STATE = "expired";
+    await expect(runtime.agentAuthenticationStatus(task())).resolves.toMatchObject({
+      state: "reauth_required",
+      detail: expect.stringContaining("expired"),
     });
 
     process.env.SBX_AUTH_TEST_STATE = "missing";
-    expect(runtime.agentAuthenticationStatus(task())).toMatchObject({ state: "missing" });
+    await expect(runtime.agentAuthenticationStatus(task())).resolves.toMatchObject({
+      state: "missing",
+    });
 
     process.env.SBX_AUTH_TEST_STATE = "unavailable";
-    expect(runtime.agentAuthenticationStatus(task())).toMatchObject({ state: "unknown" });
+    await expect(runtime.agentAuthenticationStatus(task())).resolves.toMatchObject({
+      state: "unknown",
+    });
 
     const commands = readFileSync(calls, "utf8");
     expect(commands).toContain("secret ls --sandbox boxers-project-task");
     expect(commands).not.toContain("secret ls --global");
+    expect(commands).toContain(
+      'env -u OPENAI_API_KEY codex -c forced_login_method="chatgpt" -c model_provider="openai" app-server',
+    );
     expect(commands).toContain("exec boxers-project-task codex login status");
+    expect(commands).toContain("boxers-auth-probe codex");
+  });
+
+  it("checks Claude subscription state without accepting the proxy sentinel", async () => {
+    const runtime = new DockerSandboxesRuntime();
+    const calls = fakeAuthenticationStatusSbx("task");
+    await expect(runtime.agentAuthenticationStatus(task("claude"))).resolves.toMatchObject({
+      state: "ready",
+    });
+    expect(readFileSync(calls, "utf8")).toContain(
+      "exec boxers-project-task env -u ANTHROPIC_API_KEY claude auth status",
+    );
+    expect(runtime.agentLaunchSpec(task("claude"), [])).toMatchObject({
+      args: expect.arrayContaining(["--env", "ANTHROPIC_API_KEY="]),
+    });
   });
 });

@@ -17,14 +17,9 @@ import { createInterface } from "node:readline/promises";
 import { writeStderr, writeStdout } from "../core/output.ts";
 import {
   authenticateAgent,
-  authenticateCodexSubscription,
-  authenticateClaudeSubscription,
-  confirmAuthentication,
   ensureTaskAuthentication,
-  hasGlobalCredential,
   isInteractive,
   isSshSession,
-  providerForAgent,
   remediationFor,
   type CodexAuthMode,
 } from "./auth.ts";
@@ -66,7 +61,6 @@ import {
 } from "./registry.ts";
 import {
   advanceTaskWorkspace,
-  assertTaskAgentCredential,
   createTaskEnvironment,
   destroyTaskEnvironment,
   findTaskRuntime,
@@ -98,6 +92,7 @@ import {
   generateCommitMessage,
   runAgentSessionDetached,
   runAgentSessionInteractive,
+  restartAgentSession,
   runRepairAgent,
 } from "./session.ts";
 import {
@@ -201,7 +196,9 @@ export function doctor(acknowledgeOpenNetwork = false, agent?: Agent): DoctorRes
     .filter((check) => check.status === "warning")
     .map((check) => check.detail);
   return {
-    ok: status.health === "healthy" && (!agent || status.authentication[agent] === "configured"),
+    ok:
+      status.health === "healthy" &&
+      (!agent || ["stored", "configured"].includes(status.authentication[agent])),
     warnings,
     checks,
   };
@@ -795,32 +792,13 @@ export async function newTask(name: string, options: NewTaskOptions): Promise<nu
   const effort = options.effort ?? config.defaults?.effort;
   const fast = options.fast ?? config.defaults?.fast;
   if (fast && agent !== "codex") throw new Error("--fast is supported only for Codex tasks.");
-  const globallyAuthenticated = hasGlobalCredential(agent);
-  let bootstrapCodexSubscription = false;
-  let bootstrapClaudeSubscription = false;
-  if (!globallyAuthenticated) {
-    if (!isInteractive())
-      throw new Error(
-        `No global ${providerForAgent(agent)} credential is configured. ${remediationFor(agent)}`,
-      );
-    if (!(await confirmAuthentication(agent)))
-      throw new Error(
-        `Authentication is required to create a ${agent} task. ${remediationFor(agent)}`,
-      );
-    if (agent === "codex") {
-      if (isSshSession()) bootstrapCodexSubscription = true;
-      else authenticateAgent("codex", { mode: "oauth" });
-    } else bootstrapClaudeSubscription = true;
-  }
   const template = resolveTemplate(agent, options.template);
   let task = createTaskManifest(project, name, agent, template, model, effort, fast);
   let previewUrls: string[] = [];
   let previewFailure: string | undefined;
   try {
     createTaskEnvironment(task, project.seedPath);
-    if (bootstrapCodexSubscription) authenticateCodexSubscription(task);
-    if (bootstrapClaudeSubscription) authenticateClaudeSubscription(task);
-    assertTaskAgentCredential(task);
+    await ensureTaskAuthentication(task);
     task = updateTask(
       project,
       task,
@@ -1204,7 +1182,11 @@ export async function attach(
     throw new Error("--fast is supported only for Codex tasks.");
   const configured = updateTaskSessionSettings(project, task, settings);
   const updated = rotateTaskLifecycleBridgeToken(project, configured);
-  await ensureTaskAuthentication(updated);
+  const authentication = await ensureTaskAuthentication(updated);
+  if (authentication.reauthenticated && updated.sessionStartedAt) {
+    note("Restarting the agent process with the refreshed task authentication...");
+    await restartAgentSession(updated);
+  }
   note("Connecting to the agent session...");
   const status = await runAgentSessionInteractive(updated, {
     resume: Boolean(updated.sessionStartedAt),

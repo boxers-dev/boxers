@@ -878,12 +878,19 @@ export function runDaemon(
         }
         case "stop": {
           const session = sessions.get(message.sessionId);
-          if (!session) return;
-          debug(
-            `Stopping agent session on sandbox ${debugValue(session.taskName ?? message.sessionId)}.`,
-          );
-          session.proc.kill();
-          sessions.delete(message.sessionId);
+          if (session) {
+            debug(
+              `Stopping agent session on sandbox ${debugValue(session.taskName ?? message.sessionId)}.`,
+            );
+            session.proc.kill();
+            sessions.delete(message.sessionId);
+          }
+          if (message.requestId)
+            send(socket, {
+              type: "session_stopped",
+              requestId: message.requestId,
+              sessionId: message.sessionId,
+            });
           return;
         }
       }

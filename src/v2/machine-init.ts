@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir, platform } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { isInteractive, isSshSession, authenticateAgent } from "./auth.ts";
+import { isInteractive } from "./auth.ts";
 import { daemonStart } from "./daemon-commands.ts";
 import { collectHostStatus } from "./host-status.ts";
 import { markMachineSetupComplete } from "./machine-setup.ts";
@@ -186,20 +186,6 @@ export async function initializeMachine(): Promise<number> {
       process.stdout.write(
         "Open network access acknowledged. Future doctor runs require `--acknowledge-open-network`.\n",
       );
-    }
-
-    for (const agent of ["codex", "claude"] as const) {
-      if (status.authentication[agent] === "configured") continue;
-      const label = agent === "codex" ? "Codex" : "Claude";
-      if (
-        !accepted(await readline.question(`Authenticate ${label} for future tasks? [y/N]: `), false)
-      )
-        continue;
-      authenticateAgent(
-        agent,
-        agent === "codex" ? { mode: isSshSession() ? "api-key" : "oauth" } : {},
-      );
-      status = collectHostStatus();
     }
 
     let service = daemonServiceStatus();

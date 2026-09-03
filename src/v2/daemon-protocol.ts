@@ -37,6 +37,7 @@ export interface DetachMessage {
 export interface StopMessage {
   type: "stop";
   sessionId: string;
+  requestId?: string;
 }
 export interface ListRequest {
   type: "list";
@@ -50,7 +51,7 @@ export interface PrepareShutdownRequest {
   expectedBuildId?: string;
 }
 
-export const DAEMON_PROTOCOL_VERSION = 6;
+export const DAEMON_PROTOCOL_VERSION = 7;
 
 export interface HelloRequest {
   type: "hello";
@@ -131,6 +132,11 @@ export interface ExitedMessage {
 }
 export interface SessionStartedMessage {
   type: "session_started";
+  requestId: string;
+  sessionId: string;
+}
+export interface SessionStoppedMessage {
+  type: "session_stopped";
   requestId: string;
   sessionId: string;
 }
@@ -216,6 +222,7 @@ export type ServerMessage =
   | OutputMessage
   | ExitedMessage
   | SessionStartedMessage
+  | SessionStoppedMessage
   | SessionsMessage
   | ShutdownStartedMessage
   | ShutdownBlockedMessage
@@ -269,6 +276,7 @@ const SERVER_MESSAGE_TYPES = new Set([
   "output",
   "exited",
   "session_started",
+  "session_stopped",
   "sessions",
   "shutdown_started",
   "shutdown_blocked",

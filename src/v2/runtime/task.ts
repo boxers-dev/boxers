@@ -170,6 +170,6 @@ export function publishTaskPorts(task: TaskManifest, ports: readonly number[]): 
   return runtimeForTask(task).publishPorts(task, ports);
 }
 
-export function assertTaskAgentCredential(task: TaskManifest): void {
-  runtimeForTask(task).assertAgentCredential(task);
+export async function assertTaskAgentCredential(task: TaskManifest): Promise<void> {
+  await runtimeForTask(task).assertAgentCredential(task);
 }

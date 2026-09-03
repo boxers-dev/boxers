@@ -348,6 +348,39 @@ export function notifyDaemonSetupCompleted(taskName: string): void {
   socket.once("error", () => socket.destroy());
 }
 
+/** Dispose a daemon-owned provider PTY so the next attach launches it again. */
+export async function stopDaemonSession(sessionId: string): Promise<void> {
+  const socket = await readyDaemonSocket();
+  const requestId = randomUUID();
+  const decoder = new LineDecoder();
+  socket.setEncoding("utf8");
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(
+      () => finish(new Error("Timed out restarting the daemon-owned agent session.")),
+      5_000,
+    );
+    socket.on("data", (text: string) => {
+      for (const line of decoder.push(text)) {
+        const message = parseServerMessage(line);
+        if (message?.type === "session_stopped" && message.requestId === requestId) finish();
+        else if (message?.type === "error" && message.requestId === requestId)
+          finish(new Error(message.message));
+      }
+    });
+    socket.once("error", finish);
+    socket.write(encodeMessage({ type: "stop", requestId, sessionId }));
+  });
+}
+
 export async function subscribeDaemonChanges(
   onReady: (cursor: { epoch: string; revision: number }) => void,
   onChanged: (cursor: { epoch: string; revision: number }) => void,

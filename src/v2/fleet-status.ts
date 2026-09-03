@@ -171,7 +171,7 @@ export async function showAuthenticationStatus(options: {
   if (options.json) process.stdout.write(`${JSON.stringify({ hosts: result })}\n`);
   else {
     process.stdout.write(
-      "Host credentials for new tasks (task-local subscription login is checked when creating or attaching):\n",
+      "Stored host credentials for new tasks (presence only; provider validity is checked per task):\n",
     );
     const rows = [["HOST", "CONNECTION", "OBSERVED", "CODEX", "CLAUDE"]];
     for (const view of result)
@@ -188,14 +188,14 @@ export async function showAuthenticationStatus(options: {
       if (view.authentication.codex === "missing")
         process.stdout.write(
           reference
-            ? `  ${view.name}: create or attach to a Codex task for ChatGPT device login, or run \`boxers auth codex --host ${JSON.stringify(reference)} --api-key\`.\n`
-            : "  local: run `boxers auth codex`, or create/attach to a Codex task for ChatGPT subscription login.\n",
+            ? `  ${view.name}: create or attach to a Codex task there for ChatGPT device login.\n`
+            : "  local: create or attach to a Codex task for ChatGPT device login.\n",
         );
       if (view.authentication.claude === "missing")
         process.stdout.write(
           reference
-            ? `  ${view.name}: create or attach to a Claude task for subscription login, or run \`boxers auth claude --host ${JSON.stringify(reference)}\`.\n`
-            : "  local: run `boxers auth claude`, or create/attach to a Claude task for subscription login.\n",
+            ? `  ${view.name}: create or attach to a Claude task there for subscription login.\n`
+            : "  local: create or attach to a Claude task for subscription login.\n",
         );
     }
   }

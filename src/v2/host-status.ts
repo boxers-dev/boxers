@@ -92,7 +92,7 @@ function authenticationStatus(
 ): AuthenticationStatus {
   const check = checks.find((candidate) => candidate.id === `runtime.credential.${agent}`);
   if (!check || check.status === "unknown" || check.status === "warning") return "unknown";
-  return check.status === "ok" ? "configured" : "missing";
+  return check.status === "ok" ? "stored" : "missing";
 }
 
 export function collectHostStatus(
@@ -182,8 +182,8 @@ export function isHostStatusObservation(value: unknown): value is HostStatusObse
     ["running", "stopped", "unknown"].includes(String(status.daemon)) &&
     Boolean(
       status.authentication &&
-      ["configured", "missing", "unknown"].includes(status.authentication.codex) &&
-      ["configured", "missing", "unknown"].includes(status.authentication.claude),
+      ["stored", "configured", "missing", "unknown"].includes(status.authentication.codex) &&
+      ["stored", "configured", "missing", "unknown"].includes(status.authentication.claude),
     ) &&
     Array.isArray(status.checks) &&
     status.checks.every(

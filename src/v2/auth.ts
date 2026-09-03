@@ -3,6 +3,7 @@ import type { Agent, TaskManifest } from "./types.ts";
 import { defaultRuntime, runtimeForTask } from "./runtime/registry.ts";
 import { taskRuntimeId } from "./runtime/task.ts";
 import { harnessForAgent } from "./providers/registry.ts";
+import type { RuntimeAuthenticationStatus } from "./runtime/types.ts";
 
 export type Provider = "openai" | "anthropic";
 export type CodexAuthMode = "oauth" | "api-key";
@@ -52,17 +53,28 @@ export function isSshSession(): boolean {
 
 export function remediationFor(agent: Agent): string {
   return agent === "codex"
-    ? 'Run "boxers auth codex" locally, or create a Codex task interactively over SSH to sign in with a device code.'
-    : 'Run "boxers auth claude" to store an Anthropic API key, or create a task with "boxers <task> new" in an interactive terminal to sign in with a Claude subscription.';
+    ? 'Create or attach to the Codex task from an interactive terminal to sign in with a device code.'
+    : 'Create or attach to the Claude task from an interactive terminal to sign in with your Claude subscription.';
 }
 
-export async function confirmAuthentication(agent: Agent): Promise<boolean> {
+export async function confirmAuthentication(
+  agent: Agent,
+  status?: RuntimeAuthenticationStatus,
+): Promise<boolean> {
+  const needsRenewal = status?.state === "reauth_required";
+  const external = status?.state === "external_unverified";
   const description =
     agent === "codex"
-      ? isSshSession()
-        ? "Codex needs authentication. Sign in with your ChatGPT subscription using a device code now?"
-        : "Codex needs an OpenAI credential in the task runtime. Authenticate with ChatGPT now?"
-      : "Claude needs authentication. Sign in with your Claude subscription now?";
+      ? needsRenewal
+        ? "The task's ChatGPT session could not be refreshed. Sign in again with a device code now?"
+        : external
+          ? "An OpenAI proxy credential is stored but cannot be verified. Sign in to this task with ChatGPT now?"
+          : "Codex needs authentication. Sign in to this task with ChatGPT using a device code now?"
+      : needsRenewal
+        ? "The task's Claude session is no longer valid. Sign in again now?"
+        : external
+          ? "An Anthropic proxy credential is stored but cannot be verified. Sign in to this task with Claude now?"
+          : "Claude needs authentication. Sign in to this task with your Claude subscription now?";
   const readline = createInterface({ input: process.stdin, output: process.stdout });
   try {
     const answer = (await readline.question(`${description} [Y/n] `)).trim().toLowerCase();
@@ -107,10 +119,17 @@ export function authenticateClaudeSubscription(task: TaskManifest | string): voi
   runtime.authenticateSubscription(typeof task === "string" ? task : taskRuntimeId(task), "claude");
 }
 
-export async function ensureTaskAuthentication(task: TaskManifest): Promise<void> {
+export interface TaskAuthenticationResult {
+  reauthenticated: boolean;
+  status: RuntimeAuthenticationStatus;
+}
+
+export async function ensureTaskAuthentication(task: TaskManifest): Promise<TaskAuthenticationResult> {
   const runtime = runtimeForTask(task);
-  const before = runtime.agentAuthenticationStatus(task);
-  if (before.state === "configured") return;
+  const before = await runtime.agentAuthenticationStatus(task);
+  if (before.state === "ready") return { reauthenticated: false, status: before };
+  if (before.state === "external_unverified")
+    return { reauthenticated: false, status: before };
   if (before.state === "unknown")
     throw new Error(
       `Could not verify ${task.agent} authentication for task ${task.name}: ${before.detail}`,
@@ -119,16 +138,18 @@ export async function ensureTaskAuthentication(task: TaskManifest): Promise<void
     throw new Error(
       `${task.agent} authentication is required for task ${task.name}. Attach from an interactive terminal to sign in.`,
     );
-  if (!(await confirmAuthentication(task.agent)))
+  if (!(await confirmAuthentication(task.agent, before))) {
     throw new Error(`${task.agent} authentication is required for task ${task.name}.`);
+  }
   if (task.agent === "codex") authenticateCodexSubscription(task);
   else authenticateClaudeSubscription(task);
-  const after = runtime.agentAuthenticationStatus(task);
-  if (after.state !== "configured")
+  const after = await runtime.agentAuthenticationStatus(task);
+  if (after.state !== "ready")
     throw new Error(
       after.state === "unknown"
         ? `Could not verify ${task.agent} authentication after sign-in: ${after.detail}`
         : `${task.agent} did not report an authenticated session after sign-in.`,
     );
   process.stdout.write(`${task.agent} authentication is ready for task ${task.name}.\n`);
+  return { reauthenticated: true, status: after };
 }

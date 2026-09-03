@@ -1,5 +1,10 @@
 import { resetTerminalInputModes } from "../core/ansi.ts";
-import { attachInteractive, ensureDaemonReady, startViewerlessSession } from "./daemon-client.ts";
+import {
+  attachInteractive,
+  ensureDaemonReady,
+  startViewerlessSession,
+  stopDaemonSession,
+} from "./daemon-client.ts";
 import type { Agent, TaskManifest } from "./types.ts";
 import { runtimeForTask } from "./runtime/registry.ts";
 import { taskRuntimeId } from "./runtime/task.ts";
@@ -104,6 +109,10 @@ function buildRunSpec(task: TaskManifest, options: AgentSessionOptions) {
 }
 
 export { ensureDaemonReady };
+
+export async function restartAgentSession(task: TaskManifest): Promise<void> {
+  await stopDaemonSession(taskRuntimeId(task));
+}
 
 /**
  * Same launch as `runAgentSession`, but the pty lives in the boxers

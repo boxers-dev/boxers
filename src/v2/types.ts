@@ -374,7 +374,8 @@ export interface RemoteProjectSnapshot {
 
 export type HostCheckStatus = "ok" | "warning" | "failed" | "unknown";
 export type HostHealth = "healthy" | "degraded" | "unhealthy" | "unknown";
-export type AuthenticationStatus = "configured" | "missing" | "unknown";
+/** `configured` is retained only for reading pre-reauth-flow host snapshots. */
+export type AuthenticationStatus = "stored" | "configured" | "missing" | "unknown";
 
 export interface HostStatusCheck {
   id: string;
