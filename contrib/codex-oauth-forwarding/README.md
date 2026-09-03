@@ -1,9 +1,9 @@
 # Codex OAuth access-token forwarding PoC
 
-Status: **source-validated prototype, live Sandbox model call still required**.
-The development runner has Docker but no `/dev/kvm` and did not have `sbx`
-installed, so it cannot run the final VM-backed probe. The v0.39.0 release
-binary was downloaded to a temporary directory and its CLI flags were checked.
+Status: **revised after the first remote probe; the custom-mixin model call still
+requires validation**. The development runner has Docker but no `/dev/kvm`, so
+it cannot run the VM-backed probe. The v0.39.0 release binary and its embedded
+Codex kit were inspected and the replacement mixin validates with that CLI.
 
 This experiment deliberately does not copy `auth.json`, an OAuth refresh token,
 or any other durable Codex credential to the remote host.
@@ -23,32 +23,40 @@ supplies an `OPENAI_API_KEY` sentinel, and ordinary API-key mode selects
 Platform API key, so sending it there is the wrong authentication mode and
 endpoint.
 
-The proxy half is capable of the desired forwarding. Docker's built-in
-`openai` service covers `api.openai.com`, `openai.com`, `chatgpt.com`, and
-`www.chatgpt.com`. Its bearer injection is opaque: the kit's `bearer` scheme
-expands to `Authorization: Bearer %s`; Docker does not need to parse the value as
-an API key or OAuth token.
+The first remote probe confirmed the failure mode. Codex attempted
+`wss://api.openai.com/v1/responses`, fell back to HTTPS, and OpenAI returned 401
+for the literal `proxy-managed` API key. This proves Codex was still in Platform
+API-key mode and that the intended ChatGPT route was not active.
 
-Current Codex also has the missing client-side concept:
-`chatgptAuthTokens`, intended for a host application that owns token refresh.
-It selects `https://chatgpt.com/backend-api/codex`, sends the access token as a
-Bearer token, sends `ChatGPT-Account-ID`, and does not require a refresh token.
-The PoC writes a minimal auth scaffold containing only:
+Docker's built-in service table lists `chatgpt.com`, but the v0.39.0 Codex kit's
+`apiKey.inject` rules cover only `api.openai.com` and `openai.com`. Its separate
+OAuth branch configures the ChatGPT route. A value supplied with `--command` is
+the API-key branch, so the built-in kit cannot use it as a ChatGPT bearer merely
+because the value happens to be an OAuth access token.
 
-- `auth_mode: "chatgptAuthTokens"`;
-- Docker's sandbox-visible OpenAI placeholder as `access_token`;
-- the non-secret ChatGPT account/workspace ID;
-- an empty refresh token and a synthetic metadata-only ID token.
+Bearer injection itself remains opaque: a custom kit's `scheme: bearer` expands
+to `Authorization: Bearer <resolved-value>` without parsing the value as an API
+key or OAuth token. The revised PoC therefore declares a narrowly scoped custom
+service, `codex-chatgpt`, whose only injection target is `chatgpt.com`.
 
-The real access token still stays in the remote host's Docker credential proxy.
-The scaffold is a compatibility shim, not a durable credential. OpenAI's
-documented external-token contract is the app-server protocol, where a host app
-supplies tokens in memory and answers refresh requests after a 401; direct
-construction of this file representation is not a supported public interface.
+Current Codex also has `chatgptAuthTokens`, but OpenAI documents it as an
+app-server protocol where a live host application owns refresh. Constructing its
+internal ephemeral storage file was both unsupported and ineffective with the
+Docker kit lifecycle, so the revised PoC no longer does that.
+
+Instead, Codex receives an explicit model provider with:
+
+- `base_url = "https://chatgpt.com/backend-api/codex"`;
+- `experimental_bearer_token = "proxy-managed"`;
+- `requires_openai_auth = false`;
+- the non-secret `ChatGPT-Account-Id` header.
+
+The custom mixin teaches Docker to replace that sentinel only for
+`chatgpt.com`. There is no sandbox `auth.json`, access token, or refresh token.
 
 ## Current implementation evidence
 
-Checked on 2026-09-02:
+Checked on 2026-09-03:
 
 - [Docker credential documentation](https://docs.docker.com/ai/sandboxes/configuration/credentials/): host-side dynamic command resolution, 55-minute default cache, `on-demand`, placeholder behavior, and the built-in service domain table.
 - [Docker Codex agent documentation](https://docs.docker.com/ai/sandboxes/agents/codex/): `sbx run codex` host preflight plus the supported Docker-managed `--oauth` and API-key modes.
@@ -70,9 +78,9 @@ The Codex source inspection used OpenAI commit
 Those files establish that API-key auth selects `api.openai.com`, ChatGPT auth
 selects `chatgpt.com/backend-api/codex`, model requests attach both Bearer and
 account headers, and an externally managed token does not need a refresh token.
-The access token is treated as a JWT for expiry and metadata in managed flows;
-the PoC avoids asking Codex to parse Docker's placeholder by putting a valid,
-non-secret synthetic JWT in the `id_token` field.
+The access token is treated as a JWT for expiry and metadata in managed flows.
+The revised provider path does not ask Codex to parse Docker's placeholder as a
+JWT; it uses the placeholder only as an opaque provider bearer token.
 
 `CODEX_ACCESS_TOKEN` is not a general ChatGPT OAuth-token override in current
 Codex. `codex login --with-access-token` classifies `at-...` values as Codex
@@ -154,8 +162,9 @@ ssh -T codex-token-source >/dev/null
 
 ## Remote setup and launch
 
-Install `codex-sbx-remote` on the remote host and the `codex-sbx` wrapper beside
-the laptop helper. Then:
+Install `codex-sbx-remote` and the `codex-chatgpt-token-kit` directory together
+on the remote host. Install the `codex-sbx` wrapper beside the laptop helper.
+Then:
 
 ```bash
 codex-sbx my-remote-host /absolute/remote/project
@@ -165,32 +174,35 @@ The wrapper sends only the account ID to the remote. The remote launcher:
 
 1. verifies `sbx`, Node, the project, and identifiers;
 2. creates a named Codex sandbox if needed;
-3. registers a sandbox-scoped dynamic OpenAI credential with a 45-minute cache;
-4. writes the placeholder-only `chatgptAuthTokens` scaffold;
-5. attaches with `sbx run codex --name ...`.
+3. adds the Codex-specific credential mixin if it is not already installed;
+4. registers a sandbox-scoped `codex-chatgpt` dynamic credential with a
+   45-minute cache;
+5. writes a ChatGPT backend provider containing only a sentinel and account ID;
+6. removes the obsolete `auth.json` shim and attaches to Codex.
 
 The exact credential registration is:
 
 ```bash
-sbx secret set openai --sandbox "$name" \
+sbx secret set codex-chatgpt --sandbox "$name" \
   --command 'ssh -T -o BatchMode=yes -o ClearAllForwardings=yes codex-token-source' \
   --refresh 45m
 ```
 
-Using sandbox scope avoids replacing an unrelated global OpenAI credential and
-takes effect on an already-created sandbox immediately.
+Using a dedicated service and sandbox scope avoids replacing an unrelated
+global OpenAI credential or granting the token to other sandboxes.
 
 ## Live probe and diagnostics
 
 Run these checks on a v0.39.0-capable host with KVM. Never add `-D`, shell
 tracing, or `--show-error` while a real token may be resolved.
 
-1. `sbx secret set` must complete. Failure here means SSH, forced-command,
-   helper, or Docker source verification failed.
-2. The scaffold step must find `OPENAI_API_KEY`; otherwise the kit did not expose
-   the proxy sentinel for the scoped secret.
-3. `sbx exec NAME codex login status` should report ChatGPT login. If it reports
-   API-key login, the scaffold was not loaded.
+1. `sbx kit add` and `sbx secret set` must complete. Failure here means mixin
+   installation, SSH, forced-command, helper, or Docker source verification
+   failed.
+2. The provider step must find `CODEX_CHATGPT_ACCESS_TOKEN=proxy-managed`;
+   otherwise the custom credential policy was not applied.
+3. `auth.json` should be absent. `codex login status` may report no login because
+   this provider deliberately uses `requires_openai_auth = false`.
 4. In Codex, make one minimal prompt such as `Reply with exactly OK.` A request
    to `api.openai.com` means Codex selected API-key mode. A request to
    `chatgpt.com/backend-api/codex` with 401 means the OAuth bearer was rejected
@@ -199,9 +211,10 @@ tracing, or `--show-error` while a real token may be resolved.
 5. Inspect only status codes, destinations, and Docker policy logs. Do not enable
    HTTP header/body logging.
 
-This runner could validate steps 1-5 only through source, docs, v0.39.0 CLI
-help, and synthetic helper tests. The final model request is intentionally not
-reported as successful until it is run on a real Sandbox host.
+The original probe reached `api.openai.com` and failed exactly as described
+above. The revised mixin and launcher are source/CLI validated, but the final
+custom-provider model request is intentionally not reported as successful until
+it is rerun on the remote Sandbox host.
 
 ## Lifetime and disconnect behavior
 
@@ -216,9 +229,9 @@ If the laptop disconnects, Docker can keep using the already cached access
 token. At the next cache miss it cannot run SSH. Current public documentation
 does not specify whether a failed refresh retains an old cache entry, so the
 safe operational assumption is that credential injection fails. In either
-case, once the cached token's JWT expiry passes, ChatGPT returns 401 and Codex
-cannot refresh it: the sandbox scaffold has an empty refresh token. This is the
-desired fail-closed behavior.
+case, once the cached token's JWT expiry passes, ChatGPT returns 401. Codex has
+no refresh token or refresh endpoint inside the sandbox, so this is the desired
+fail-closed behavior.
 
 ## Security boundaries
 
@@ -226,7 +239,7 @@ desired fail-closed behavior.
 | -------------------------------------- | ------- | -------------------------------------------------------- | -------------------------------- |
 | OAuth refresh token / full `auth.json` | Yes     | Never                                                    | Never                            |
 | Short-lived OAuth access token         | Yes     | Temporarily in SSH receiver and Docker proxy/cache       | Never in normal operation        |
-| Docker proxy placeholder               | No need | Docker manages it                                        | Yes, env plus minimal scaffold   |
+| Docker proxy placeholder               | No need | Docker manages it                                        | Yes, env plus provider config    |
 | ChatGPT account/workspace ID           | Yes     | Yes                                                      | Yes                              |
 | Ability to consume Codex entitlement   | Yes     | Yes while forced SSH capability works or token is cached | Yes through allowed proxy routes |
 
@@ -234,11 +247,11 @@ The remote host can invoke the forced command repeatedly and can use the token
 outside Docker while it is valid; SSH restriction cannot prevent that. It does
 prevent arbitrary laptop shell access and disclosure of the refresh token. A
 malicious sandbox cannot read the real bearer, but while authorized it can ask
-the Docker proxy to make arbitrary requests to the built-in OpenAI service
-domains. Network policy and sandbox scope remain important.
+the Docker proxy to make arbitrary requests to `chatgpt.com` using the custom
+credential. Network policy and sandbox scope remain important.
 
 Basic model inference should need only the valid access token plus correct
-account ID. Features relying on email, plan metadata, ChatGPT user ID, managed
-Agent Identity registration, connectors/apps, cloud tasks, or their own OAuth
-flows may be unavailable or behave differently because the scaffold
-intentionally omits that state. This PoC is scoped to core Codex model traffic.
+account ID. Features relying on Codex login state, email, plan metadata, ChatGPT
+user ID, managed Agent Identity registration, connectors/apps, cloud tasks, or
+their own OAuth flows may be unavailable because the provider deliberately has
+no local login state. This PoC is scoped to core Codex model traffic.

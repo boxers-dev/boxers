@@ -18,6 +18,10 @@ command -v node >/dev/null || { echo "codex-sbx-remote: node is not installed" >
 [[ $account_id =~ ^[A-Za-z0-9_-]+$ ]] || { echo "codex-sbx-remote: invalid ChatGPT account ID" >&2; exit 1; }
 [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9.-]+$ ]] || { echo "codex-sbx-remote: invalid sandbox name" >&2; exit 1; }
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+kit_dir="$script_dir/codex-chatgpt-token-kit"
+[[ -f $kit_dir/spec.yaml ]] || { echo "codex-sbx-remote: credential mixin is missing" >&2; exit 1; }
+
 if ! sbx ls --json | node -e '
 let input = "";
 process.stdin.on("data", (chunk) => input += chunk);
@@ -30,36 +34,45 @@ process.stdin.on("end", () => {
   sbx create --clone --name "$name" codex "$project"
 fi
 
-# The command is fixed host configuration. The dedicated SSH identity is restricted
-# by the laptop's authorized_keys entry to the token helper only.
-sbx secret set openai \
+# Adding the mixin recreates the container and installs the Codex-specific proxy
+# policy. Do this before binding the custom service name.
+if ! sbx exec -u agent "$name" test -f /home/agent/.codex/codex-chatgpt-command-token-kit; then
+  sbx kit add "$name" "$kit_dir"
+fi
+
+# Use a dedicated service so the generic API-key credential is injected only at
+# the ChatGPT Codex backend, never at api.openai.com. The command is fixed host
+# configuration and its SSH identity is restricted to the token helper.
+sbx secret set codex-chatgpt \
   --sandbox "$name" \
   --command 'ssh -T -o BatchMode=yes -o ClearAllForwardings=yes codex-token-source' \
   --refresh 45m
 
-# Build Codex's externally-managed ChatGPT auth shape using only Docker's
-# sandbox-visible sentinel and a non-secret account ID. No real token crosses stdin.
-sbx exec "$name" node -e '
+# Select the ChatGPT Codex backend without asking Codex to interpret an API-key
+# placeholder as login state. Only the proxy sentinel and account ID enter the VM.
+sbx exec -u agent "$name" node -e '
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
-const placeholder = process.env.OPENAI_API_KEY;
-if (!placeholder) throw new Error("Docker did not expose the OpenAI proxy placeholder");
-const dir = path.join(os.homedir(), ".codex");
+const dir = process.env.CODEX_HOME || "/home/agent/.codex";
+if (process.env.CODEX_CHATGPT_ACCESS_TOKEN !== "proxy-managed")
+  throw new Error("Docker did not expose the Codex ChatGPT proxy placeholder");
 fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-const auth = {
-  auth_mode: "chatgptAuthTokens",
-  OPENAI_API_KEY: null,
-  tokens: {
-    id_token: "e30.e30.e30",
-    access_token: placeholder,
-    refresh_token: "",
-    account_id: process.argv[1]
-  },
-  last_refresh: new Date().toISOString()
-};
-fs.writeFileSync(path.join(dir, "auth.json"), `${JSON.stringify(auth, null, 2)}\n`, { mode: 0o600 });
+const accountId = JSON.stringify(process.argv[1]);
+const config = `approval_policy = "never"
+sandbox_mode = "danger-full-access"
+mcp_oauth_credentials_store = "file"
+model_provider = "codex_oauth_forwarding"
+
+[model_providers.codex_oauth_forwarding]
+name = "Docker proxy forwarded ChatGPT OAuth"
+base_url = "https://chatgpt.com/backend-api/codex"
+experimental_bearer_token = "proxy-managed"
+requires_openai_auth = false
+http_headers = { "ChatGPT-Account-Id" = ${accountId} }
+`;
+fs.writeFileSync(path.join(dir, "config.toml"), config, { mode: 0o600 });
+fs.rmSync(path.join(dir, "auth.json"), { force: true });
 ' "$account_id"
 
-echo "Starting $name. The sandbox auth file contains only Docker's placeholder." >&2
+echo "Starting $name. The access token remains in Docker's credential proxy." >&2
 exec sbx run codex --name "$name"

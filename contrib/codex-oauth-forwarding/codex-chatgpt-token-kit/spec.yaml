@@ -1,0 +1,23 @@
+schemaVersion: "2"
+kind: mixin
+name: codex-chatgpt-command-token
+version: 0.1.0
+displayName: Codex ChatGPT command token
+description: Route a command-backed short-lived ChatGPT token through the Sandbox proxy.
+requires:
+  agent: codex
+
+credentials:
+  - service: codex-chatgpt
+    apiKey:
+      name: CODEX_CHATGPT_ACCESS_TOKEN
+      proxyManaged: true
+      inject:
+        - domain: chatgpt.com
+          scheme: bearer
+
+setup:
+  install:
+    - command: touch /home/agent/.codex/codex-chatgpt-command-token-kit
+      user: agent
+      description: Mark the Codex ChatGPT command-token mixin as installed
