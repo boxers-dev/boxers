@@ -24,6 +24,22 @@ export interface PeerCacheWriteResult {
   changed: boolean;
 }
 
+/** Fleet membership is authoritative for a peer's routed and displayed name. */
+function withFleetPeerName(peer: FleetPeerIdentity, view: MachineView): MachineView {
+  return {
+    ...view,
+    name: peer.name,
+    ...(view.snapshot
+      ? {
+          snapshot: {
+            ...view.snapshot,
+            machine: { ...view.snapshot.machine, name: peer.name },
+          },
+        }
+      : {}),
+  };
+}
+
 function comparablePeerView(view: MachineView): unknown {
   if (!view.snapshot) return view;
   const { servedAt: _servedAt, observedAt, ...snapshot } = view.snapshot;
@@ -55,14 +71,15 @@ export function readCachedPeerView(peer: FleetPeerIdentity): MachineView {
     const cached = readJson<CachedPeerView>(path);
     if (cached.version !== 1 || cached.view.id !== peer.id) throw new Error("invalid cache");
     if (cached.view.snapshot) parseRemoteSnapshot(JSON.stringify(cached.view.snapshot));
+    const view = withFleetPeerName(peer, cached.view);
     const age = Date.now() - Date.parse(cached.updatedAt);
-    if (cached.view.connection === "online" && (!Number.isFinite(age) || age > PEER_FRESHNESS_MS))
+    if (view.connection === "online" && (!Number.isFinite(age) || age > PEER_FRESHNESS_MS))
       return {
-        ...cached.view,
+        ...view,
         connection: "stale",
         detail: `Peer observer heartbeat is stale; last contact ${humanTimestamp(cached.updatedAt)}`,
       };
-    return cached.view;
+    return view;
   } catch (error) {
     const detail =
       error instanceof Error ? error.message : "The cached peer projection is invalid.";
@@ -89,6 +106,7 @@ export function writeCachedPeerView(
   next: MachineView,
 ): PeerCacheWriteResult {
   const previous = readCachedPeerView(peer);
+  next = withFleetPeerName(peer, next);
   let newestSnapshot =
     next.snapshot &&
     previous.snapshot &&

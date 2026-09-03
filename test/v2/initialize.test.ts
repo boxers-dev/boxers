@@ -121,7 +121,7 @@ describe("boxers project init", () => {
 
     await expect(
       cloneAndInitializeProject("git@example.invalid:owner/repo.git", "main", destination),
-    ).rejects.toThrow(/on .*@.* with that account's non-interactive Git credentials/);
+    ).rejects.toThrow(/on .* as account .* with that account's non-interactive Git credentials/);
 
     expect(stdout.mock.calls.flat().join("")).toContain(
       "Repository credentials and SSH keys are read on that machine",

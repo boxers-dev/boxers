@@ -303,6 +303,7 @@ export function updateLocalFleetMember(member: FleetMember): FleetManifest {
     member.ssh?.publicKey !== ssh.publicKey
   )
     throw new Error("Local fleet member identity does not match this host.");
+  renameLocalMachine(member.name);
   return mergeFleet(fleet, [member], [], false);
 }
 

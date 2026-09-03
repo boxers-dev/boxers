@@ -79,6 +79,39 @@ describe("peer projection cache", () => {
     });
   });
 
+  it("uses the fleet name instead of a stale name stored in the peer cache", () => {
+    const home = mkdtempSync(join(tmpdir(), "boxers-peer-cache-rename-"));
+    cleanup.push(home);
+    process.env.BOXERS_HOME = home;
+    const snapshot: RemoteSnapshot = {
+      protocolVersion: 3,
+      machine: {
+        version: 1,
+        id: "peer-id",
+        name: "old-name",
+        createdAt: "2026-08-26T00:00:00.000Z",
+        boxersVersion: "1.2.3",
+      },
+      observedAt: new Date().toISOString(),
+      tasks: [],
+    };
+    atomicWriteJson(peerCachePath("peer-id"), {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      view: {
+        id: "peer-id",
+        name: "old-name",
+        connection: "online",
+        snapshot,
+      },
+    });
+
+    const view = readCachedPeerView({ id: "peer-id", name: "home-linux-server" });
+
+    expect(view.name).toBe("home-linux-server");
+    expect(view.snapshot?.machine.name).toBe("home-linux-server");
+  });
+
   it("does not let a late older refresh roll back the recorded projection", () => {
     const home = mkdtempSync(join(tmpdir(), "boxers-peer-cache-order-"));
     cleanup.push(home);

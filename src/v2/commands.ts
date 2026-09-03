@@ -1027,12 +1027,12 @@ export async function cloneAndInitializeProject(
     writeStdout(`Reusing existing checkout at ${destination}.\n`);
   } else {
     const remoteSession = isSshSession();
-    const remoteAccount = remoteSession
-      ? `${userInfo().username}@${localMachineIdentity().name}`
+    const remoteIdentity = remoteSession
+      ? { account: userInfo().username, machine: localMachineIdentity().name }
       : undefined;
-    if (remoteAccount)
+    if (remoteIdentity)
       writeStdout(
-        `Preparing the Git checkout on ${remoteAccount}. Repository credentials and SSH keys are read on that machine; Boxers does not forward personal keys from the machine where this command was started.\n`,
+        `Preparing the Git checkout on ${remoteIdentity.machine} as account ${remoteIdentity.account}. Repository credentials and SSH keys are read on that machine; Boxers does not forward personal keys from the machine where this command was started.\n`,
       );
     const clone = command("git", ["clone", "--branch", base, "--", source, destination], {
       stdio: "inherit",
@@ -1044,9 +1044,9 @@ export async function cloneAndInitializeProject(
           }
         : process.env,
     });
-    if (clone.status !== 0 && remoteAccount)
+    if (clone.status !== 0 && remoteIdentity)
       throw new Error(
-        `Could not clone the project on ${remoteAccount} with that account's non-interactive Git credentials. Connect to that machine and verify \`git ls-remote <clone-url>\` with the project's configured clone URL. For an SSH remote, its key must be usable there without a passphrase prompt (for example through an SSH agent available to non-interactive sessions).`,
+        `Could not clone the project on ${remoteIdentity.machine} as account ${remoteIdentity.account} with that account's non-interactive Git credentials. Connect to that machine and verify \`git ls-remote <clone-url>\` with the project's configured clone URL. For an SSH remote, its key must be usable there without a passphrase prompt (for example through an SSH agent available to non-interactive sessions).`,
       );
     requireSuccess(clone, `Could not clone ${source}`);
   }

@@ -357,6 +357,7 @@ describe("fleet identity and administration", () => {
       ["observe", "operate"],
       "2028-01-01T00:00:00.000Z",
     );
+    refreshedReceiver.name = "receiver-alias";
     acceptEnrollment(
       encodeEnrollment({
         fleetId: fleet.fleetId,
@@ -367,5 +368,6 @@ describe("fleet identity and administration", () => {
     expect(
       readFleet()?.members.find((member) => member.hostId === refreshedReceiver.hostId),
     ).toEqual(refreshedReceiver);
+    expect(localMachineIdentity().name).toBe("receiver-alias");
   });
 });
