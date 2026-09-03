@@ -306,6 +306,20 @@ describe("v2 CLI", () => {
     expect(commands.authenticate).toHaveBeenLastCalledWith("codex", "api-key");
     await dispatch(["auth", "codex", "--oauth"]);
     expect(commands.authenticate).toHaveBeenLastCalledWith("codex", "oauth");
+    await dispatch(["auth", "codex", "--host", "server", "--api-key"]);
+    expect(machines.runRemoteCommand).toHaveBeenLastCalledWith(
+      "server",
+      ["auth", "codex", "--api-key"],
+      true,
+    );
+    await dispatch(["auth", "claude", "--host=server"]);
+    expect(machines.runRemoteCommand).toHaveBeenLastCalledWith("server", ["auth", "claude"], true);
+    await expect(dispatch(["auth", "codex", "--host", "server"])).rejects.toThrow(
+      "remote Codex task",
+    );
+    await expect(dispatch(["auth", "codex", "--host", "server", "--oauth"])).rejects.toThrow(
+      "remote Codex task",
+    );
     await expect(dispatch(["auth", "codex", "--oauth", "--api-key"])).rejects.toBeInstanceOf(
       UsageError,
     );

@@ -39,6 +39,11 @@ export interface ProviderInvocation {
   inputFormat: "json";
 }
 
+export interface ProviderAuthentication {
+  service: string;
+  statusCommand: string[];
+}
+
 export interface LifecycleHookDefinition {
   command: string;
   timeoutSeconds: number;
@@ -52,6 +57,7 @@ export interface LifecycleHookConfiguration {
 
 export interface AgentHarness {
   readonly id: Agent;
+  readonly authentication: ProviderAuthentication;
   lifecycleCapabilities(): { userPromptSubmit: true; turnFinished: true };
   lifecycleHookConfiguration(recorderPath: string): LifecycleHookConfiguration;
   durableSessionArguments(

@@ -42,7 +42,9 @@ import type {
   TaskEnvironmentSpec,
   TaskRuntime,
   RuntimeAuthMode,
+  RuntimeAuthenticationStatus,
 } from "./types.ts";
+import { harnessForAgent } from "../providers/registry.ts";
 
 function parseVersion(text: string): number[] | undefined {
   const match = /(?:^|\s)v?(\d+)\.(\d+)\.(\d+)(?:\s|$)/m.exec(text);
@@ -134,6 +136,10 @@ function configuredServices(output: string): string[] {
   return known.filter((service) =>
     new RegExp(`(^|[^a-z0-9_-])${service}([^a-z0-9_-]|$)`, "m").test(lower),
   );
+}
+
+function serviceIsConfigured(output: string, service: string): boolean {
+  return new RegExp(`(^|[^a-z0-9_-])${service}([^a-z0-9_-]|$)`, "im").test(output);
 }
 
 export function dockerLoginDiagnostic(output: string): RuntimeDiagnostic {
@@ -258,7 +264,7 @@ export class DockerSandboxesRuntime implements TaskRuntime {
         : {}),
     });
 
-    const secrets = command("sbx", ["secret", "ls"]);
+    const secrets = command("sbx", ["secret", "ls", "--global"]);
     const services = configuredServices(secrets.stdout);
     const agents = options.agent ? [options.agent] : (["codex", "claude"] as const);
     for (const agent of agents) {
@@ -275,8 +281,8 @@ export class DockerSandboxesRuntime implements TaskRuntime {
                 `could not inspect ${provider} credentials`
               ).trim()
             : credentialAvailable
-              ? `${provider} is configured globally`
-              : `${provider} is not configured globally`,
+              ? `${provider} host credential is available for new ${agent} tasks`
+              : `${provider} host credential is not configured for new ${agent} tasks`,
         ...(secrets.status === 0 && !credentialAvailable
           ? {
               remediation: {
@@ -292,7 +298,7 @@ export class DockerSandboxesRuntime implements TaskRuntime {
   }
 
   globalCredentialServices(): string[] {
-    const result = command("sbx", ["secret", "ls"]);
+    const result = command("sbx", ["secret", "ls", "--global"]);
     return configuredServices(
       requireSuccess(result, "Could not inspect global Docker Sandbox credentials"),
     );
@@ -315,7 +321,11 @@ export class DockerSandboxesRuntime implements TaskRuntime {
         ? command("sbx", ["exec", runtimeId, "codex", "login", "--device-auth"], {
             stdio: "inherit",
           })
-        : command("sbx", ["run", "--name", runtimeId], { stdio: "inherit" });
+        : command(
+            "sbx",
+            ["exec", "--interactive", "--tty", runtimeId, "claude", "auth", "login", "--claudeai"],
+            { stdio: "inherit" },
+          );
     if (result.status !== 0)
       throw new Error(
         `${agent === "codex" ? "Codex device" : "Claude subscription"} authentication was not completed.`,
@@ -465,21 +475,47 @@ export class DockerSandboxesRuntime implements TaskRuntime {
     stopSandbox(dockerTask(task));
   }
 
-  assertAgentCredential(task: TaskManifest): void {
-    const service = task.agent === "codex" ? "openai" : "anthropic";
+  agentAuthenticationStatus(task: TaskManifest): RuntimeAuthenticationStatus {
+    const authentication = harnessForAgent(task.agent).authentication;
     const id = runtimeId(task);
-    const scoped = command("sbx", ["secret", "ls", id]);
-    if (scoped.status !== 0)
-      throw new Error(
-        `Could not inspect task runtime credentials: ${(scoped.stderr || scoped.stdout).trim()}`,
-      );
-    const services = [
-      ...new Set([...this.globalCredentialServices(), ...configuredServices(scoped.stdout)]),
-    ];
-    if (!services.includes(service))
-      throw new Error(
-        `The ${service} credential is not available to task runtime ${id}. Run "boxers auth ${task.agent}".`,
-      );
+    const scoped = command("sbx", ["secret", "ls", "--sandbox", id]);
+    if (scoped.status === 0 && serviceIsConfigured(scoped.stdout, authentication.service))
+      return {
+        state: "configured",
+        detail: `${authentication.service} credential is scoped to this task`,
+      };
+
+    const native = command("sbx", ["exec", id, ...authentication.statusCommand]);
+    if (native.status === 0)
+      return {
+        state: "configured",
+        detail: `${task.agent} is authenticated inside this task`,
+      };
+    const nativeDetail = (native.stderr || native.stdout).trim();
+    if (
+      scoped.status !== 0 ||
+      native.status === 126 ||
+      native.status === 127 ||
+      /not found|no such sandbox|cannot connect|connection refused/i.test(nativeDetail)
+    )
+      return {
+        state: "unknown",
+        detail: nativeDetail || "could not inspect scoped credentials or task-local authentication",
+      };
+    return {
+      state: "missing",
+      detail: `no ${authentication.service} host credential or task-local ${task.agent} login is available`,
+    };
+  }
+
+  assertAgentCredential(task: TaskManifest): void {
+    const status = this.agentAuthenticationStatus(task);
+    if (status.state === "configured") return;
+    throw new Error(
+      status.state === "unknown"
+        ? `Could not verify ${task.agent} authentication for task ${task.name}: ${status.detail}`
+        : `${task.agent} authentication is required for task ${task.name}. Run "boxers ${task.name} attach" from an interactive terminal to sign in, or configure a host credential with "boxers auth ${task.agent}".`,
+    );
   }
 
   workspacePath(task: TaskManifest): string {

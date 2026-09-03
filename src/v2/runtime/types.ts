@@ -3,6 +3,11 @@ import type { CommandResult, StreamingCommandOptions, StreamingCommandResult } f
 
 export type RuntimeAuthMode = "oauth" | "api-key";
 
+export interface RuntimeAuthenticationStatus {
+  state: "configured" | "missing" | "unknown";
+  detail: string;
+}
+
 export interface RuntimeProcessSpec {
   command: string;
   args: string[];
@@ -174,6 +179,7 @@ export interface TaskRuntime {
   previewLogs(task: TaskManifest, jobId: string): RuntimeJobLogs | undefined;
   openShell(task: TaskManifest): number;
   suspend(task: TaskManifest): void;
+  agentAuthenticationStatus(task: TaskManifest): RuntimeAuthenticationStatus;
   assertAgentCredential(task: TaskManifest): void;
   workspacePath(task: TaskManifest): string;
   agentLaunchSpec(task: TaskManifest, args: readonly string[]): RuntimeProcessSpec;

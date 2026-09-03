@@ -33,6 +33,10 @@ function hookConfiguration(recorderPath: string): LifecycleHookConfiguration {
 
 export const codexHarness: AgentHarness = {
   id: "codex",
+  authentication: {
+    service: "openai",
+    statusCommand: ["codex", "login", "status"],
+  },
 
   lifecycleCapabilities: () => ({ userPromptSubmit: true, turnFinished: true }),
 

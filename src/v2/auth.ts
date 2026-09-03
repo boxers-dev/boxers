@@ -2,6 +2,7 @@ import { createInterface } from "node:readline/promises";
 import type { Agent, TaskManifest } from "./types.ts";
 import { defaultRuntime, runtimeForTask } from "./runtime/registry.ts";
 import { taskRuntimeId } from "./runtime/task.ts";
+import { harnessForAgent } from "./providers/registry.ts";
 
 export type Provider = "openai" | "anthropic";
 export type CodexAuthMode = "oauth" | "api-key";
@@ -21,7 +22,7 @@ const KNOWN_SERVICES = [
 ] as const;
 
 export function providerForAgent(agent: Agent): Provider {
-  return agent === "codex" ? "openai" : "anthropic";
+  return harnessForAgent(agent).authentication.service as Provider;
 }
 
 export function servicesFromSecretOutput(output: string): string[] {
@@ -61,7 +62,7 @@ export async function confirmAuthentication(agent: Agent): Promise<boolean> {
       ? isSshSession()
         ? "Codex needs authentication. Sign in with your ChatGPT subscription using a device code now?"
         : "Codex needs an OpenAI credential in the task runtime. Authenticate with ChatGPT now?"
-      : "Claude needs an Anthropic credential in the task runtime. Open Claude Code to run /login now?";
+      : "Claude needs authentication. Sign in with your Claude subscription now?";
   const readline = createInterface({ input: process.stdin, output: process.stdout });
   try {
     const answer = (await readline.question(`${description} [Y/n] `)).trim().toLowerCase();
@@ -100,8 +101,34 @@ export function authenticateCodexSubscription(task: TaskManifest | string): void
 
 export function authenticateClaudeSubscription(task: TaskManifest | string): void {
   process.stdout.write(
-    "Claude Code will open for subscription authentication. Run /login, finish the browser flow, then run /exit to return to boxers.\n",
+    "Claude will open its subscription authentication flow. Finish the browser sign-in to continue.\n",
   );
   const runtime = typeof task === "string" ? defaultRuntime() : runtimeForTask(task);
   runtime.authenticateSubscription(typeof task === "string" ? task : taskRuntimeId(task), "claude");
+}
+
+export async function ensureTaskAuthentication(task: TaskManifest): Promise<void> {
+  const runtime = runtimeForTask(task);
+  const before = runtime.agentAuthenticationStatus(task);
+  if (before.state === "configured") return;
+  if (before.state === "unknown")
+    throw new Error(
+      `Could not verify ${task.agent} authentication for task ${task.name}: ${before.detail}`,
+    );
+  if (!isInteractive())
+    throw new Error(
+      `${task.agent} authentication is required for task ${task.name}. Attach from an interactive terminal to sign in.`,
+    );
+  if (!(await confirmAuthentication(task.agent)))
+    throw new Error(`${task.agent} authentication is required for task ${task.name}.`);
+  if (task.agent === "codex") authenticateCodexSubscription(task);
+  else authenticateClaudeSubscription(task);
+  const after = runtime.agentAuthenticationStatus(task);
+  if (after.state !== "configured")
+    throw new Error(
+      after.state === "unknown"
+        ? `Could not verify ${task.agent} authentication after sign-in: ${after.detail}`
+        : `${task.agent} did not report an authenticated session after sign-in.`,
+    );
+  process.stdout.write(`${task.agent} authentication is ready for task ${task.name}.\n`);
 }

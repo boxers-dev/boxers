@@ -82,8 +82,8 @@ General
   boxers update
 
 Auth
-  boxers auth claude
-  boxers auth codex [--oauth|--api-key]
+  boxers auth claude [--host <host>]
+  boxers auth codex [--oauth|--api-key] [--host <host>]
   boxers auth status [--host <host>|--all] [--refresh] [--json]
 
 Project
@@ -505,16 +505,33 @@ export async function dispatch(argv: string[]): Promise<number> {
       return showAuthenticationStatus({ refresh, ...(host ? { host } : {}), all, json });
     }
     if (!isAgent(agentValue ?? "")) throw new UsageError("auth requires codex or claude.");
-    only(authArgs, ["--oauth", "--api-key"], "auth");
-    if (authArgs.includes("--oauth") && authArgs.includes("--api-key"))
+    let host: string | undefined;
+    const modeArgs: string[] = [];
+    for (let index = 0; index < authArgs.length; index++) {
+      const arg = authArgs[index];
+      if (arg === "--host") host = value(authArgs, index++, arg);
+      else if (arg?.startsWith("--host=")) {
+        host = arg.slice(7);
+        if (!host) throw new UsageError("--host requires a value.");
+      } else if (arg === "--oauth" || arg === "--api-key") modeArgs.push(arg);
+      else throw new UsageError(`Unexpected argument for auth: ${arg}`);
+    }
+    if (modeArgs.includes("--oauth") && modeArgs.includes("--api-key"))
       throw new UsageError("Use either --oauth or --api-key, not both.");
-    if (agentValue === "claude" && authArgs.length)
+    if (agentValue === "claude" && modeArgs.length)
       throw new UsageError("--oauth and --api-key apply only to Codex authentication.");
+    if (host) {
+      if (agentValue === "codex" && !modeArgs.includes("--api-key"))
+        throw new UsageError(
+          "Remote Codex host authentication requires --api-key. For ChatGPT subscription access, create or attach to a remote Codex task and Boxers will offer device login inside its durable Sandbox.",
+        );
+      return runRemoteCommand(host, ["auth", agentValue as Agent, ...modeArgs], true);
+    }
     return authenticate(
       agentValue as Agent,
-      authArgs.includes("--api-key")
+      modeArgs.includes("--api-key")
         ? "api-key"
-        : authArgs.includes("--oauth")
+        : modeArgs.includes("--oauth")
           ? "oauth"
           : undefined,
     );

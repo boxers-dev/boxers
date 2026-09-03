@@ -44,5 +44,13 @@ describe("fleet host status", () => {
     expect(write.mock.calls.map((call) => String(call[0])).join("")).toContain(
       '"claude":"missing"',
     );
+    write.mockClear();
+    await expect(
+      showAuthenticationStatus({ refresh: false, all: false, json: false }),
+    ).resolves.toBe(1);
+    const authenticationOutput = write.mock.calls.map((call) => String(call[0])).join("");
+    expect(authenticationOutput).toContain("Host credentials for new tasks");
+    expect(authenticationOutput).toContain("boxers auth claude");
+    expect(authenticationOutput).toContain("task-local subscription login");
   });
 });

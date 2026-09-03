@@ -20,6 +20,7 @@ import {
   authenticateCodexSubscription,
   authenticateClaudeSubscription,
   confirmAuthentication,
+  ensureTaskAuthentication,
   hasGlobalCredential,
   isInteractive,
   isSshSession,
@@ -818,8 +819,7 @@ export async function newTask(name: string, options: NewTaskOptions): Promise<nu
     createTaskEnvironment(task, project.seedPath);
     if (bootstrapCodexSubscription) authenticateCodexSubscription(task);
     if (bootstrapClaudeSubscription) authenticateClaudeSubscription(task);
-    if (!bootstrapCodexSubscription && !bootstrapClaudeSubscription)
-      assertTaskAgentCredential(task);
+    assertTaskAgentCredential(task);
     task = updateTask(
       project,
       task,
@@ -1203,6 +1203,7 @@ export async function attach(
     throw new Error("--fast is supported only for Codex tasks.");
   const configured = updateTaskSessionSettings(project, task, settings);
   const updated = rotateTaskLifecycleBridgeToken(project, configured);
+  await ensureTaskAuthentication(updated);
   note("Connecting to the agent session...");
   const status = await runAgentSessionInteractive(updated, {
     resume: Boolean(updated.sessionStartedAt),

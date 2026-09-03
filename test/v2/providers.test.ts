@@ -5,6 +5,17 @@ import { codexHarness } from "../../src/v2/providers/codex.ts";
 const now = "2026-08-29T00:00:00.000Z";
 
 describe("provider lifecycle adapters", () => {
+  it("declares provider-native authentication checks with each harness", () => {
+    expect(codexHarness.authentication).toEqual({
+      service: "openai",
+      statusCommand: ["codex", "login", "status"],
+    });
+    expect(claudeHarness.authentication).toEqual({
+      service: "anthropic",
+      statusCommand: ["claude", "auth", "status"],
+    });
+  });
+
   it("normalizes only stable Codex prompt fields and ignores transcript_path", () => {
     expect(
       codexHarness.normalizeLifecycleEvent(

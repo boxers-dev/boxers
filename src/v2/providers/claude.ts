@@ -25,6 +25,10 @@ function hookConfiguration(recorderPath: string): LifecycleHookConfiguration {
 
 export const claudeHarness: AgentHarness = {
   id: "claude",
+  authentication: {
+    service: "anthropic",
+    statusCommand: ["claude", "auth", "status"],
+  },
 
   lifecycleCapabilities: () => ({ userPromptSubmit: true, turnFinished: true }),
 

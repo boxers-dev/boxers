@@ -10,6 +10,8 @@ import {
   remediationFor,
   servicesFromSecretOutput,
 } from "../../src/v2/auth.ts";
+import { DockerSandboxesRuntime } from "../../src/v2/runtime/docker-sandboxes.ts";
+import type { TaskManifest } from "../../src/v2/types.ts";
 
 const cleanup: string[] = [];
 const originalPath = process.env.PATH;
@@ -20,6 +22,7 @@ afterEach(() => {
   if (originalSshConnection === undefined) delete process.env.SSH_CONNECTION;
   else process.env.SSH_CONNECTION = originalSshConnection;
   delete process.env.SBX_AUTH_ARGS;
+  delete process.env.SBX_AUTH_TEST_STATE;
   for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
@@ -38,6 +41,49 @@ function fakeSbx(service: "openai" | "anthropic"): string {
   return output;
 }
 
+function task(agent: "codex" | "claude" = "codex"): TaskManifest {
+  return {
+    version: 3,
+    id: "task-id",
+    projectId: "project-id",
+    name: "task",
+    runtime: { kind: "docker-sandboxes", id: "boxers-project-task" },
+    agent,
+    sessionMode: "native",
+    lifecycleBridgeToken: "0123456789abcdef0123456789abcdef",
+    createdAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+function fakeAuthenticationStatusSbx(state: "scoped" | "task" | "missing" | "unavailable") {
+  const bin = mkdtempSync(join(tmpdir(), "boxers-auth-status-bin-"));
+  cleanup.push(bin);
+  const executable = join(bin, "sbx");
+  const calls = join(bin, "calls");
+  writeFileSync(
+    executable,
+    `#!/bin/sh
+printf '%s\n' "$*" >> "$SBX_AUTH_ARGS"
+if [ "$1 $2" = "secret ls" ]; then
+  [ "$SBX_AUTH_TEST_STATE" = scoped ] && printf 'service openai configured\n'
+  exit 0
+fi
+if [ "$1" = exec ]; then
+  [ "$SBX_AUTH_TEST_STATE" = task ] && exit 0
+  [ "$SBX_AUTH_TEST_STATE" = unavailable ] && { printf 'no such sandbox\n' >&2; exit 1; }
+  printf 'Not logged in\n' >&2
+  exit 1
+fi
+exit 0
+`,
+  );
+  chmodSync(executable, 0o755);
+  process.env.PATH = `${bin}:${originalPath ?? ""}`;
+  process.env.SBX_AUTH_ARGS = calls;
+  process.env.SBX_AUTH_TEST_STATE = state;
+  return calls;
+}
+
 describe("agent authentication", () => {
   it("maps agents and parses service listings without substring matches", () => {
     expect(providerForAgent("codex")).toBe("openai");
@@ -53,7 +99,7 @@ describe("agent authentication", () => {
     const output = fakeSbx("openai");
     expect(authenticateAgent("codex")).toBe(0);
     expect(readFileSync(output, "utf8")).toContain("secret set openai --oauth");
-    expect(readFileSync(output, "utf8")).toContain("secret ls ");
+    expect(readFileSync(output, "utf8")).toContain("secret ls --global");
   });
 
   it("supports API-key authentication over SSH and prevents accidental localhost OAuth", () => {
@@ -75,18 +121,47 @@ describe("agent authentication", () => {
     );
   });
 
-  it("stores Claude API keys globally and opens subscription login per Sandbox", () => {
+  it("stores Claude API keys globally and uses dedicated subscription login per Sandbox", () => {
     const output = fakeSbx("anthropic");
     expect(authenticateAgent("claude")).toBe(0);
     authenticateClaudeSubscription("boxers-project-task");
     const args = readFileSync(output, "utf8");
     expect(args).toContain("secret set anthropic");
-    expect(args).toContain("run --name boxers-project-task");
+    expect(args).toContain(
+      "exec --interactive --tty boxers-project-task claude auth login --claudeai",
+    );
   });
 
   it("provides provider-specific non-interactive remediation", () => {
     expect(remediationFor("codex")).toContain("device code");
     expect(remediationFor("claude")).toContain("Anthropic API key");
     expect(remediationFor("claude")).toContain("interactive terminal");
+  });
+
+  it("distinguishes scoped credentials, task-local login, missing auth, and inspection failure", () => {
+    const runtime = new DockerSandboxesRuntime();
+
+    const calls = fakeAuthenticationStatusSbx("scoped");
+    expect(runtime.agentAuthenticationStatus(task())).toMatchObject({
+      state: "configured",
+      detail: expect.stringContaining("scoped to this task"),
+    });
+
+    process.env.SBX_AUTH_TEST_STATE = "task";
+    expect(runtime.agentAuthenticationStatus(task())).toMatchObject({
+      state: "configured",
+      detail: expect.stringContaining("inside this task"),
+    });
+
+    process.env.SBX_AUTH_TEST_STATE = "missing";
+    expect(runtime.agentAuthenticationStatus(task())).toMatchObject({ state: "missing" });
+
+    process.env.SBX_AUTH_TEST_STATE = "unavailable";
+    expect(runtime.agentAuthenticationStatus(task())).toMatchObject({ state: "unknown" });
+
+    const commands = readFileSync(calls, "utf8");
+    expect(commands).toContain("secret ls --sandbox boxers-project-task");
+    expect(commands).not.toContain("secret ls --global");
+    expect(commands).toContain("exec boxers-project-task codex login status");
   });
 });
