@@ -1,4 +1,5 @@
 import { resetTerminalInputModes } from "../core/ansi.ts";
+import { codexTaskExecArguments } from "./runtime/codex-home.ts";
 import {
   attachInteractive,
   ensureDaemonReady,
@@ -79,8 +80,9 @@ export function runRepairAgent(task: TaskManifest, prompt: string): CommandResul
     "--signal=TERM",
     "--kill-after=10s",
     "10m",
-    task.agent,
-    ...repairAgentArguments(task, workspace, prompt),
+    ...(task.agent === "codex"
+      ? codexTaskExecArguments(repairAgentArguments(task, workspace, prompt))
+      : [task.agent, ...repairAgentArguments(task, workspace, prompt)]),
   ]);
 }
 
@@ -316,7 +318,15 @@ export function generateCommitMessage(
     const modelArgs = model ? ["--model", model] : [];
     const agentArgs =
       task.agent === "codex"
-        ? ["codex", "exec", "--ephemeral", "--sandbox", "read-only", "--json", ...modelArgs, prompt]
+        ? codexTaskExecArguments([
+            "exec",
+            "--ephemeral",
+            "--sandbox",
+            "read-only",
+            "--json",
+            ...modelArgs,
+            prompt,
+          ])
         : [
             "claude",
             "-p",

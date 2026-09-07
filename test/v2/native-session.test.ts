@@ -80,6 +80,15 @@ if [ "$command_name" = ls ]; then printf '{"sandboxes":[]}\n'; fi
 if [ "$command_name" = secret ] && [ "$1" = ls ]; then printf 'service openai configured\n'; fi
 if [ "$command_name" = exec ] && [ "$2" = pwd ]; then printf '/workspace/project\n'; fi
 if [ "$command_name" = exec ] && [ "$2" = git ]; then printf '/workspace/project/.git\n'; fi
+case "$*" in
+  *"app-server"*)
+    IFS= read -r ignored
+    printf '{"id":"boxers-initialize","result":{}}\n'
+    IFS= read -r ignored
+    IFS= read -r ignored
+    printf '{"id":"boxers-account","result":{"account":{"type":"chatgpt"}}}\n'
+    ;;
+esac
 if [ "$command_name" = exec ] && [ "$2" = sh ]; then cat > /dev/null; fi
 `,
     );
@@ -104,7 +113,7 @@ if [ "$command_name" = exec ] && [ "$2" = sh ]; then cat > /dev/null; fi
       "<codex>",
     );
     expect(calls).toContain("run <codex> <--name>");
-    expect(calls).toContain("<--> <--model>");
+    expect(calls).toContain('<--> <-c> <forced_login_method="chatgpt">');
     expect(calls).toContain("<--model> <gpt-example>");
     expect(calls).toContain('<model_reasoning_effort="high">');
     expect(calls).toContain('<service_tier="fast">');
@@ -171,7 +180,7 @@ fi
 
     const generated = generateCommitMessage(task, "diff --git a/file b/file");
     const calls = readFileSync(log, "utf8");
-    expect(calls.match(/codex exec/g)).toHaveLength(2);
+    expect(calls.match(/boxers-codex \/home\/agent\/\.boxers\/codex exec/g)).toHaveLength(2);
     expect(calls).toContain("overlong development note");
     expect(calls).toContain("summarize the note once");
     expect(calls).toContain("the whole supplied conversation");

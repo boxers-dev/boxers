@@ -59,6 +59,7 @@ function fakeAuthenticationStatusSbx(
   state:
     | "scoped"
     | "task"
+    | "imported"
     | "expired"
     | "external_ready"
     | "external_rejected"
@@ -81,17 +82,22 @@ if [ "$1 $2" = "secret ls" ]; then
 fi
 if [ "$1" = exec ]; then
   case "$*" in
+    *"node -e"*)
+      [ "$SBX_AUTH_TEST_STATE" = imported ] && printf 'imported\n'
+      exit 0
+      ;;
     *"boxers-auth-probe"*)
       [ "$SBX_AUTH_TEST_STATE" = external_ready ] && exit 0
       [ "$SBX_AUTH_TEST_STATE" = external_rejected ] && exit 11
       exit 12
       ;;
     *"codex "*"app-server"*)
-      if [ "$SBX_AUTH_TEST_STATE" = task ] || [ "$SBX_AUTH_TEST_STATE" = expired ]; then
+      if [ "$SBX_AUTH_TEST_STATE" = task ] || [ "$SBX_AUTH_TEST_STATE" = imported ] || [ "$SBX_AUTH_TEST_STATE" = expired ]; then
         IFS= read -r ignored
         printf '{"id":"boxers-initialize","result":{"userAgent":"test"}}\n'
         IFS= read -r ignored
         IFS= read -r ignored
+        printf '%s\n' "$ignored" >> "$SBX_AUTH_ARGS"
         if [ "$SBX_AUTH_TEST_STATE" = expired ]; then
           printf '{"id":"boxers-account","error":{"message":"refresh token expired"}}\n'
         else
@@ -99,7 +105,12 @@ if [ "$1" = exec ]; then
         fi
         exit 0
       fi
-      exit 1
+      IFS= read -r ignored
+      printf '{"id":"boxers-initialize","result":{}}\n'
+      IFS= read -r ignored
+      IFS= read -r ignored
+      printf '{"id":"boxers-account","result":{"account":null}}\n'
+      exit 0
       ;;
   esac
   [ "$SBX_AUTH_TEST_STATE" = task ] && exit 0
@@ -150,7 +161,7 @@ describe("agent authentication", () => {
     const output = fakeSbx("openai");
     authenticateCodexSubscription("boxers-project-task");
     expect(readFileSync(output, "utf8")).toContain(
-      'exec --interactive --tty boxers-project-task env -u OPENAI_API_KEY codex -c forced_login_method="chatgpt" -c model_provider="openai" login --device-auth',
+      'exec --interactive --tty boxers-project-task env -u OPENAI_API_KEY CODEX_HOME=/home/agent/.boxers/codex codex -c forced_login_method="chatgpt" -c model_provider="openai" -c cli_auth_credentials_store="file" login --device-auth',
     );
   });
 
@@ -171,7 +182,7 @@ describe("agent authentication", () => {
     expect(remediationFor("claude")).toContain("interactive terminal");
   });
 
-  it("distinguishes proxy credentials, refreshed task login, expired auth, and failures", async () => {
+  it("distinguishes proxy credentials, saved task login, and inconclusive account errors", async () => {
     const runtime = new DockerSandboxesRuntime();
 
     const calls = fakeAuthenticationStatusSbx("scoped");
@@ -196,12 +207,13 @@ describe("agent authentication", () => {
     process.env.SBX_AUTH_TEST_STATE = "task";
     await expect(runtime.agentAuthenticationStatus(task())).resolves.toMatchObject({
       state: "ready",
-      detail: expect.stringContaining("refreshed"),
+      detail: expect.stringContaining("stored"),
     });
     expect(runtime.agentLaunchSpec(task(), [])).toMatchObject({
       args: expect.arrayContaining([
         "--env",
         "OPENAI_API_KEY=",
+        "CODEX_HOME=/home/agent/.boxers/codex",
         'forced_login_method="chatgpt"',
         'model_provider="openai"',
       ]),
@@ -209,7 +221,7 @@ describe("agent authentication", () => {
 
     process.env.SBX_AUTH_TEST_STATE = "expired";
     await expect(runtime.agentAuthenticationStatus(task())).resolves.toMatchObject({
-      state: "reauth_required",
+      state: "unknown",
       detail: expect.stringContaining("expired"),
     });
 
@@ -227,8 +239,10 @@ describe("agent authentication", () => {
     expect(commands).toContain("secret ls --sandbox boxers-project-task");
     expect(commands).not.toContain("secret ls --global");
     expect(commands).toContain(
-      'env -u OPENAI_API_KEY codex -c forced_login_method="chatgpt" -c model_provider="openai" app-server',
+      'env -u OPENAI_API_KEY CODEX_HOME=/home/agent/.boxers/codex codex -c forced_login_method="chatgpt" -c model_provider="openai" -c cli_auth_credentials_store="file" app-server',
     );
+    expect(commands).toContain('"refreshToken":false');
+    expect(commands).not.toContain('"refreshToken":true');
     expect(commands).toContain("exec boxers-project-task codex login status");
     expect(commands).toContain("boxers-auth-probe codex");
   });
@@ -245,5 +259,19 @@ describe("agent authentication", () => {
     expect(runtime.agentLaunchSpec(task("claude"), [])).toMatchObject({
       args: expect.arrayContaining(["--env", "ANTHROPIC_API_KEY="]),
     });
+  });
+
+  it("requests a provider restart when surviving credentials change homes", async () => {
+    fakeAuthenticationStatusSbx("imported");
+    await expect(
+      new DockerSandboxesRuntime().agentAuthenticationStatus(task()),
+    ).resolves.toMatchObject({
+      state: "ready",
+      restartRequired: true,
+    });
+    process.env.SBX_AUTH_TEST_STATE = "task";
+    const status = await new DockerSandboxesRuntime().agentAuthenticationStatus(task());
+    expect(status.state).toBe("ready");
+    expect(status.restartRequired).toBeUndefined();
   });
 });

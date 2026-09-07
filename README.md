@@ -250,7 +250,15 @@ ChatGPT and Claude subscription sessions live inside an individual durable task
 Sandbox. On `new` and `attach`, Boxers checks that task-local session and offers
 the provider-native flow when it is missing or needs renewal: Codex device
 login or `claude auth login --claudeai`. Codex is checked through its structured
-account API with token refresh; Claude is checked with its native auth status.
+account API without forcing a token refresh; Codex handles renewal during normal
+use. Claude is checked with its native auth status.
+
+Task-local Codex credentials are stored in `/home/agent/.boxers/codex` inside
+the durable Sandbox, outside Docker's managed Codex auth files. Existing
+conversation history remains shared so attach resumes the same session. Surviving
+ChatGPT credentials are preserved automatically; tasks whose credentials were
+already removed need one more device login. An inconclusive Codex account check
+reports an error instead of requesting a new login.
 A Docker proxy credential is checked with a non-generating provider request.
 An accepted credential continues silently, a definite authentication rejection
 offers task login, and an inconclusive network check does not nag the user.

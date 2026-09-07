@@ -1183,8 +1183,11 @@ export async function attach(
   const configured = updateTaskSessionSettings(project, task, settings);
   const updated = rotateTaskLifecycleBridgeToken(project, configured);
   const authentication = await ensureTaskAuthentication(updated);
-  if (authentication.reauthenticated && updated.sessionStartedAt) {
-    note("Restarting the agent process with the refreshed task authentication...");
+  if (
+    (authentication.reauthenticated || authentication.status.restartRequired) &&
+    updated.sessionStartedAt
+  ) {
+    note("Restarting the agent process with the updated task authentication...");
     await restartAgentSession(updated);
   }
   note("Connecting to the agent session...");

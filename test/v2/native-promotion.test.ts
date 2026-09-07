@@ -1161,7 +1161,7 @@ printf 'resolved and staged shared.txt\n'
       "Exit status: 0",
     );
     expect(readFileSync(process.env["FAKE_SBX_LOG"], "utf8")).toContain(
-      "<timeout> <--signal=TERM> <--kill-after=10s> <10m> <codex>",
+      "<timeout> <--signal=TERM> <--kill-after=10s> <10m> <sh> <-c>",
     );
   });
 

@@ -46,6 +46,12 @@ import type {
   RuntimeAuthenticationStatus,
 } from "./types.ts";
 import { harnessForAgent } from "../providers/registry.ts";
+import {
+  CODEX_CHATGPT_CONFIG_ARGS,
+  CODEX_TASK_HOME,
+  CODEX_TASK_HOME_ENV,
+  PREPARE_CODEX_HOME,
+} from "./codex-home.ts";
 
 function parseVersion(text: string): number[] | undefined {
   const match = /(?:^|\s)v?(\d+)\.(\d+)\.(\d+)(?:\s|$)/m.exec(text);
@@ -145,12 +151,17 @@ function serviceIsConfigured(output: string, service: string): boolean {
 
 const CODEX_ACCOUNT_TIMEOUT_MS = 10_000;
 const EXTERNAL_AUTH_REJECTED = 11;
-const CODEX_CHATGPT_CONFIG_ARGS = [
-  "-c",
-  'forced_login_method="chatgpt"',
-  "-c",
-  'model_provider="openai"',
-] as const;
+function prepareCodexHome(runtimeId: string) {
+  return command("sbx", [
+    "exec",
+    runtimeId,
+    "node",
+    "-e",
+    PREPARE_CODEX_HOME,
+    "/home/agent/.codex",
+    CODEX_TASK_HOME,
+  ]);
+}
 
 const EXTERNAL_AUTH_PROBE = `
 agent="$1"
@@ -203,11 +214,17 @@ function externalCredentialStatus(
 }
 
 /**
- * Ask Codex to read and refresh its task-local account. The Docker credential
+ * Ask Codex to read its task-local account without forcing token rotation. The Docker credential
  * proxy is deliberately removed from this probe so its placeholder API key
  * cannot be mistaken for a usable ChatGPT session.
  */
 function codexTaskAccountStatus(runtimeId: string): Promise<RuntimeAuthenticationStatus> {
+  const prepared = prepareCodexHome(runtimeId);
+  if (prepared.status !== 0)
+    return Promise.resolve({
+      state: "unknown",
+      detail: "Could not prepare the task-local Codex home",
+    });
   return new Promise((resolve) => {
     const child = spawn(
       "sbx",
@@ -218,6 +235,7 @@ function codexTaskAccountStatus(runtimeId: string): Promise<RuntimeAuthenticatio
         "env",
         "-u",
         "OPENAI_API_KEY",
+        CODEX_TASK_HOME_ENV,
         "codex",
         ...CODEX_CHATGPT_CONFIG_ARGS,
         "app-server",
@@ -260,9 +278,13 @@ function codexTaskAccountStatus(runtimeId: string): Promise<RuntimeAuthenticatio
         error?: { message?: unknown };
       };
       if (response.id === initializeId && !initialized) {
+        if (response.error) {
+          finish({ state: "unknown", detail: "Codex account probe initialization failed" });
+          return;
+        }
         initialized = true;
         write({ method: "initialized", params: {} });
-        write({ method: "account/read", id: accountId, params: { refreshToken: true } });
+        write({ method: "account/read", id: accountId, params: { refreshToken: false } });
         return;
       }
       if (response.id !== accountId) return;
@@ -270,8 +292,8 @@ function codexTaskAccountStatus(runtimeId: string): Promise<RuntimeAuthenticatio
         const detail =
           typeof response.error.message === "string"
             ? response.error.message
-            : "Codex could not refresh the task-local account";
-        finish({ state: "reauth_required", detail });
+            : "Codex could not read the task-local account";
+        finish({ state: "unknown", detail });
         return;
       }
       const account = response.result?.account;
@@ -285,7 +307,8 @@ function codexTaskAccountStatus(runtimeId: string): Promise<RuntimeAuthenticatio
           : "account";
       finish({
         state: "ready",
-        detail: `task-local Codex ${type === "chatgpt" ? "ChatGPT" : type} account refreshed`,
+        detail: `task-local Codex ${type === "chatgpt" ? "ChatGPT" : type} account is stored`,
+        ...(prepared.stdout.trim() === "imported" ? { restartRequired: true } : {}),
       });
     };
     const consume = (): void => {
@@ -305,7 +328,10 @@ function codexTaskAccountStatus(runtimeId: string): Promise<RuntimeAuthenticatio
     });
     child.stderr.on("data", (chunk: string) => (stderr += chunk));
     child.on("error", (error) =>
-      finish({ state: "unknown", detail: `could not start the Codex account probe: ${error.message}` }),
+      finish({
+        state: "unknown",
+        detail: `could not start the Codex account probe: ${error.message}`,
+      }),
     );
     child.on("close", () => {
       if (settled) return;
@@ -317,7 +343,7 @@ function codexTaskAccountStatus(runtimeId: string): Promise<RuntimeAuthenticatio
         });
     });
     timer = setTimeout(
-      () => finish({ state: "unknown", detail: "Codex account refresh timed out" }),
+      () => finish({ state: "unknown", detail: "Codex account read timed out" }),
       CODEX_ACCOUNT_TIMEOUT_MS,
     );
     write({
@@ -503,6 +529,8 @@ export class DockerSandboxesRuntime implements TaskRuntime {
   }
 
   authenticateSubscription(runtimeId: string, agent: TaskManifest["agent"]): void {
+    if (agent === "codex")
+      requireSuccess(prepareCodexHome(runtimeId), "Could not prepare the task-local Codex home");
     const result =
       agent === "codex"
         ? command(
@@ -515,6 +543,7 @@ export class DockerSandboxesRuntime implements TaskRuntime {
               "env",
               "-u",
               "OPENAI_API_KEY",
+              CODEX_TASK_HOME_ENV,
               "codex",
               ...CODEX_CHATGPT_CONFIG_ARGS,
               "login",
@@ -722,7 +751,7 @@ export class DockerSandboxesRuntime implements TaskRuntime {
       return taskLocal;
     }
     this.#taskLocalAuthentication.delete(id);
-    if (taskLocal.state === "reauth_required") return taskLocal;
+    if (taskLocal.state === "reauth_required" || taskLocal.state === "unknown") return taskLocal;
 
     const scoped = command("sbx", ["secret", "ls", "--sandbox", id]);
     const native = command("sbx", ["exec", id, ...authentication.statusCommand]);
@@ -776,6 +805,9 @@ export class DockerSandboxesRuntime implements TaskRuntime {
         runtimeId(task),
         ...(this.#taskLocalAuthentication.has(runtimeId(task))
           ? ["--env", `${taskLocalVariable}=`]
+          : []),
+        ...(task.agent === "codex" && this.#taskLocalAuthentication.has(runtimeId(task))
+          ? ["--env", CODEX_TASK_HOME_ENV]
           : []),
         "--",
         ...(task.agent === "codex" && this.#taskLocalAuthentication.has(runtimeId(task))

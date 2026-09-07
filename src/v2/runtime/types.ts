@@ -6,6 +6,8 @@ export type RuntimeAuthMode = "oauth" | "api-key";
 export interface RuntimeAuthenticationStatus {
   state: "ready" | "external_unverified" | "missing" | "reauth_required" | "unknown";
   detail: string;
+  /** A running provider must reopen credentials after their storage location changes. */
+  restartRequired?: boolean;
 }
 
 export interface RuntimeProcessSpec {
