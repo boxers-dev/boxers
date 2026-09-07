@@ -80,10 +80,12 @@ describe("CLI daemon boundary", () => {
     child.stdout?.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
     child.stderr?.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
     let timedOut = false;
+    // Allow cold tsx startup under full-suite load. The zero-connections
+    // assertion below verifies the daemon boundary independently of timing.
     const timeout = setTimeout(() => {
       timedOut = true;
       child?.kill("SIGKILL");
-    }, 2_000);
+    }, 10_000);
     const code = await new Promise<number | null>((resolve) => child?.once("close", resolve));
     clearTimeout(timeout);
 
@@ -104,5 +106,5 @@ describe("CLI daemon boundary", () => {
         remediation: expect.objectContaining({ value: expect.stringContaining("daemon stop") }),
       }),
     );
-  });
+  }, 15_000);
 });

@@ -113,6 +113,8 @@ Tasks
       [--fast|--no-fast]
       [-d, --detach]
 
+  boxers new [same options]  # pick a fictional boxer name for your task
+
   boxers <machine>/<task> new [--remote-path <absolute-path>] [--agent codex|claude] [...]
 
   # Prefix an existing task with <machine>/ to run the command remotely.
@@ -842,8 +844,9 @@ export async function dispatch(argv: string[]): Promise<number> {
       throw new UsageError("remote project clone requires source, base, and destination.");
     return cloneAndInitializeProject(source, base, destination);
   }
-  if (rest.length === 0) throw new UsageError(`Missing command for task "${first}".`);
-  const [taskCommand, ...args] = rest;
+  const autoName = first === "new" && (rest.length === 0 || rest[0]?.startsWith("-"));
+  if (rest.length === 0 && !autoName) throw new UsageError(`Missing command for task "${first}".`);
+  const [taskCommand, ...args] = autoName ? ["new", ...rest] : rest;
   const qualified = first.split("/");
   if (qualified.length > 1) {
     if (qualified.length !== 2)
@@ -889,7 +892,7 @@ export async function dispatch(argv: string[]): Promise<number> {
       const options = parseNew(args);
       if (options.remotePath)
         throw new UsageError("--remote-path applies only to <machine>/<task> new.");
-      return newTask(first, {
+      return newTask(autoName ? undefined : first, {
         ...(options.agent !== undefined ? { agent: options.agent } : {}),
         ...(options.prompt !== undefined ? { prompt: options.prompt } : {}),
         ...(options.template !== undefined ? { template: options.template } : {}),

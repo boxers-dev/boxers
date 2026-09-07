@@ -15,6 +15,7 @@ import { tmpdir, userInfo } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { writeStderr, writeStdout } from "../core/output.ts";
+import { generateBoxerName } from "./boxer-name.ts";
 import {
   authenticateAgent,
   ensureTaskAuthentication,
@@ -770,7 +771,11 @@ function reclaimMissingTaskRegistration(name: string): void {
     );
 }
 
-export async function newTask(name: string, options: NewTaskOptions): Promise<number> {
+export async function newTask(name: string | undefined, options: NewTaskOptions): Promise<number> {
+  if (name === undefined) {
+    name = generateBoxerName(listRegisteredTasks().map(({ task }) => task.name));
+    note(`In this corner: ${name}`);
+  }
   reclaimMissingTaskRegistration(name);
   assertTaskNameAvailable(name);
   const runtime = defaultRuntime();

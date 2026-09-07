@@ -31,6 +31,11 @@ Project setup asks how completed work should be integrated, which agent to use,
 and whether the project needs previews or automated checks. After that, a task
 name followed by `new` opens the agent.
 
+Feeling lucky? Run `boxers new` (with the same options as a named task) and
+Boxers announces a fictional ring name like `mike-byteson` or `muhammad-cli`.
+Existing names are skipped; if the roster is full, a numbered rematch suffix
+keeps the name available. Use the announced name to attach or run other task commands.
+
 Press Ctrl-C to detach. The task and conversation keep running in the
 background; attach again whenever you want.
 

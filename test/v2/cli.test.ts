@@ -190,6 +190,24 @@ describe("v2 CLI", () => {
     expect(commands.status).toHaveBeenLastCalledWith("task", false, true);
   });
 
+  it("allows new without a task name and preserves creation options", async () => {
+    await dispatch(["new"]);
+    expect(commands.newTask).toHaveBeenLastCalledWith(undefined, { detach: false });
+    await dispatch(["new", "--agent", "codex", "--prompt", "Fix it", "--no-fast", "-d"]);
+    expect(commands.newTask).toHaveBeenLastCalledWith(undefined, {
+      agent: "codex",
+      prompt: "Fix it",
+      fast: false,
+      detach: true,
+    });
+    await expect(dispatch(["new", "--agent", "vibe"])).rejects.toBeInstanceOf(UsageError);
+    await expect(dispatch(["new", "--remote-path", "/srv/project"])).rejects.toThrow(
+      "--remote-path applies only",
+    );
+    await dispatch(["new", "attach"]);
+    expect(commands.attach).toHaveBeenLastCalledWith("new", {});
+  });
+
   it("parses new and rejects unsupported agents", async () => {
     await dispatch([
       "task-one",
