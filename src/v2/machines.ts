@@ -7,7 +7,7 @@ import { captureStateProjection } from "./projection.ts";
 import { isTaskState } from "./state.ts";
 import { isTaskView } from "./task-view.ts";
 import { collectHostStatus, isHostStatusObservation, readHostStatus } from "./host-status.ts";
-import { managedSshArgs } from "./ssh-transport.ts";
+import { codexOAuthSshArgs, managedSshArgs } from "./ssh-transport.ts";
 import { runtimeInventoryAsync } from "./runtime/task.ts";
 import {
   archiveMissingTaskRegistrations,
@@ -339,7 +339,7 @@ export function runRemoteTaskCommand(
   return runRemoteCommand(reference, [task, ...args], tty);
 }
 
-export function runRemoteCommand(reference: string, args: readonly string[], tty = true): number {
+function requireRemoteMachine(reference: string): RemoteMachine {
   const normalized = reference.toLowerCase();
   const matches = listRemoteMachines().filter(
     (machine) =>
@@ -349,7 +349,26 @@ export function runRemoteCommand(reference: string, args: readonly string[], tty
   );
   if (!matches.length) throw new Error(`Unknown machine "${reference}".`);
   if (matches.length > 1) throw new Error(`Machine reference "${reference}" is ambiguous.`);
-  const machine = matches[0]!;
+  return matches[0]!;
+}
+
+export function runRemoteCodexOAuth(reference: string): number {
+  const machine = requireRemoteMachine(reference);
+  process.stdout.write(
+    `Signing in to ChatGPT on ${machine.name} using your normal SSH account. Open the printed sign-in URL in this workstation's browser. The localhost callback is forwarded for this login only; Docker stores and refreshes the credential on ${machine.name} for future tasks.\n`,
+  );
+  const result = spawnSync("ssh", codexOAuthSshArgs(machine.sshHost), { stdio: "inherit" });
+  if (result.error) throw new Error(`Could not start remote OAuth: ${result.error.message}`);
+  if (result.status !== 0)
+    throw new Error(
+      "Remote ChatGPT host login failed. Check normal SSH access and that local port 1455 is free, then retry.",
+    );
+  process.stdout.write(`ChatGPT host credential saved on ${machine.name}. New tasks reuse it.\n`);
+  return 0;
+}
+
+export function runRemoteCommand(reference: string, args: readonly string[], tty = true): number {
+  const machine = requireRemoteMachine(reference);
   return (
     spawnSync("ssh", managedSshArgs(machine.sshHost, args, { tty }), {
       stdio: "inherit",

@@ -1,4 +1,5 @@
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -6,11 +7,16 @@ import {
   authenticateAgent,
   authenticateCodexSubscription,
   authenticateClaudeSubscription,
+  ensureNewTaskAuthentication,
   providerForAgent,
   remediationFor,
   servicesFromSecretOutput,
 } from "../../src/v2/auth.ts";
-import { DockerSandboxesRuntime } from "../../src/v2/runtime/docker-sandboxes.ts";
+import {
+  DockerSandboxesRuntime,
+  EXTERNAL_AUTH_PROBE,
+} from "../../src/v2/runtime/docker-sandboxes.ts";
+import { codexOAuthSshArgs } from "../../src/v2/ssh-transport.ts";
 import type { TaskManifest } from "../../src/v2/types.ts";
 
 const cleanup: string[] = [];
@@ -89,7 +95,8 @@ if [ "$1" = exec ]; then
     *"boxers-auth-probe"*)
       [ "$SBX_AUTH_TEST_STATE" = external_ready ] && exit 0
       [ "$SBX_AUTH_TEST_STATE" = external_rejected ] && exit 11
-      exit 12
+      [ "$SBX_AUTH_TEST_STATE" = scoped ] && exit 12
+      exit 13
       ;;
     *"codex "*"app-server"*)
       if [ "$SBX_AUTH_TEST_STATE" = task ] || [ "$SBX_AUTH_TEST_STATE" = imported ] || [ "$SBX_AUTH_TEST_STATE" = expired ]; then
@@ -177,7 +184,7 @@ describe("agent authentication", () => {
   });
 
   it("provides provider-specific non-interactive remediation", () => {
-    expect(remediationFor("codex")).toContain("device code");
+    expect(remediationFor("codex")).toContain("boxers auth codex --host");
     expect(remediationFor("claude")).toContain("Claude subscription");
     expect(remediationFor("claude")).toContain("interactive terminal");
   });
@@ -273,5 +280,62 @@ describe("agent authentication", () => {
     const status = await new DockerSandboxesRuntime().agentAuthenticationStatus(task());
     expect(status.state).toBe("ready");
     expect(status.restartRequired).toBeUndefined();
+  });
+
+  it("reuses a saved host credential across new tasks without starting login", async () => {
+    const calls = fakeSbx("openai");
+    process.env.SSH_CONNECTION = "client 123 remote 22";
+    await ensureNewTaskAuthentication("codex");
+    await ensureNewTaskAuthentication("codex");
+    expect(readFileSync(calls, "utf8")).not.toContain("secret set");
+    fakeSbx("anthropic");
+    await expect(ensureNewTaskAuthentication("codex")).rejects.toThrow("boxers auth codex --host");
+  });
+
+  it("uses normal SSH with a loopback-only callback for reusable remote OAuth", () => {
+    const args = codexOAuthSshArgs("imre@server");
+    expect(args).toContain("127.0.0.1:1455:127.0.0.1:1455");
+    expect(args).toContain("ExitOnForwardFailure=yes");
+    expect(args.slice(-6)).toEqual(["imre@server", "sbx", "secret", "set", "openai", "--oauth"]);
+    expect(args).not.toContain("-i");
+    expect(args).not.toContain("boxers-gateway-request");
+  });
+
+  it("probes ChatGPT OAuth on its own backend and never mistakes API rejection for OAuth expiry", () => {
+    const bin = mkdtempSync(join(tmpdir(), "boxers-proxy-probe-"));
+    cleanup.push(bin);
+    const log = join(bin, "calls");
+    writeFileSync(
+      join(bin, "curl"),
+      `#!/bin/sh
+printf '%s\\n' "$@" >> "$PROBE_LOG"
+case "$*" in
+  *https://chatgpt.com/backend-api/codex/responses*) printf '%s' "\${PROBE_HTTP_STATUS:-400}" ;;
+  *https://api.openai.com/v1/responses*) printf 401 ;;
+  *) exit 99 ;;
+esac
+`,
+    );
+    chmodSync(join(bin, "curl"), 0o755);
+    const probe = (mode: string, status = "400") =>
+      spawnSync("sh", ["-c", EXTERNAL_AUTH_PROBE, "test", "codex"], {
+        env: {
+          ...process.env,
+          PATH: `${bin}:${originalPath}`,
+          SBX_CRED_OPENAI_MODE: mode,
+          PROBE_LOG: log,
+          PROBE_HTTP_STATUS: status,
+          OPENAI_API_KEY: "test-key",
+        },
+      }).status;
+    expect(probe("oauth")).toBe(0);
+    const calls = readFileSync(log, "utf8");
+    expect(calls).toContain("https://chatgpt.com/backend-api/codex/responses");
+    expect(calls).not.toContain("https://api.openai.com");
+    expect(calls).toContain("Bearer oai-oat01-proxy-managed");
+    expect(probe("apikey")).toBe(11);
+    expect(probe("oauth", "401")).toBe(11);
+    for (const status of ["403", "429", "500", "000"]) expect(probe("oauth", status)).toBe(12);
+    expect(probe("none")).toBe(13);
   });
 });

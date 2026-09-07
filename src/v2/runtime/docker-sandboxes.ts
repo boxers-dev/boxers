@@ -151,6 +151,7 @@ function serviceIsConfigured(output: string, service: string): boolean {
 
 const CODEX_ACCOUNT_TIMEOUT_MS = 10_000;
 const EXTERNAL_AUTH_REJECTED = 11;
+const EXTERNAL_AUTH_MISSING = 13;
 function prepareCodexHome(runtimeId: string) {
   return command("sbx", [
     "exec",
@@ -163,14 +164,25 @@ function prepareCodexHome(runtimeId: string) {
   ]);
 }
 
-const EXTERNAL_AUTH_PROBE = `
+export const EXTERNAL_AUTH_PROBE = `
 agent="$1"
 if test "$agent" = codex; then
+  case "\${SBX_CRED_OPENAI_MODE:-none}" in
+    oauth)
+      endpoint=https://chatgpt.com/backend-api/codex/responses
+      bearer=oai-oat01-proxy-managed
+      ;;
+    apikey)
+      endpoint=https://api.openai.com/v1/responses
+      bearer="$OPENAI_API_KEY"
+      ;;
+    *) exit 13 ;;
+  esac
   status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
     --connect-timeout 3 --max-time 5 \
-    --header "Authorization: Bearer $OPENAI_API_KEY" \
+    --header "Authorization: Bearer $bearer" \
     --header 'Content-Type: application/json' \
-    --data '{}' https://api.openai.com/v1/responses)" || exit 12
+    --data '{}' "$endpoint")" || exit 12
 else
   status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
     --connect-timeout 3 --max-time 5 \
@@ -180,8 +192,10 @@ else
     --data '{}' https://api.anthropic.com/v1/messages)" || exit 12
 fi
 test "$status" = 401 && exit 11
-test "$status" = 000 && exit 12
-exit 0
+case "$status" in
+  2??|400|422) exit 0 ;;
+  *) exit 12 ;;
+esac
 `;
 
 function externalCredentialStatus(
@@ -206,6 +220,11 @@ function externalCredentialStatus(
     return {
       state: "reauth_required",
       detail: `${agent === "codex" ? "OpenAI" : "Anthropic"} rejected the proxy credential`,
+    };
+  if (result.status === EXTERNAL_AUTH_MISSING)
+    return {
+      state: "missing",
+      detail: "No Docker-managed OpenAI credential is bound to this task",
     };
   return {
     state: "external_unverified",
@@ -720,6 +739,15 @@ export class DockerSandboxesRuntime implements TaskRuntime {
   async agentAuthenticationStatus(task: TaskManifest): Promise<RuntimeAuthenticationStatus> {
     const authentication = harnessForAgent(task.agent).authentication;
     const id = runtimeId(task);
+    // Docker owns host OAuth storage, refresh, and the sandbox's provider route.
+    // New tasks must reuse that login before considering task-local device auth.
+    if (task.agent === "codex") {
+      const proxy = externalCredentialStatus(id, "codex");
+      if (proxy.state !== "missing") {
+        this.#taskLocalAuthentication.delete(id);
+        return proxy;
+      }
+    }
     const taskLocal =
       task.agent === "codex"
         ? await codexTaskAccountStatus(id)

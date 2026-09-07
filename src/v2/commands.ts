@@ -18,6 +18,7 @@ import { writeStderr, writeStdout } from "../core/output.ts";
 import {
   authenticateAgent,
   ensureTaskAuthentication,
+  ensureNewTaskAuthentication,
   isInteractive,
   isSshSession,
   remediationFor,
@@ -792,6 +793,7 @@ export async function newTask(name: string, options: NewTaskOptions): Promise<nu
   const effort = options.effort ?? config.defaults?.effort;
   const fast = options.fast ?? config.defaults?.fast;
   if (fast && agent !== "codex") throw new Error("--fast is supported only for Codex tasks.");
+  await ensureNewTaskAuthentication(agent);
   const template = resolveTemplate(agent, options.template);
   let task = createTaskManifest(project, name, agent, template, model, effort, fast);
   let previewUrls: string[] = [];

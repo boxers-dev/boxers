@@ -233,42 +233,49 @@ boxers auth status
 boxers auth codex
 boxers auth claude
 boxers auth status --host gpu-builder --refresh
+boxers auth codex --host gpu-builder
 boxers auth codex --host gpu-builder --api-key
 boxers auth claude --host gpu-builder
 boxers project status
 ```
 
 `status` is the overview for this machine and connected hosts. `doctor`
-performs detailed live diagnostics. The `auth` commands manage optional host
+performs detailed live diagnostics. The `auth` commands manage reusable host
 proxy credentials; their status reports whether a credential is stored, not
 whether the provider currently accepts it. Authentication state belongs to the
 host that runs the Sandbox: remote API credentials are entered on that host
 through the restricted fleet connection and are never forwarded from the
 initiating machine.
 
-ChatGPT and Claude subscription sessions live inside an individual durable task
-Sandbox. On `new` and `attach`, Boxers checks that task-local session and offers
-the provider-native flow when it is missing or needs renewal: Codex device
-login or `claude auth login --claudeai`. Codex is checked through its structured
-account API without forcing a token refresh; Codex handles renewal during normal
-use. Claude is checked with its native auth status.
+For Codex, sign in once per host with `boxers auth codex`. Docker stores and
+refreshes the ChatGPT OAuth credential on that host, and new tasks reuse it.
+New Codex tasks require this host credential before their Sandbox is created.
+Boxers checks Docker's configured route: ChatGPT OAuth uses the ChatGPT backend;
+API keys use the OpenAI API. An inconclusive network check does not trigger login.
 
-Task-local Codex credentials are stored in `/home/agent/.boxers/codex` inside
+From your workstation, `boxers auth codex --host gpu-builder` sets up the same
+reusable login remotely. It uses your normal SSH account (as initial fleet setup
+does) and temporarily forwards localhost port 1455 for the browser callback.
+Open the printed URL in your workstation's browser. The token is stored on the
+remote host. Local port 1455 must be free. Managed task SSH keys remain restricted
+and cannot forward ports. `--api-key` continues to use the managed fleet connection.
+
+Existing task-local Codex credentials are stored in `/home/agent/.boxers/codex` inside
 the durable Sandbox, outside Docker's managed Codex auth files. Existing
 conversation history remains shared so attach resumes the same session. Surviving
-ChatGPT credentials are preserved automatically; tasks whose credentials were
-already removed need one more device login. An inconclusive Codex account check
+ChatGPT credentials are preserved automatically. Tasks without a bound host
+credential can still resume their existing task-local login. An inconclusive Codex account check
 reports an error instead of requesting a new login.
 A Docker proxy credential is checked with a non-generating provider request.
 An accepted credential continues silently, a definite authentication rejection
-offers task login, and an inconclusive network check does not nag the user.
+asks you to renew the host login, and an inconclusive network check does not nag the user.
 After reauthentication, Boxers restarts only the daemon-owned provider process
 and resumes the existing provider-native conversation in the same Sandbox.
 
-Codex's global ChatGPT OAuth flow uses a localhost browser callback and is not
-available through the restricted fleet SSH connection. Use task-local device
-login for ChatGPT subscription access, or `--api-key` for a reusable remote-host
-credential.
+Claude subscription login remains task-local, using `claude auth login --claudeai`.
+Docker snapshots global credentials at Sandbox creation; configuring a host login
+later does not automatically bind it to an older task. Keep those tasks and their
+history; newly created tasks use the host login.
 
 For lower-level troubleshooting:
 

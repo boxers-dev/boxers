@@ -53,8 +53,28 @@ export function isSshSession(): boolean {
 
 export function remediationFor(agent: Agent): string {
   return agent === "codex"
-    ? 'Create or attach to the Codex task from an interactive terminal to sign in with a device code.'
-    : 'Create or attach to the Claude task from an interactive terminal to sign in with your Claude subscription.';
+    ? 'Run "boxers auth codex" on this host, or "boxers auth codex --host <host>" from your workstation. The host login is reused by new tasks.'
+    : "Create or attach to the Claude task from an interactive terminal to sign in with your Claude subscription.";
+}
+
+/** Establish Docker's reusable host credential before creating the sandbox. */
+export async function ensureNewTaskAuthentication(agent: Agent): Promise<void> {
+  if (agent !== "codex" || hasGlobalCredential(agent)) return;
+  if (!isInteractive() || isSshSession())
+    throw new Error(`No OpenAI host credential is configured. ${remediationFor(agent)}`);
+  const readline = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (
+      await readline.question("Sign in to ChatGPT once for this host and future tasks? [Y/n] ")
+    )
+      .trim()
+      .toLowerCase();
+    if (answer !== "" && answer !== "y" && answer !== "yes")
+      throw new Error(`Codex host authentication is required. ${remediationFor(agent)}`);
+  } finally {
+    readline.close();
+  }
+  authenticateAgent("codex");
 }
 
 export async function confirmAuthentication(
@@ -124,16 +144,19 @@ export interface TaskAuthenticationResult {
   status: RuntimeAuthenticationStatus;
 }
 
-export async function ensureTaskAuthentication(task: TaskManifest): Promise<TaskAuthenticationResult> {
+export async function ensureTaskAuthentication(
+  task: TaskManifest,
+): Promise<TaskAuthenticationResult> {
   const runtime = runtimeForTask(task);
   const before = await runtime.agentAuthenticationStatus(task);
   if (before.state === "ready") return { reauthenticated: false, status: before };
-  if (before.state === "external_unverified")
-    return { reauthenticated: false, status: before };
+  if (before.state === "external_unverified") return { reauthenticated: false, status: before };
   if (before.state === "unknown")
     throw new Error(
       `Could not verify ${task.agent} authentication for task ${task.name}: ${before.detail}`,
     );
+  if (task.agent === "codex" && before.state === "reauth_required")
+    throw new Error(`Docker's OpenAI host credential was rejected. ${remediationFor("codex")}`);
   if (!isInteractive())
     throw new Error(
       `${task.agent} authentication is required for task ${task.name}. Attach from an interactive terminal to sign in.`,

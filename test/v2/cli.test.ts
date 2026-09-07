@@ -26,6 +26,7 @@ vi.mock("../../src/v2/machines.ts", () => ({
   remoteSnapshot: vi.fn(() => 0),
   remoteWatch: vi.fn(() => 0),
   runRemoteCommand: vi.fn(() => 0),
+  runRemoteCodexOAuth: vi.fn(() => 0),
   runRemoteTaskCommand: vi.fn(() => 0),
 }));
 
@@ -314,12 +315,10 @@ describe("v2 CLI", () => {
     );
     await dispatch(["auth", "claude", "--host=server"]);
     expect(machines.runRemoteCommand).toHaveBeenLastCalledWith("server", ["auth", "claude"], true);
-    await expect(dispatch(["auth", "codex", "--host", "server"])).rejects.toThrow(
-      "remote Codex task",
-    );
-    await expect(dispatch(["auth", "codex", "--host", "server", "--oauth"])).rejects.toThrow(
-      "remote Codex task",
-    );
+    await expect(dispatch(["auth", "codex", "--host", "server"])).resolves.toBe(0);
+    expect(machines.runRemoteCodexOAuth).toHaveBeenLastCalledWith("server");
+    await expect(dispatch(["auth", "codex", "--host", "server", "--oauth"])).resolves.toBe(0);
+    expect(machines.runRemoteCodexOAuth).toHaveBeenLastCalledWith("server");
     await expect(dispatch(["auth", "codex", "--oauth", "--api-key"])).rejects.toBeInstanceOf(
       UsageError,
     );

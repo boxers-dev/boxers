@@ -113,7 +113,9 @@ if [ "$command_name" = exec ] && [ "$2" = sh ]; then cat > /dev/null; fi
       "<codex>",
     );
     expect(calls).toContain("run <codex> <--name>");
-    expect(calls).toContain('<--> <-c> <forced_login_method="chatgpt">');
+    expect(calls).toContain("<--> <--model>");
+    expect(calls).not.toContain("CODEX_HOME=/home/agent/.boxers/codex");
+    expect(calls).not.toContain("<app-server>");
     expect(calls).toContain("<--model> <gpt-example>");
     expect(calls).toContain('<model_reasoning_effort="high">');
     expect(calls).toContain('<service_tier="fast">');

@@ -40,6 +40,7 @@ import {
   remoteSnapshot,
   remoteWatch,
   runRemoteCommand,
+  runRemoteCodexOAuth,
   runRemoteTaskCommand,
 } from "./v2/machines.ts";
 import { projectCloneSource, requireProject } from "./v2/registry.ts";
@@ -84,6 +85,7 @@ General
 Auth
   boxers auth claude [--host <host>]
   boxers auth codex [--oauth|--api-key] [--host <host>]
+    ChatGPT login is saved per host; remote OAuth uses normal SSH with a temporary localhost:1455 callback tunnel.
   boxers auth status [--host <host>|--all] [--refresh] [--json]
 
 Project
@@ -522,9 +524,7 @@ export async function dispatch(argv: string[]): Promise<number> {
       throw new UsageError("--oauth and --api-key apply only to Codex authentication.");
     if (host) {
       if (agentValue === "codex" && !modeArgs.includes("--api-key"))
-        throw new UsageError(
-          "Remote Codex host authentication requires --api-key. For ChatGPT subscription access, create or attach to a remote Codex task and Boxers will offer device login inside its durable Sandbox.",
-        );
+        return runRemoteCodexOAuth(host);
       return runRemoteCommand(host, ["auth", agentValue as Agent, ...modeArgs], true);
     }
     return authenticate(

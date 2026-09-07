@@ -8,6 +8,28 @@ interface GatewayRequest {
   args: string[];
 }
 
+/** One-time host login uses the user's SSH account, as fleet enrollment does.
+ * Managed task keys intentionally remain unable to forward ports.
+ */
+export function codexOAuthSshArgs(host: string): string[] {
+  return [
+    "-t",
+    "-o",
+    "ConnectTimeout=8",
+    "-o",
+    "ExitOnForwardFailure=yes",
+    "-L",
+    "127.0.0.1:1455:127.0.0.1:1455",
+    "--",
+    host,
+    "sbx",
+    "secret",
+    "set",
+    "openai",
+    "--oauth",
+  ];
+}
+
 export function encodeGatewayRequest(args: readonly string[]): string {
   if (args.some((value) => typeof value !== "string" || value.includes("\0")))
     throw new Error("Invalid Boxers SSH gateway argument.");
