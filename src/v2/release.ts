@@ -3,6 +3,7 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readlinkSync,
   realpathSync,
@@ -12,7 +13,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, platform, arch } from "node:os";
+import { homedir, platform, arch, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync, gunzipSync } from "node:zlib";
@@ -376,7 +377,7 @@ export function installReleaseCapsule(capsule: Buffer, activate = true): Install
     throw new Error("The Boxers release has no dist/index.mjs executable.");
   chmodSync(executable, 0o755);
   const reported = requireSuccess(
-    command(executable, ["--version"]),
+    command(process.execPath, [executable, "--version"]),
     "Could not validate Boxers",
   ).trim();
   if (reported !== decoded.manifest.packageVersion)
@@ -490,5 +491,33 @@ export function activeReleaseBuildId(root = packageRoot()): string | undefined {
     return typeof value.buildId === "string" ? value.buildId : undefined;
   } catch {
     return undefined;
+  }
+}
+
+export function officialReleaseCapsule(packageName: string, version: string): Buffer {
+  if (!/^\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.-]+)?$/.test(version))
+    throw new Error(`Invalid Boxers version ${version}.`);
+  const temporary = mkdtempSync(join(tmpdir(), "boxers-official-release-"));
+  try {
+    requireSuccess(
+      command("npm", [
+        "install",
+        "--no-audit",
+        "--no-fund",
+        "--omit=dev",
+        "--package-lock=false",
+        "--prefix",
+        temporary,
+        `${packageName}@${version}`,
+      ]),
+      `Could not install Boxers ${version}`,
+    );
+    const installedRoot = join(temporary, "node_modules", ...packageName.split("/"));
+    const capsule = createReleaseCapsule(installedRoot);
+    if (decodeReleaseCapsule(capsule).manifest.packageVersion !== version)
+      throw new Error(`Installed Boxers did not match requested version ${version}.`);
+    return capsule;
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
   }
 }

@@ -1,3 +1,5 @@
+import { readVersion } from "../core/version.ts";
+import { daemonReleaseMatches } from "./daemon-identity.ts";
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { connect } from "node:net";
 import { daemonMain } from "./daemon.ts";
@@ -310,8 +312,7 @@ export async function runDaemonReplacement(
   const running = status();
   if (
     running.active &&
-    running.boxersBuildId === expectedBuildId &&
-    running.protocolVersion === DAEMON_PROTOCOL_VERSION
+    daemonReleaseMatches(running, { version: readVersion(), buildId: expectedBuildId })
   )
     return 0;
 
@@ -328,8 +329,7 @@ export async function runDaemonReplacement(
   const replacement = status();
   if (
     !replacement.active ||
-    replacement.boxersBuildId !== expectedBuildId ||
-    replacement.protocolVersion !== DAEMON_PROTOCOL_VERSION
+    !daemonReleaseMatches(replacement, { version: readVersion(), buildId: expectedBuildId })
   )
     throw new Error(
       `The replacement daemon did not start the activated Boxers build ${expectedBuildId.slice(0, 8)} (protocol ${DAEMON_PROTOCOL_VERSION}).`,

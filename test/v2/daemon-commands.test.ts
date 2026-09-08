@@ -1,3 +1,4 @@
+import { readVersion } from "../../src/core/version.ts";
 import { createServer, type Server } from "node:net";
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -108,6 +109,7 @@ describe("daemon lifecycle safety", () => {
       enabled: true,
       active: true,
       protocolVersion: replaced ? DAEMON_PROTOCOL_VERSION : DAEMON_PROTOCOL_VERSION - 1,
+      boxersVersion: readVersion(),
       boxersBuildId: replaced ? buildId : "b".repeat(64),
       platform: "test",
       detail: "test daemon",
@@ -138,6 +140,7 @@ describe("daemon lifecycle safety", () => {
           enabled: true,
           active: true,
           protocolVersion: DAEMON_PROTOCOL_VERSION,
+          boxersVersion: readVersion(),
           boxersBuildId: buildId,
           platform: "test",
           detail: "test daemon",
@@ -167,6 +170,7 @@ describe("daemon lifecycle safety", () => {
           enabled: true,
           active: true,
           protocolVersion: DAEMON_PROTOCOL_VERSION,
+          boxersVersion: readVersion(),
           boxersBuildId: replaced ? buildId : "b".repeat(64),
           platform: "test",
           detail: "test daemon",

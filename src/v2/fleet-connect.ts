@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { userInfo } from "node:os";
 import { resolve } from "node:path";
-import { readPackageName, readVersion } from "../core/version.ts";
+import { readVersion } from "../core/version.ts";
 import {
   ensureFleet,
   enrollFleetMember,
@@ -20,11 +20,20 @@ import { listRemoteMachines, queryRemoteMachine, type RemoteMachine } from "./ma
 import type { FleetMember, FleetRemoval, PeerRole } from "./types.ts";
 import {
   mergeFleetUpdateState,
+  createFleetReleaseIntent,
+  acknowledgeFleetRelease,
   readFleetUpdateState,
   type FleetUpdateState,
 } from "./fleet-update.ts";
 import type { RuntimeDiagnostic } from "./runtime/types.ts";
-import { installDaemonService } from "./service.ts";
+import { activateHostRelease } from "./host-release.ts";
+import { activeReleaseBuildId, createReleaseCapsule, decodeReleaseCapsule } from "./release.ts";
+import {
+  confirmFleetDowngrade,
+  newerRelease,
+  sendFleetReleaseWithBootstrap,
+} from "./fleet-release.ts";
+import { bootstrapHostRelease } from "./release-bootstrap.ts";
 import {
   authorizeManagedPeer,
   encodePeerAuthorization,
@@ -32,7 +41,7 @@ import {
   reconcileManagedPeerAuthorizations,
   revokeManagedPeer,
 } from "./ssh-identity.ts";
-import { managedSshArgs } from "./ssh-transport.ts";
+import { captureSsh } from "./ssh-transport.ts";
 
 const CONNECT_TIMEOUT_MS = 30_000;
 
@@ -45,6 +54,7 @@ export interface RemoteIdentity {
   machine: ReturnType<typeof localMachineIdentity>;
   publicKey: string;
   boxersVersion: string;
+  buildId?: string | undefined;
   executable: string;
   setupComplete: boolean;
   fleetId?: string;
@@ -54,109 +64,23 @@ export interface RemoteIdentity {
 
 function runSshCaptured(
   host: string,
-  remoteArgs: readonly string[],
+  args: readonly string[],
   input?: string,
-  timeoutMs = CONNECT_TIMEOUT_MS,
-  batchMode = false,
-  streamStderr = false,
-  description = "Remote operation",
+  timeout = CONNECT_TIMEOUT_MS,
 ): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(
-      "ssh",
-      [
-        ...(batchMode ? ["-o", "BatchMode=yes"] : []),
-        "-o",
-        "ConnectTimeout=8",
-        "--",
-        host,
-        ...remoteArgs,
-      ],
-      { stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"] },
-    );
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const finish = (error?: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (error) reject(error);
-      else resolve(stdout);
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      finish(new Error(`${description} on ${host} timed out after ${timeoutMs}ms.`));
-    }, timeoutMs);
-    child.stdout!.setEncoding("utf8");
-    child.stderr!.setEncoding("utf8");
-    child.stdout!.on("data", (chunk: string) => (stdout += chunk));
-    child.stderr!.on("data", (chunk: string) => {
-      stderr += chunk;
-      if (streamStderr) process.stderr.write(chunk);
-    });
-    child.on("error", (error) =>
-      finish(new Error(`${description} on ${host} could not start SSH: ${error.message}`)),
-    );
-    child.on("close", (code) =>
-      finish(
-        code === 0
-          ? undefined
-          : new Error(
-              `${description} on ${host} failed (exit ${code ?? 1})${
-                (stderr || stdout).trim() ? `:\n${(stderr || stdout).trim()}` : "."
-              }`,
-            ),
-      ),
-    );
-    if (input !== undefined) child.stdin!.end(input);
+  return captureSsh(host, args, {
+    managed: false,
+    timeout,
+    ...(input === undefined ? {} : { input }),
   });
 }
 
 function runManagedSshCaptured(
   host: string,
   args: readonly string[],
-  timeoutMs = CONNECT_TIMEOUT_MS,
-  acceptNewHostKey = false,
-  description = "Managed remote operation",
+  timeout = CONNECT_TIMEOUT_MS,
 ): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn("ssh", managedSshArgs(host, args, { acceptNewHostKey }), {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const finish = (error?: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (error) reject(error);
-      else resolve(stdout);
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      finish(new Error(`${description} on ${host} timed out after ${timeoutMs}ms.`));
-    }, timeoutMs);
-    child.stdout!.setEncoding("utf8");
-    child.stderr!.setEncoding("utf8");
-    child.stdout!.on("data", (chunk: string) => (stdout += chunk));
-    child.stderr!.on("data", (chunk: string) => (stderr += chunk));
-    child.on("error", (error) =>
-      finish(new Error(`${description} could not start SSH: ${error.message}`)),
-    );
-    child.on("close", (code) =>
-      finish(
-        code === 0
-          ? undefined
-          : new Error(
-              `${description} on ${host} failed (exit ${code ?? 1})${
-                (stderr || stdout).trim() ? `:\n${(stderr || stdout).trim()}` : "."
-              }`,
-            ),
-      ),
-    );
-  });
+  return captureSsh(host, args, { timeout, description: "Managed remote operation" });
 }
 
 function parseManagedSshIdentity(text: string): { publicKey: string; fingerprint: string } {
@@ -200,37 +124,6 @@ function parseIdentity(text: string): RemoteIdentity {
   return identity as RemoteIdentity;
 }
 
-function managedBootstrapScript(): string {
-  const packageName = readPackageName();
-  return [
-    "set -eu",
-    'version="$1"',
-    'printf "Checking Node.js and npm on the remote machine...\\n" >&2',
-    'command -v node >/dev/null 2>&1 || { printf "Node.js 20 or newer is required but node was not found.\\n" >&2; exit 1; }',
-    'command -v npm >/dev/null 2>&1 || { printf "npm is required but was not found.\\n" >&2; exit 1; }',
-    `node -e 'if (Number(process.versions.node.split(".")[0]) < 20) { console.error("Node.js 20 or newer is required; found " + process.version + "."); process.exit(1) }'`,
-    'install_root="${XDG_DATA_HOME:-$HOME/.local/share}/boxers/managed/$version"',
-    'mkdir -p "$install_root"',
-    `printf "Installing ${packageName}@%s...\\n" "$version" >&2`,
-    `npm install --no-audit --no-fund --omit=dev --prefix "$install_root" "${packageName}@$version" >&2`,
-    'executable="$install_root/node_modules/.bin/boxers"',
-    'test -x "$executable" || { printf "npm completed but did not create the Boxers executable at %s.\\n" "$executable" >&2; exit 1; }',
-    'installed_version="$("$executable" --version)"',
-    'test "$installed_version" = "$version" || { printf "Installed Boxers version %s, expected %s.\\n" "$installed_version" "$version" >&2; exit 1; }',
-    'bin_dir="$HOME/.local/bin"',
-    'mkdir -p "$bin_dir"',
-    'temporary="$bin_dir/.boxers.$$.tmp"',
-    "trap 'rm -f \"$temporary\"' EXIT",
-    'ln -s "$executable" "$temporary"',
-    'mv -f "$temporary" "$bin_dir/boxers"',
-    "trap - EXIT",
-    'printf "Installed Boxers %s at %s.\\n" "$version" "$bin_dir/boxers" >&2',
-    'printf "Reading the remote Boxers identity...\\n" >&2',
-    'BOXERS_EXECUTABLE="$bin_dir/boxers" exec "$bin_dir/boxers" remote identity',
-    "",
-  ].join("\n");
-}
-
 function runSshInteractive(host: string, remoteArgs: readonly string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn("ssh", ["-t", "-o", "ConnectTimeout=8", "--", host, ...remoteArgs], {
@@ -260,36 +153,48 @@ async function ensureRemoteSetup(host: string, identity: RemoteIdentity): Promis
   return refreshed;
 }
 
-async function discoverOrInstall(host: string, install: boolean): Promise<RemoteIdentity> {
+async function discoverOrInstall(
+  host: string,
+  install: boolean,
+  capsule: Buffer,
+): Promise<{ identity: RemoteIdentity; allowDowngrade: boolean }> {
+  const expected = decodeReleaseCapsule(capsule).manifest;
   process.stdout.write(`Checking Boxers on ${host}...\n`);
-  let installReason: string | undefined;
+  let identity: RemoteIdentity | undefined;
+  let reason: string;
   try {
-    const identity = parseIdentity(
+    identity = parseIdentity(
       await runSshCaptured(host, ["boxers", "remote", "identity"], undefined, 12_000),
     );
-    if (identity.boxersVersion === readVersion()) return identity;
-    installReason = `remote version ${identity.boxersVersion} does not match local ${readVersion()}`;
+    reason = `remote build ${identity.buildId ?? "unknown"} does not match ${expected.buildId}`;
   } catch (error) {
-    installReason = error instanceof Error ? error.message : String(error);
+    reason = error instanceof Error ? error.message : String(error);
   }
-  if (!install)
-    throw new Error(`Boxers is not available on ${host}: ${installReason ?? "unknown reason"}`);
-  const version = readVersion();
-  if (!/^\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.-]+)?$/.test(version))
-    throw new Error(`Cannot remotely install non-release Boxers version ${version}.`);
+  if (!install) {
+    if (identity?.buildId === expected.buildId) return { identity, allowDowngrade: false };
+    throw new Error(
+      `Boxers is not compatible on ${host}: ${reason}. Re-run without --no-install to align the exact build.`,
+    );
+  }
+  let allowDowngrade = false;
+  if (identity && newerRelease(identity.boxersVersion, expected.packageVersion)) {
+    allowDowngrade = await confirmFleetDowngrade(expected.packageVersion, [
+      {
+        machine: { id: identity.machine.id, name: identity.machine.name, sshHost: host },
+        version: identity.boxersVersion,
+      },
+    ]);
+    if (!allowDowngrade)
+      throw new Error("Connection cancelled because it would downgrade the remote Boxers release.");
+  }
+  // Re-activate even an identical build to repair its launcher and daemon.
   process.stdout.write(
-    `Remote Boxers installation is required: ${installReason ?? "not available"}.\n`,
+    `Aligning Boxers ${expected.packageVersion} (${expected.buildId.slice(0, 8)}) on ${host}...\n`,
   );
-  const output = await runSshCaptured(
-    host,
-    ["sh", "-s", "--", version],
-    managedBootstrapScript(),
-    180_000,
-    false,
-    true,
-    `Boxers ${version} installation`,
-  );
-  return parseIdentity(output);
+  const installed = parseIdentity(await bootstrapHostRelease(host, capsule));
+  if (installed.buildId !== expected.buildId || installed.boxersVersion !== expected.packageVersion)
+    throw new Error("Remote Boxers activation did not confirm the requested build.");
+  return { identity: installed, allowDowngrade };
 }
 
 export function remoteIdentity(): RemoteIdentity {
@@ -302,6 +207,7 @@ export function remoteIdentity(): RemoteIdentity {
     machine: localMachineIdentity(),
     publicKey: localHostKey().publicKey,
     boxersVersion: readVersion(),
+    buildId: activeReleaseBuildId(),
     executable: executablePath(process.env.BOXERS_EXECUTABLE ?? process.argv[1] ?? "boxers"),
     setupComplete,
     ...(fleet ? { fleetId: fleet.fleetId } : {}),
@@ -482,27 +388,19 @@ export async function connectHost(
     admin: boolean;
   },
   dependencies: {
-    installService: typeof installDaemonService;
-  } = { installService: installDaemonService },
+    activateRelease: typeof activateHostRelease;
+    createCapsule: typeof createReleaseCapsule;
+  } = { activateRelease: activateHostRelease, createCapsule: createReleaseCapsule },
 ): Promise<number> {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._@:-]*$/.test(options.host))
     throw new Error("SSH host must be a non-option SSH host or config alias.");
   if (options.reverseHost && !/^[a-zA-Z0-9][a-zA-Z0-9._@:-]*$/.test(options.reverseHost))
     throw new Error("Reverse SSH host must be a non-option SSH host or config alias.");
-  const localExecutableValue = process.env.BOXERS_EXECUTABLE ?? process.argv[1];
-  const localExecutable = localExecutableValue ? executablePath(localExecutableValue) : undefined;
-  let localServiceWarning: string | undefined;
-  if (localExecutable && !localExecutable.endsWith(".ts")) {
-    try {
-      dependencies.installService(localExecutable);
-    } catch (error) {
-      localServiceWarning = error instanceof Error ? error.message : String(error);
-    }
-  }
-  const remote = await ensureRemoteSetup(
-    options.host,
-    await discoverOrInstall(options.host, options.install),
-  );
+  const capsule = dependencies.createCapsule();
+  const local = await dependencies.activateRelease(capsule);
+  const localExecutable = local.stableExecutable;
+  const discovered = await discoverOrInstall(options.host, options.install, capsule);
+  const remote = await ensureRemoteSetup(options.host, discovered.identity);
   const localSsh = ensureManagedSshIdentity();
   const remoteSsh = parseManagedSshIdentity(
     await runSshCaptured(options.host, [remote.executable, "remote", "ssh-identity"]),
@@ -546,7 +444,6 @@ export async function connectHost(
   validateFleetMember(localMember);
   const previouslyEnrolled = fleet.members.some((member) => member.hostId === remoteMember.hostId);
   let reciprocalFleet: string | undefined;
-  let serviceWarning: string | undefined;
   try {
     await runSshCaptured(options.host, [
       remote.executable,
@@ -570,6 +467,21 @@ export async function connectHost(
           CONNECT_TIMEOUT_MS,
         )
       : undefined;
+    // Learn any pending generation before publishing the selected build. Otherwise
+    // a reconnect can immediately roll back to the fleet's previous desired build.
+    if (reciprocalFleet) acceptFleetSyncResponse(reciprocalFleet);
+    createFleetReleaseIntent(local.manifest, discovered.allowDowngrade);
+    const releaseState = acknowledgeFleetRelease();
+    await sendFleetReleaseWithBootstrap(
+      {
+        id: remoteMember.hostId,
+        name: remoteMember.name,
+        sshHost: options.host,
+        executable: remote.executable,
+      },
+      releaseState,
+      capsule,
+    );
     await runManagedSshCaptured(
       options.host,
       ["remote", "verify-peer", localMachineIdentity().id, "--accept-new-host-key"],
@@ -605,17 +517,6 @@ export async function connectHost(
       `Could not establish managed reciprocal SSH between ${options.host} and ${reverseTarget}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  try {
-    await runManagedSshCaptured(options.host, [
-      "service",
-      "install",
-      "--executable",
-      remote.executable,
-    ]);
-  } catch (error) {
-    serviceWarning = error instanceof Error ? error.message : String(error);
-  }
-  if (reciprocalFleet) acceptFleetSyncResponse(reciprocalFleet);
   const gossip = await gossipFleetMembership();
   for (const failure of gossip.failures)
     process.stderr.write(
@@ -628,19 +529,7 @@ export async function connectHost(
     process.stdout.write(
       `${diagnostic.status === "ok" ? "ok" : diagnostic.status.toUpperCase()}  ${remoteMember.name} ${diagnostic.component}: ${diagnostic.detail}\n`,
     );
-  if (serviceWarning)
-    process.stderr.write(
-      `warning: reciprocal enrollment succeeded, but the remote daemon service could not be installed: ${serviceWarning}\n`,
-    );
-  if (localServiceWarning)
-    process.stderr.write(
-      `warning: reciprocal enrollment succeeded, but the local daemon service could not be installed: ${localServiceWarning}\n`,
-    );
-  return serviceWarning ||
-    localServiceWarning ||
-    remote.diagnostics.some((diagnostic) => diagnostic.status === "failed")
-    ? 1
-    : 0;
+  return remote.diagnostics.some((diagnostic) => diagnostic.status === "failed") ? 1 : 0;
 }
 
 export async function disconnectHost(reference: string): Promise<number> {

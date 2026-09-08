@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process";
+import { managedInvocation } from "./core/launcher.ts";
 import { dispatch, UsageError } from "./cli.ts";
 import { error as printError } from "./core/ui.ts";
 import { isDaemonBackedTaskInvocation } from "./core/entrypoint.ts";
@@ -5,9 +7,12 @@ import { runDaemonIntent } from "./v2/daemon-client.ts";
 
 try {
   const args = process.argv.slice(2);
-  process.exitCode = isDaemonBackedTaskInvocation(args)
-    ? await runDaemonIntent(args)
-    : await dispatch(args);
+  const managed = managedInvocation(args);
+  process.exitCode = managed
+    ? (spawnSync(managed.command, managed.args, { stdio: "inherit" }).status ?? 1)
+    : isDaemonBackedTaskInvocation(args)
+      ? await runDaemonIntent(args)
+      : await dispatch(args);
 } catch (err) {
   if (err instanceof UsageError) {
     printError(err.message);

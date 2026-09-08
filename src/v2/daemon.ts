@@ -921,6 +921,7 @@ export function runDaemon(
             requestId: message.requestId,
             protocolVersion: DAEMON_PROTOCOL_VERSION,
             boxersVersion: readVersion(),
+            boxersBuildId: activeReleaseBuildId(),
             epoch,
             revision,
           });

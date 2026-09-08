@@ -53,7 +53,7 @@ export interface PrepareShutdownRequest {
   expectedBuildId?: string;
 }
 
-export const DAEMON_PROTOCOL_VERSION = 7;
+export const DAEMON_PROTOCOL_VERSION = 8;
 
 export interface HelloRequest {
   type: "hello";
@@ -191,6 +191,7 @@ export interface HelloMessage {
   requestId: string;
   protocolVersion: number;
   boxersVersion: string;
+  boxersBuildId?: string | undefined;
   epoch: string;
   revision: number;
 }

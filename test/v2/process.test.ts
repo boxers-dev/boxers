@@ -42,6 +42,20 @@ describe("bounded synchronous commands", () => {
 });
 
 describe("streaming commands", () => {
+  it("streams binary input without changing bytes", async () => {
+    const input = Buffer.from([0, 255, 10, 13, 128]);
+    const result = await commandStreaming(
+      process.execPath,
+      [
+        "-e",
+        "const fs=require('node:fs'); process.stdout.write(fs.readFileSync(0).toString('hex'));",
+      ],
+      { input },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe(input.toString("hex"));
+  });
+
   it("delivers output while the child is still running", async () => {
     let finished = false;
     let streamedBeforeFinish = false;

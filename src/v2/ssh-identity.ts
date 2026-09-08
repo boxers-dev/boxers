@@ -158,6 +158,8 @@ function assertSafeAuthorizedKeys(path: string): void {
 
 export function authorizeManagedPeer(hostId: string, publicKey: string, executable: string): void {
   if (!HOST_ID.test(hostId)) throw new Error("Invalid managed SSH peer host ID.");
+  if (!EXECUTABLE.test(process.execPath))
+    throw new Error("Invalid Boxers Node.js executable path.");
   if (!EXECUTABLE.test(executable)) throw new Error("Invalid Boxers gateway executable path.");
   const path = authorizedKeysPath();
   withPidFileLock(authorizedKeysLockPath(), () => {
@@ -169,7 +171,7 @@ export function authorizeManagedPeer(hostId: string, publicKey: string, executab
     const key = canonicalSshPublicKey(publicKey, `boxers:${hostId}`);
     lines.push(
       marker(hostId),
-      `command="env BOXERS_HOME=${shellSingleQuote(boxersHome())} ${executable} remote gateway ${hostId}",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc ${key}`,
+      `command="env BOXERS_HOME=${shellSingleQuote(boxersHome())} ${process.execPath} ${executable} remote gateway ${hostId}",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc ${key}`,
     );
     atomicWriteText(path, `${lines.join("\n")}\n`, 0o600);
   });

@@ -55,7 +55,8 @@ describe("daemon service executable resolution", () => {
       process.env.BOXERS_HOME = join(root, "state");
       process.env.PATH = `${bin}:${previous.path ?? ""}`;
 
-      installDaemonService(stable);
+      expect(resolveBoxersExecutable(stable)).toBe(stable);
+      installDaemonService(resolveBoxersExecutable(stable));
 
       const unit = readFileSync(join(root, ".config", "systemd", "user", "boxers.service"), "utf8");
       expect(unit).toContain(`ExecStart="${process.execPath}" "${stable}" __daemon-run`);

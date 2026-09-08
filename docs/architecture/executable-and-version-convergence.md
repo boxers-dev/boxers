@@ -1,7 +1,10 @@
 # Executable and version convergence
 
-Status: proposed. This document records a reproduced multi-host compatibility
-failure and recommends a simpler executable and protocol model.
+Status: historical diagnosis and proposal. The shared lifecycle refactor is
+recorded in [Shared command lifecycle review](shared-command-lifecycle.md),
+including the implemented activation, launcher, and protocol changes. The
+reproduced state and remaining projection suggestions below describe the earlier
+incident.
 
 ## Summary
 
@@ -116,15 +119,15 @@ operations honor it, while a full second CLI remains reachable interactively.
 
 The code uses several identifiers with distinct purposes:
 
-| Identifier | Current purpose |
-| --- | --- |
-| Package version | Human-facing release name and upgrade/downgrade ordering |
-| Build ID | Hash-derived identity of the exact release manifest and files |
-| Daemon Boxers version | Package version reported by the daemon binary |
-| Daemon protocol version | CLI-to-local-daemon message compatibility |
-| Task-view protocol version | Host-to-host projection compatibility |
-| Watch protocol version | Peer invalidation stream compatibility |
-| Persisted state versions | On-disk schema compatibility for individual records |
+| Identifier                 | Current purpose                                               |
+| -------------------------- | ------------------------------------------------------------- |
+| Package version            | Human-facing release name and upgrade/downgrade ordering      |
+| Build ID                   | Hash-derived identity of the exact release manifest and files |
+| Daemon Boxers version      | Package version reported by the daemon binary                 |
+| Daemon protocol version    | CLI-to-local-daemon message compatibility                     |
+| Task-view protocol version | Host-to-host projection compatibility                         |
+| Watch protocol version     | Peer invalidation stream compatibility                        |
+| Persisted state versions   | On-disk schema compatibility for individual records           |
 
 The daemon does not have an independent semantic version. Its reported Boxers
 version is the package version of the executable that launched it. Calling this

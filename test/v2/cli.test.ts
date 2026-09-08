@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("../../src/v2/commands.ts", () => ({
   attach: vi.fn(),
+  executeTaskIntent: vi.fn(() => 0),
   authenticate: vi.fn(() => 0),
   check: vi.fn(),
   cloneAndInitializeProject: vi.fn(),
@@ -527,7 +528,7 @@ describe("v2 CLI", () => {
     await expect(dispatch(["task", "shell"])).rejects.toBeInstanceOf(UsageError);
     await expect(dispatch(["task", "rm"])).rejects.toBeInstanceOf(UsageError);
     await dispatch(["task", "sync"]);
-    expect(commands.sync).toHaveBeenCalledWith("task");
+    expect(commands.executeTaskIntent).toHaveBeenCalledWith("task", { kind: "sync" });
   });
 
   it("limits --remote-path to remote task creation", async () => {
@@ -611,23 +612,36 @@ describe("v2 CLI", () => {
 
   it("dispatches check and parses the explicit promotion check override", async () => {
     await dispatch(["task", "check"]);
-    expect(commands.check).toHaveBeenCalledWith("task");
+    expect(commands.executeTaskIntent).toHaveBeenCalledWith("task", { kind: "check" });
     await dispatch(["task", "setup"]);
-    expect(commands.setup).toHaveBeenCalledWith("task");
+    expect(commands.executeTaskIntent).toHaveBeenCalledWith("task", { kind: "setup" });
 
     await dispatch(["task", "promote", "--skip-checks", "--message", "Ship candidate"]);
-    expect(commands.promote).toHaveBeenCalledWith("task", "Ship candidate", true);
+    expect(commands.executeTaskIntent).toHaveBeenCalledWith("task", {
+      kind: "promote",
+      message: "Ship candidate",
+      skipChecks: true,
+    });
 
     await dispatch(["task", "promote"]);
-    expect(commands.promote).toHaveBeenLastCalledWith("task", undefined, false);
+    expect(commands.executeTaskIntent).toHaveBeenLastCalledWith("task", {
+      kind: "promote",
+      skipChecks: false,
+    });
     await expect(dispatch(["task", "promote", "--force"])).rejects.toBeInstanceOf(UsageError);
   });
 
   it("shows a preview when no preview action is given", async () => {
     await dispatch(["mytask", "preview"]);
-    expect(commands.preview).toHaveBeenCalledWith("mytask", "show");
+    expect(commands.executeTaskIntent).toHaveBeenCalledWith("mytask", {
+      kind: "preview",
+      action: "show",
+    });
 
     await dispatch(["mytask", "preview", "logs"]);
-    expect(commands.preview).toHaveBeenLastCalledWith("mytask", "logs");
+    expect(commands.executeTaskIntent).toHaveBeenLastCalledWith("mytask", {
+      kind: "preview",
+      action: "logs",
+    });
   });
 });

@@ -1,3 +1,4 @@
+import { TASK_VIEW_PROTOCOL_VERSION } from "../../src/v2/types.ts";
 import { describe, expect, it } from "vitest";
 import { PeerRefreshCoordinator } from "../../src/v2/peer-cache.ts";
 import type { RemoteMachine } from "../../src/v2/machines.ts";
@@ -28,7 +29,7 @@ const online: MachineView = {
   name: machine.name,
   connection: "online",
   snapshot: {
-    protocolVersion: 3,
+    protocolVersion: TASK_VIEW_PROTOCOL_VERSION,
     machine: {
       version: 1,
       id: machine.id,

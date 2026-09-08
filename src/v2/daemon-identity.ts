@@ -1,3 +1,4 @@
+import { DAEMON_PROTOCOL_VERSION } from "./daemon-protocol.ts";
 import { readFileSync } from "node:fs";
 import { command } from "./process.ts";
 
@@ -30,4 +31,20 @@ export function isBoxersDaemonCommand(commandLine: string): boolean {
 export function processIsBoxersDaemon(pid: number): boolean {
   const commandLine = daemonProcessCommandLine(pid);
   return commandLine !== undefined && isBoxersDaemonCommand(commandLine);
+}
+
+/** One compatibility rule for activation, health reporting, and client handshakes. */
+export function daemonReleaseMatches(
+  observed: {
+    protocolVersion?: number;
+    boxersVersion?: string;
+    boxersBuildId?: string | undefined;
+  },
+  expected: { version: string; buildId?: string | null | undefined },
+): boolean {
+  return (
+    observed.protocolVersion === DAEMON_PROTOCOL_VERSION &&
+    observed.boxersVersion === expected.version &&
+    (!expected.buildId || observed.boxersBuildId === expected.buildId)
+  );
 }

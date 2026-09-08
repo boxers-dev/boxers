@@ -1,16 +1,10 @@
-import {
-  chmodSync,
-  mkdtempSync,
-  mkdirSync,
-  readlinkSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
+import * as release from "../../src/v2/release.ts";
+import * as hostRelease from "../../src/v2/host-release.ts";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { activateManagedExecutable, doctorFleet } from "../../src/v2/fleet-admin.ts";
+import { acceptManagedUpdate, encodeAdminRequest, doctorFleet } from "../../src/v2/fleet-admin.ts";
 import { enrollFleetMember, ensureFleet } from "../../src/v2/fleet.ts";
 import {
   canonicalSshPublicKey,
@@ -30,41 +24,28 @@ afterEach(() => {
   for (const directory of cleanup.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
-function executable(directory: string, name: string, version: string): string {
-  const path = join(directory, name);
-  writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' '${version}'\n`);
-  chmodSync(path, 0o755);
-  return path;
-}
-
 describe("managed fleet update activation", () => {
-  it("leaves the previous stable executable untouched until validation and service setup pass", () => {
-    const directory = mkdtempSync(join(tmpdir(), "boxers-managed-update-"));
-    cleanup.push(directory);
-    const installs = join(directory, "installs");
-    const bin = join(directory, "bin");
-    mkdirSync(installs);
-    mkdirSync(bin);
-    const previous = executable(installs, "previous", "1.0.0");
-    const candidate = executable(installs, "candidate", "2.0.0");
-    const invalid = executable(installs, "invalid", "9.9.9");
-    const stable = join(bin, "boxers");
-    symlinkSync(previous, stable);
-
-    expect(() => activateManagedExecutable(invalid, "2.0.0", stable, () => undefined)).toThrow(
-      "expected 2.0.0",
-    );
-    expect(readlinkSync(stable)).toBe(previous);
-
-    expect(() =>
-      activateManagedExecutable(candidate, "2.0.0", stable, () => {
-        throw new Error("service failed");
-      }),
-    ).toThrow("service failed");
-    expect(readlinkSync(stable)).toBe(previous);
-
-    activateManagedExecutable(candidate, "2.0.0", stable, () => undefined);
-    expect(readlinkSync(stable)).toBe(candidate);
+  it("routes legacy npm updates through shared release activation", async () => {
+    const state = mkdtempSync(join(tmpdir(), "boxers-managed-update-"));
+    cleanup.push(state);
+    process.env.BOXERS_HOME = state;
+    ensureFleet();
+    const capsule = Buffer.from("fixture capsule");
+    vi.spyOn(release, "officialReleaseCapsule").mockReturnValue(capsule);
+    const activate = vi.spyOn(hostRelease, "activateHostRelease").mockResolvedValue({
+      manifest: { packageVersion: "2.0.0" } as release.ReleaseManifest,
+      executable: "/managed/release/dist/index.mjs",
+      stableExecutable: "/managed/bin/boxers",
+      runtimeInstalled: true,
+      daemonReplacementRequired: true,
+    });
+    await expect(acceptManagedUpdate(encodeAdminRequest("2.0.0"))).resolves.toEqual({
+      version: "2.0.0",
+      executable: "/managed/bin/boxers",
+      daemonRestartRequired: true,
+    });
+    expect(release.officialReleaseCapsule).toHaveBeenCalledWith("@boxers-dev/boxers", "2.0.0");
+    expect(activate).toHaveBeenCalledWith(capsule);
   });
 
   it("fans doctor out while retaining partial-outage results", async () => {

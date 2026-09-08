@@ -19,9 +19,21 @@ describe("interactive daemon client input", () => {
     expect(
       daemonSpawnCommand("/old/release/dist/index.mjs", "/home/user/.local/bin/boxers"),
     ).toEqual({
-      command: "/home/user/.local/bin/boxers",
-      args: ["__daemon-run"],
+      command: process.execPath,
+      args: ["/home/user/.local/bin/boxers", "__daemon-run"],
     });
+  });
+
+  it("rejects ambiguous task arguments through the shared parser", () => {
+    expect(() => parseDaemonIntent(["task", "preview", "start", "extra"])).toThrow(
+      "preview accepts",
+    );
+    expect(() =>
+      parseDaemonIntent(["task", "promote", "--message", "first", "--message=second"]),
+    ).toThrow("only be specified once");
+    expect(() => parseDaemonIntent(["task", "promote", "--message", "--skip-checks"])).toThrow(
+      "requires a value",
+    );
   });
 
   it("keeps source development launches on the TypeScript runner", () => {

@@ -1,3 +1,4 @@
+import { TASK_VIEW_PROTOCOL_VERSION } from "../../src/v2/types.ts";
 import { describe, expect, it } from "vitest";
 import { formatMachineViews, parseRemoteSnapshot } from "../../src/v2/machines.ts";
 import type { RemoteSnapshot, TaskView } from "../../src/v2/types.ts";
@@ -17,7 +18,7 @@ const view = (changes: TaskView["changes"]["state"] = "unknown"): TaskView => ({
 });
 
 const snapshot: RemoteSnapshot = {
-  protocolVersion: 3,
+  protocolVersion: TASK_VIEW_PROTOCOL_VERSION,
   machine: {
     version: 1,
     id: "host-id",
@@ -49,6 +50,12 @@ const snapshot: RemoteSnapshot = {
 };
 
 describe("multi-machine protocol", () => {
+  it("identifies the previous incompatible project schema as a protocol mismatch", () => {
+    expect(() => parseRemoteSnapshot(JSON.stringify({ ...snapshot, protocolVersion: 3 }))).toThrow(
+      "Unsupported remote task-view protocol version 3",
+    );
+  });
+
   it("accepts protocol v3 and rejects flattened or incompatible snapshots", () => {
     expect(parseRemoteSnapshot(JSON.stringify(snapshot))).toEqual(snapshot);
     expect(
@@ -88,9 +95,9 @@ describe("multi-machine protocol", () => {
     expect(() => parseRemoteSnapshot(JSON.stringify({ ...snapshot, protocolVersion: 1 }))).toThrow(
       "Unsupported remote task-view protocol version 1",
     );
-    expect(() => parseRemoteSnapshot(JSON.stringify({ protocolVersion: 3 }))).toThrow(
-      "invalid snapshot",
-    );
+    expect(() =>
+      parseRemoteSnapshot(JSON.stringify({ protocolVersion: TASK_VIEW_PROTOCOL_VERSION })),
+    ).toThrow("invalid snapshot");
     expect(() =>
       parseRemoteSnapshot(
         JSON.stringify({

@@ -1,7 +1,6 @@
+import { boxersLaunch } from "../core/launcher.ts";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { isDeepStrictEqual } from "node:util";
 import { localMachineIdentity } from "./registry.ts";
@@ -21,18 +20,15 @@ import {
   cachedReleaseCapsule,
   createReleaseCapsule,
   decodeReleaseCapsule,
-  installReleaseCapsule,
+  officialReleaseCapsule,
   stableExecutablePath,
 } from "./release.ts";
 import { listRemoteMachines, type RemoteMachine } from "./machines.ts";
-import { managedSshArgs } from "./ssh-transport.ts";
-import { reconcileManagedPeerAuthorizations } from "./ssh-identity.ts";
-import { installDaemonService } from "./service.ts";
-import { command, requireSuccess } from "./process.ts";
+import { captureSsh, managedSshArgs } from "./ssh-transport.ts";
 import { encodeAdminRequest } from "./fleet-admin.ts";
 import { readVersion } from "../core/version.ts";
 import { gossipFleetMembership } from "./fleet-connect.ts";
-import { boxersHome } from "./paths.ts";
+import { activateHostRelease } from "./host-release.ts";
 
 const REMOTE_UPDATE_TIMEOUT_MS = 5 * 60_000;
 const MAX_REMOTE_CAPSULE_BYTES = 64 * 1024 * 1024;
@@ -59,54 +55,6 @@ function decodeUpdateState(encoded: string): FleetUpdateState {
   }
 }
 
-function finalizeManagedActivation(packageVersion: string, buildId: string): boolean {
-  const fleet = readFleet();
-  if (fleet)
-    reconcileManagedPeerAuthorizations(
-      fleet.members,
-      fleet.removedMembers ?? [],
-      stableExecutablePath(),
-    );
-  try {
-    const service = installDaemonService(stableExecutablePath());
-    return Boolean(
-      service.active &&
-      (service.boxersVersion !== packageVersion || service.boxersBuildId !== buildId),
-    );
-  } catch {
-    // Unsupported service managers use the lazily started daemon path.
-    return true;
-  }
-}
-
-function replaceDaemon(buildId: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(stableExecutablePath(), ["__daemon-replace", buildId], {
-      detached: true,
-      stdio: ["ignore", "ignore", "pipe"],
-      env: { ...process.env, BOXERS_HOME: boxersHome() },
-    });
-    let stderr = "";
-    let settled = false;
-    const finish = (error?: Error): void => {
-      if (settled) return;
-      settled = true;
-      if (error) reject(error);
-      else resolve();
-    };
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => (stderr += chunk));
-    child.once("error", (error) => finish(error));
-    child.once("close", (code) =>
-      finish(
-        code === 0
-          ? undefined
-          : new Error(stderr.trim() || `Replacing the Boxers daemon exited ${code ?? 1}.`),
-      ),
-    );
-  });
-}
-
 async function activateDesiredRelease(capsule: Buffer): Promise<RemoteReleaseResult> {
   const state = readFleetUpdateState();
   const desired = state.desired;
@@ -121,12 +69,8 @@ async function activateDesiredRelease(capsule: Buffer): Promise<RemoteReleaseRes
   const decoded = decodeReleaseCapsule(capsule);
   if (!isDeepStrictEqual(decoded.manifest, desired.body.release))
     throw new Error("The streamed Boxers release does not match the fleet's desired manifest.");
-  const installed = installReleaseCapsule(capsule);
-  const daemonReplacementRequired = finalizeManagedActivation(
-    installed.manifest.packageVersion,
-    installed.manifest.buildId,
-  );
-  if (daemonReplacementRequired) await replaceDaemon(installed.manifest.buildId);
+  const installed = await activateHostRelease(capsule);
+  const { daemonReplacementRequired } = installed;
   const currentDesired = readFleetUpdateState().desired;
   if (
     currentDesired?.body.release.buildId !== installed.manifest.buildId ||
@@ -277,105 +221,42 @@ export async function reconcileFleetRelease(): Promise<{
   return { status };
 }
 
-export function sendFleetRelease(
+export async function sendFleetRelease(
   machine: RemoteMachine,
   state: FleetUpdateState,
   capsule: Buffer,
 ): Promise<RemoteReleaseResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(
-      "ssh",
-      managedSshArgs(machine.sshHost, ["remote", "install-release", encodeUpdateState(state)]),
-      { stdio: ["pipe", "pipe", "pipe"] },
-    );
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const finish = (error?: Error): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (error) reject(error);
-      else {
-        try {
-          const result = JSON.parse(stdout) as RemoteReleaseResult;
-          if (
-            result?.version !== 1 ||
-            result.hostId !== machine.id ||
-            result.buildId !== state.desired?.body.release.buildId ||
-            !result.update
-          )
-            throw new Error("Remote returned an invalid Boxers release result.");
-          mergeFleetUpdateState(result.update);
-          if (!fleetReleaseIsAcknowledged(machine.id))
-            throw new Error("Remote returned no valid Boxers release acknowledgement.");
-          resolve(result);
-        } catch (parseError) {
-          reject(parseError instanceof Error ? parseError : new Error(String(parseError)));
-        }
-      }
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      finish(new Error(`Updating ${machine.name} timed out.`));
-    }, REMOTE_UPDATE_TIMEOUT_MS);
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => (stdout += chunk));
-    child.stderr.on("data", (chunk: string) => (stderr += chunk));
-    child.on("error", (error) => finish(error));
-    child.on("close", (code) =>
-      finish(
-        code === 0
-          ? undefined
-          : new Error((stderr || stdout).trim() || `Updating ${machine.name} exited ${code ?? 1}.`),
-      ),
-    );
-    child.stdin.on("error", () => undefined);
-    child.stdin.end(capsule);
+  const stdout = await captureSsh(
+    machine.sshHost,
+    ["remote", "install-release", encodeUpdateState(state)],
+    {
+      input: capsule,
+      timeout: REMOTE_UPDATE_TIMEOUT_MS,
+      description: `Updating ${machine.name}`,
+    },
+  );
+  const result = JSON.parse(stdout) as RemoteReleaseResult;
+  if (
+    result?.version !== 1 ||
+    result.hostId !== machine.id ||
+    result.buildId !== state.desired?.body.release.buildId ||
+    !result.update
+  )
+    throw new Error("Remote returned an invalid Boxers release result.");
+  mergeFleetUpdateState(result.update);
+  if (!fleetReleaseIsAcknowledged(machine.id))
+    throw new Error("Remote returned no valid Boxers release acknowledgement.");
+  return result;
+}
+
+async function bootstrapRemoteProtocol(machine: RemoteMachine, version: string): Promise<void> {
+  await captureSsh(machine.sshHost, ["remote", "update", encodeAdminRequest(version)], {
+    timeout: REMOTE_UPDATE_TIMEOUT_MS,
+    description: `Bootstrapping the update protocol on ${machine.name}`,
   });
 }
 
-function bootstrapRemoteProtocol(machine: RemoteMachine, version: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(
-      "ssh",
-      managedSshArgs(machine.sshHost, ["remote", "update", encodeAdminRequest(version)]),
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const finish = (error?: Error): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (error) reject(error);
-      else resolve();
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      finish(new Error(`Bootstrapping the update protocol on ${machine.name} timed out.`));
-    }, REMOTE_UPDATE_TIMEOUT_MS);
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => (stdout += chunk));
-    child.stderr.on("data", (chunk: string) => (stderr += chunk));
-    child.on("error", (error) => finish(error));
-    child.on("close", (code) => {
-      if (code !== 0)
-        finish(
-          new Error(
-            (stderr || stdout).trim() ||
-              `Bootstrapping the update protocol on ${machine.name} exited ${code ?? 1}.`,
-          ),
-        );
-      else finish();
-    });
-  });
-}
-
-async function sendFleetReleaseWithBootstrap(
+export async function sendFleetReleaseWithBootstrap(
   machine: RemoteMachine,
   state: FleetUpdateState,
   capsule: Buffer,
@@ -458,36 +339,15 @@ function latestRegistryRelease(packageName: string): Promise<string | undefined>
   });
 }
 
-function remotePackageVersion(machine: RemoteMachine): Promise<string | undefined> {
-  return new Promise((resolve) => {
-    const child = spawn("ssh", managedSshArgs(machine.sshHost, ["remote", "identity"]), {
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    let stdout = "";
-    let settled = false;
-    const finish = (value?: string): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(value);
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      finish();
-    }, 12_000);
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => (stdout += chunk));
-    child.on("error", () => finish());
-    child.on("close", (code) => {
-      if (code !== 0) return finish();
-      try {
-        const value = JSON.parse(stdout) as { boxersVersion?: unknown };
-        finish(typeof value.boxersVersion === "string" ? value.boxersVersion : undefined);
-      } catch {
-        finish();
-      }
-    });
-  });
+async function remotePackageVersion(machine: RemoteMachine): Promise<string | undefined> {
+  try {
+    const value = JSON.parse(
+      await captureSsh(machine.sshHost, ["remote", "identity"], { timeout: 12_000 }),
+    ) as { boxersVersion?: unknown };
+    return typeof value.boxersVersion === "string" ? value.boxersVersion : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function confirmOfficialUpdate(current: string, latest: string): Promise<boolean> {
@@ -510,7 +370,7 @@ async function confirmOfficialUpdate(current: string, latest: string): Promise<b
   }
 }
 
-async function confirmFleetDowngrade(
+export async function confirmFleetDowngrade(
   current: string,
   machines: { machine: RemoteMachine; version: string }[],
 ): Promise<boolean> {
@@ -532,29 +392,6 @@ async function confirmFleetDowngrade(
   }
 }
 
-function installOfficialPackage(packageName: string, version: string): void {
-  const temporary = mkdtempSync(join(tmpdir(), "boxers-official-release-"));
-  try {
-    requireSuccess(
-      command("npm", [
-        "install",
-        "--no-audit",
-        "--no-fund",
-        "--omit=dev",
-        "--package-lock=false",
-        "--prefix",
-        temporary,
-        `${packageName}@${version}`,
-      ]),
-      `Could not install Boxers ${version}`,
-    );
-    const installedRoot = join(temporary, "node_modules", ...packageName.split("/"));
-    installReleaseCapsule(createReleaseCapsule(installedRoot));
-  } finally {
-    rmSync(temporary, { recursive: true, force: true });
-  }
-}
-
 export async function updateFleetRelease(
   options: { skipRegistry?: boolean } = {},
 ): Promise<number> {
@@ -566,8 +403,9 @@ export async function updateFleetRelease(
     if (latest && newerRelease(latest, active.packageVersion)) {
       if (await confirmOfficialUpdate(active.packageVersion, latest)) {
         process.stdout.write(`Installing Boxers ${latest} on this machine…\n`);
-        installOfficialPackage(active.packageName, latest);
-        const continued = spawnSync(stableExecutablePath(), ["__update-continue"], {
+        await activateHostRelease(officialReleaseCapsule(active.packageName, latest));
+        const launch = boxersLaunch(stableExecutablePath(), ["__update-continue"]);
+        const continued = spawnSync(launch.command, launch.args, {
           stdio: "inherit",
         });
         return continued.status ?? 1;
@@ -602,9 +440,7 @@ export async function updateFleetRelease(
       }
     }
   }
-  const local = installReleaseCapsule(capsule);
-  if (finalizeManagedActivation(local.manifest.packageVersion, local.manifest.buildId))
-    await replaceDaemon(local.manifest.buildId);
+  const local = await activateHostRelease(capsule);
   process.stdout.write(
     `Local machine is up to date with Boxers ${local.manifest.packageVersion} (${local.manifest.buildId.slice(0, 8)}).\n`,
   );
@@ -662,6 +498,7 @@ export function fleetReleaseNeedsDaemonReplacement(): boolean {
   const localId = localMachineIdentity().id;
   return (
     fleetReleaseIsAcknowledged(localId, state) &&
+    activeManagedBuildId() === desired.body.release.buildId &&
     activeReleaseBuildId() !== desired.body.release.buildId
   );
 }

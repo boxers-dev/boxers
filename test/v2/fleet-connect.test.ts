@@ -1,7 +1,19 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import * as fleetRelease from "../../src/v2/fleet-release.ts";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as hostRelease from "../../src/v2/host-release.ts";
+import * as release from "../../src/v2/release.ts";
+import * as bootstrap from "../../src/v2/release-bootstrap.ts";
 import { readVersion } from "../../src/core/version.ts";
 import {
   connectHost,
@@ -54,6 +66,37 @@ function directory(prefix: string): string {
 }
 
 function fixture(): { localHome: string; log: string; remoteId: string } {
+  const packageRoot = directory("boxers-connect-package-");
+  mkdirSync(join(packageRoot, "dist"));
+  writeFileSync(
+    join(packageRoot, "package.json"),
+    JSON.stringify({ name: "@boxers-dev/boxers", version: readVersion() }),
+  );
+  writeFileSync(join(packageRoot, "dist/index.mjs"), "// fixture");
+  const capsule = release.createReleaseCapsule(packageRoot);
+  const manifest = release.decodeReleaseCapsule(capsule).manifest;
+  vi.spyOn(release, "createReleaseCapsule").mockReturnValue(capsule);
+  vi.spyOn(hostRelease, "activateHostRelease").mockResolvedValue({
+    manifest,
+    stableExecutable: "boxers",
+    executable: "boxers",
+    runtimeInstalled: false,
+    daemonReplacementRequired: false,
+  });
+  vi.spyOn(fleetRelease, "sendFleetReleaseWithBootstrap").mockImplementation(
+    async (machine, state) => ({
+      version: 1,
+      hostId: machine.id,
+      buildId: manifest.buildId,
+      packageVersion: manifest.packageVersion,
+      runtimeInstalled: false,
+      daemonReplacementRequired: false,
+      update: state,
+    }),
+  );
+  vi.spyOn(bootstrap, "bootstrapHostRelease").mockImplementation(
+    async () => process.env.FAKE_REMOTE_IDENTITY!,
+  );
   const remoteHome = directory("boxers-connect-remote-");
   process.env.BOXERS_HOME = remoteHome;
   ensureFleet("fleet-id");
@@ -67,6 +110,7 @@ function fixture(): { localHome: string; log: string; remoteId: string } {
     machine: remoteMachine,
     publicKey: localHostKey().publicKey,
     boxersVersion: readVersion(),
+    buildId: manifest.buildId,
     executable: "boxers",
     setupComplete: true,
     fleetId: "fleet-id",
@@ -157,8 +201,11 @@ describe("reciprocal fleet connection", () => {
   it("streams bootstrap diagnostics and includes operation context in failures", async () => {
     fixture();
     process.env.FAKE_BOOTSTRAP_FAILURE = "1";
+    vi.mocked(bootstrap.bootstrapHostRelease).mockRejectedValue(
+      new Error("Installing the Boxers build on remote-box failed (exit 1): npm ERR! code E401"),
+    );
     vi.spyOn(process.stdout, "write").mockReturnValue(true);
-    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    vi.spyOn(process.stderr, "write").mockReturnValue(true);
 
     await expect(
       connectHost({
@@ -168,9 +215,8 @@ describe("reciprocal fleet connection", () => {
         admin: false,
       }),
     ).rejects.toThrow(
-      `Boxers ${readVersion()} installation on remote-box failed (exit 1):\nnpm ERR! code E401`,
+      "Installing the Boxers build on remote-box failed (exit 1): npm ERR! code E401",
     );
-    expect(stderr.mock.calls.flat().join("")).toContain("npm ERR! code E401");
   });
 
   it("runs machine initialization through a TTY only on the first connection", async () => {
@@ -318,51 +364,67 @@ describe("reciprocal fleet connection", () => {
     expect(readFileSync(join(localHome, "authorized_keys"), "utf8")).not.toContain(remoteId);
   });
 
-  it("keeps successful enrollment but reports remote service setup failure", async () => {
-    const { remoteId } = fixture();
-    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-    vi.spyOn(process.stdout, "write").mockReturnValue(true);
-    process.env.FAKE_SERVICE_FAIL = "1";
-
-    await expect(
-      connectHost({
-        host: "remote-box",
-        reverseHost: "local-box",
-        install: false,
-        admin: true,
-      }),
-    ).resolves.toBe(1);
-    expect(readFleet()?.members.some((member) => member.hostId === remoteId)).toBe(true);
-    expect(listRemoteMachines()).toContainEqual(expect.objectContaining({ id: remoteId }));
-    expect(stderr.mock.calls.flat().join("")).toContain(
-      "remote daemon service could not be installed",
+  it("does not enroll when shared host activation fails", async () => {
+    const { remoteId, log } = fixture();
+    vi.mocked(hostRelease.activateHostRelease).mockRejectedValue(
+      new Error("local service unavailable"),
     );
+    await expect(
+      connectHost({ host: "remote-box", reverseHost: "local-box", install: true, admin: true }),
+    ).rejects.toThrow("local service unavailable");
+    expect(readFleet()?.members.some((member) => member.hostId === remoteId)).toBe(false);
+    expect(existsSync(log)).toBe(false);
   });
 
-  it("keeps successful enrollment but reports local service setup failure", async () => {
-    const { remoteId } = fixture();
-    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-    vi.spyOn(process.stdout, "write").mockReturnValue(true);
-    process.argv[1] = "/opt/boxers/bin/boxers";
-
+  it("aligns equal versions with different builds before enrollment", async () => {
+    const { log } = fixture();
+    const identity = JSON.parse(process.env.FAKE_REMOTE_IDENTITY!);
+    process.env.FAKE_REMOTE_IDENTITY = JSON.stringify({ ...identity, buildId: "a".repeat(64) });
+    vi.mocked(bootstrap.bootstrapHostRelease).mockImplementation(async () => {
+      expect(readFileSync(log, "utf8")).not.toContain("remote enroll");
+      return JSON.stringify(identity);
+    });
     await expect(
-      connectHost(
-        {
-          host: "remote-box",
-          reverseHost: "local-box",
-          install: false,
-          admin: true,
-        },
-        {
-          installService: () => {
-            throw new Error("local service unavailable");
-          },
-        },
-      ),
-    ).resolves.toBe(1);
-    expect(readFleet()?.members.some((member) => member.hostId === remoteId)).toBe(true);
-    expect(stderr.mock.calls.flat().join("")).toContain(
-      "local daemon service could not be installed",
+      connectHost({ host: "remote-box", reverseHost: "local-box", install: true, admin: true }),
+    ).resolves.toBe(0);
+    expect(bootstrap.bootstrapHostRelease).toHaveBeenCalledWith("remote-box", expect.any(Buffer));
+  });
+
+  it("rejects an activation that confirms the wrong build before enrollment", async () => {
+    const { log } = fixture();
+    vi.mocked(bootstrap.bootstrapHostRelease).mockResolvedValue(
+      JSON.stringify({ ...JSON.parse(process.env.FAKE_REMOTE_IDENTITY!), buildId: "b".repeat(64) }),
     );
+    await expect(
+      connectHost({ host: "remote-box", reverseHost: "local-box", install: true, admin: true }),
+    ).rejects.toThrow("did not confirm the requested build");
+    expect(readFileSync(log, "utf8")).not.toContain("remote enroll");
+    expect(fleetRelease.sendFleetReleaseWithBootstrap).not.toHaveBeenCalled();
+  });
+
+  it("uses the shared downgrade policy before replacing a newer remote release", async () => {
+    fixture();
+    process.env.FAKE_REMOTE_IDENTITY = JSON.stringify({
+      ...JSON.parse(process.env.FAKE_REMOTE_IDENTITY!),
+      boxersVersion: "99.0.0",
+    });
+    const confirm = vi.spyOn(fleetRelease, "confirmFleetDowngrade").mockResolvedValue(false);
+    await expect(
+      connectHost({ host: "remote-box", reverseHost: "local-box", install: true, admin: true }),
+    ).rejects.toThrow("would downgrade");
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(bootstrap.bootstrapHostRelease).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unknown build with --no-install before enrollment", async () => {
+    const { log } = fixture();
+    const identity = JSON.parse(process.env.FAKE_REMOTE_IDENTITY!);
+    delete identity.buildId;
+    process.env.FAKE_REMOTE_IDENTITY = JSON.stringify(identity);
+    await expect(
+      connectHost({ host: "remote-box", reverseHost: "local-box", install: false, admin: true }),
+    ).rejects.toThrow("without --no-install");
+    expect(readFileSync(log, "utf8")).not.toContain("remote enroll");
+    expect(bootstrap.bootstrapHostRelease).not.toHaveBeenCalled();
   });
 });

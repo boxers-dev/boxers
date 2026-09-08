@@ -86,6 +86,13 @@ boxers fix-parser promote
   remote/base branch (`origin` by default). It never forces the target or advances
   your host checkout. The branch must permit direct pushes.
 
+`review`, `check`, `sync`, `setup`, `promote`, and preview start/restart share
+workspace preparation: wait for existing setup, require an idle agent, refresh
+and reconcile the canonical target, and capture the candidate. Commands wait
+for setup introduced by the new target before consuming that candidate. Explicit
+`setup` reconciles first and then retries setup once. Promotion can reuse the
+exact reviewed tree and resumes an accepted delivery before preparing new work.
+
 `promote` runs required checks itself, so `review` and `check` are useful but
 not mandatory steps.
 
@@ -165,8 +172,14 @@ boxers hosts rename <machine> <new-name>
 on the owning machine and propagated to the rest of the fleet. Use `local` to
 rename the machine running the command.
 
-On the first connection, Boxers installs the matching CLI release in the
-remote user's account and opens the normal interactive machine setup over SSH.
+`connect` distributes the exact local build to the remote user's account before
+enrollment, including development changes that share a published version number.
+It uses the same managed installation, service configuration, daemon replacement,
+and fleet release distribution as `update`. Both select the stable launcher at
+`~/.local/bin/boxers`. `--no-install` requires the remote to already report the
+exact build; a matching version number alone is insufficient.
+
+On the first connection, Boxers opens the normal interactive machine setup over SSH.
 That setup installs and authenticates Docker Sandboxes, initializes its network
 policy, offers agent authentication, and installs the daemon. Successful setup
 is recorded on the remote machine, so later connections skip it.
@@ -245,9 +258,18 @@ the next attach resumes provider-native history and interrupted recomputable
 work is observed or rerun. Boxers never downgrades a newer official release
 without an explicit fleet-wide confirmation.
 
-When Boxers is run from its own source checkout, `boxers update` builds that
-checkout automatically and distributes the resulting development build. No
-publish or package step is required.
+When Boxers is run from its own source checkout, `boxers connect` and
+`boxers update` build that checkout automatically and distribute the resulting
+development build. No publish or package step is required. Installed package
+launchers delegate ordinary commands to the active managed build; explicit
+source-checkout invocations remain available for development. Older published
+launchers without this delegation must be upgraded once, or invoked through
+`~/.local/bin/boxers` directly.
+
+The selected build is identified by its content hash. Daemon activation, client
+connections, and health reporting share the same version/build/protocol check.
+Project configuration stays with each project; both hosts use the same parser
+and task commands read configuration from the reconciled target commit.
 
 ## Health and authentication
 

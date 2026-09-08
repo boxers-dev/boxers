@@ -1,3 +1,6 @@
+import { activeManagedExecutable } from "./release.ts";
+import { boxersLaunch } from "../core/launcher.ts";
+import { commandStreaming } from "./process.ts";
 import { spawnSync } from "node:child_process";
 import { readFleet } from "./fleet.ts";
 import { ensureManagedSshIdentity } from "./ssh-identity.ts";
@@ -112,8 +115,10 @@ export function authorizeGatewayRequest(hostId: string, args: readonly string[])
 export function runSshGateway(hostId: string): number {
   const args = decodeGatewayRequest(process.env["SSH_ORIGINAL_COMMAND"]);
   authorizeGatewayRequest(hostId, args);
-  const executable = process.env["BOXERS_EXECUTABLE"] ?? process.argv[1] ?? "boxers";
-  return spawnSync(executable, args, { stdio: "inherit", env: process.env }).status ?? 1;
+  const executable =
+    activeManagedExecutable() ?? process.env["BOXERS_EXECUTABLE"] ?? process.argv[1] ?? "boxers";
+  const launch = boxersLaunch(executable, args);
+  return spawnSync(launch.command, launch.args, { stdio: "inherit", env: process.env }).status ?? 1;
 }
 
 export function managedSshArgs(
@@ -138,4 +143,42 @@ export function managedSshArgs(
     "boxers-gateway-request",
     encodeGatewayRequest(args),
   ];
+}
+
+/** Shared bounded transport for JSON/text RPCs, including streamed release input. */
+export async function captureSsh(
+  host: string,
+  args: readonly string[],
+  options: {
+    managed?: boolean;
+    timeout?: number;
+    input?: string | Buffer;
+    acceptNewHostKey?: boolean;
+    streamStderr?: boolean;
+    acceptNonZeroStdout?: boolean;
+    description?: string;
+  } = {},
+): Promise<string> {
+  const description = options.description ?? "Remote operation";
+  const sshArgs =
+    options.managed === false
+      ? ["-o", "ConnectTimeout=8", "--", host, ...args]
+      : managedSshArgs(host, args, { acceptNewHostKey: options.acceptNewHostKey ?? false });
+  const result = await commandStreaming("ssh", sshArgs, {
+    timeout: options.timeout ?? 30_000,
+    ...(options.input === undefined ? {} : { input: options.input }),
+    ...(options.streamStderr
+      ? {
+          onStderr: (chunk: string) => {
+            process.stderr.write(chunk);
+          },
+        }
+      : {}),
+  });
+  if (result.timedOut) throw new Error(`${description} on ${host} timed out.`);
+  if (result.status !== 0 && !(options.acceptNonZeroStdout && result.stdout.trim()))
+    throw new Error(
+      `${description} on ${host} failed (exit ${result.status}):\n${(result.stderr || result.stdout).trim()}`,
+    );
+  return result.stdout;
 }

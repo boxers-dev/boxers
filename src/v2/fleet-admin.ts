@@ -1,15 +1,10 @@
-import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, renameSync, symlinkSync, unlinkSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { readPackageName, readVersion } from "../core/version.ts";
+import { readPackageName } from "../core/version.ts";
 import { signHostProjection, verifyHostProjection, readFleet } from "./fleet.ts";
 import { localMachineIdentity } from "./registry.ts";
 import { listRemoteMachines, type RemoteMachine } from "./machines.ts";
-import { command, requireSuccess } from "./process.ts";
 import type { DoctorResult } from "./commands.ts";
-import { installDaemonService } from "./service.ts";
 import {
   atomicWriteJson,
   fleetAdminStateLockPath,
@@ -17,9 +12,9 @@ import {
   readJson,
 } from "./paths.ts";
 import { withPidFileLock } from "./lock.ts";
-import { managedSshArgs } from "./ssh-transport.ts";
-import { reconcileManagedPeerAuthorizations } from "./ssh-identity.ts";
-import { stableExecutablePath } from "./release.ts";
+import { captureSsh } from "./ssh-transport.ts";
+import { officialReleaseCapsule } from "./release.ts";
+import { activateHostRelease } from "./host-release.ts";
 
 interface AdminRequestBody {
   fleetId: string;
@@ -98,40 +93,10 @@ export function decodeAdminRequest(encoded: string): AdminRequestBody {
 function sshCaptured(
   machine: RemoteMachine,
   args: readonly string[],
-  timeoutMs = 180_000,
+  timeout = 180_000,
   acceptNonZeroStdout = false,
 ): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn("ssh", managedSshArgs(machine.sshHost, args), {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const finish = (error?: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (error) reject(error);
-      else resolve(stdout);
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      finish(new Error(`Remote operation timed out after ${timeoutMs}ms.`));
-    }, timeoutMs);
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => (stdout += chunk));
-    child.stderr.on("data", (chunk: string) => (stderr += chunk));
-    child.on("error", (error) => finish(error));
-    child.on("close", (code) =>
-      finish(
-        code === 0 || (acceptNonZeroStdout && Boolean(stdout.trim()))
-          ? undefined
-          : new Error((stderr || stdout).trim() || `Remote operation exited ${code ?? 1}.`),
-      ),
-    );
-  });
+  return captureSsh(machine.sshHost, args, { timeout, acceptNonZeroStdout });
 }
 
 function parseDoctorResult(value: string): DoctorResult {
@@ -173,72 +138,17 @@ function parseDoctorResult(value: string): DoctorResult {
   return result as DoctorResult;
 }
 
-export function acceptManagedUpdate(encoded: string): {
-  version: string;
-  executable: string;
-  daemonRestartRequired: boolean;
-} {
+/** Legacy wire request; installation and activation use the current shared path. */
+export async function acceptManagedUpdate(encoded: string) {
   const request = decodeAdminRequest(encoded);
-  if (!/^\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.-]+)?$/.test(request.version))
-    throw new Error(`Invalid Boxers version ${request.version}.`);
-  const dataRoot = process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share");
-  const installRoot = join(dataRoot, "boxers", "managed", request.version);
-  mkdirSync(installRoot, { recursive: true, mode: 0o700 });
-  requireSuccess(
-    command("npm", [
-      "install",
-      "--silent",
-      "--no-audit",
-      "--no-fund",
-      "--omit=dev",
-      "--prefix",
-      installRoot,
-      `${readPackageName()}@${request.version}`,
-    ]),
-    `Could not install Boxers ${request.version}`,
+  const installed = await activateHostRelease(
+    officialReleaseCapsule(readPackageName(), request.version),
   );
-  const executable = join(installRoot, "node_modules", ".bin", "boxers");
-  const stable = join(homedir(), ".local", "bin", "boxers");
-  activateManagedExecutable(executable, request.version, stable);
-  const fleet = readFleet();
-  if (fleet)
-    reconcileManagedPeerAuthorizations(
-      fleet.members,
-      fleet.removedMembers ?? [],
-      stableExecutablePath(),
-    );
   return {
-    version: request.version,
-    executable: stable,
-    daemonRestartRequired: request.version !== readVersion(),
+    version: installed.manifest.packageVersion,
+    executable: installed.stableExecutable,
+    daemonRestartRequired: installed.daemonReplacementRequired,
   };
-}
-
-export function activateManagedExecutable(
-  executable: string,
-  expectedVersion: string,
-  stable: string,
-  installService: (path: string) => unknown = installDaemonService,
-): void {
-  if (!existsSync(executable))
-    throw new Error(`Installed Boxers has no executable at ${executable}.`);
-  const installedVersion = requireSuccess(
-    command(executable, ["--version"]),
-    `Could not validate Boxers ${expectedVersion}`,
-  ).trim();
-  if (installedVersion !== expectedVersion)
-    throw new Error(
-      `Installed Boxers reported ${installedVersion || "no version"}, expected ${expectedVersion}.`,
-    );
-  mkdirSync(dirname(stable), { recursive: true, mode: 0o700 });
-  const temporary = `${stable}.${process.pid}.${randomUUID()}.tmp`;
-  symlinkSync(executable, temporary);
-  try {
-    installService(stable);
-    renameSync(temporary, stable);
-  } finally {
-    if (existsSync(temporary)) unlinkSync(temporary);
-  }
 }
 
 export async function doctorFleet(

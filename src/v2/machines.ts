@@ -1,4 +1,5 @@
-import { spawn, spawnSync } from "node:child_process";
+import { TASK_VIEW_PROTOCOL_VERSION } from "./types.ts";
+import { spawnSync } from "node:child_process";
 import { subscribeDaemonChanges } from "./daemon-client.ts";
 import { localMachineIdentity } from "./registry.ts";
 import { readFleet } from "./fleet.ts";
@@ -7,7 +8,7 @@ import { captureStateProjection } from "./projection.ts";
 import { isTaskState } from "./state.ts";
 import { isTaskView } from "./task-view.ts";
 import { collectHostStatus, isHostStatusObservation, readHostStatus } from "./host-status.ts";
-import { codexOAuthSshArgs, managedSshArgs } from "./ssh-transport.ts";
+import { captureSsh, codexOAuthSshArgs, managedSshArgs } from "./ssh-transport.ts";
 import { runtimeInventoryAsync } from "./runtime/task.ts";
 import {
   archiveMissingTaskRegistrations,
@@ -53,7 +54,7 @@ export function parseRemoteSnapshot(text: string): RemoteSnapshot {
   if (!value || typeof value !== "object")
     throw new Error("Remote returned a non-object snapshot.");
   const snapshot = value as Partial<RemoteSnapshot>;
-  if (snapshot.protocolVersion !== 3)
+  if (snapshot.protocolVersion !== TASK_VIEW_PROTOCOL_VERSION)
     throw new Error(
       `Unsupported remote task-view protocol version ${String(snapshot.protocolVersion)}; upgrade both Boxers hosts.`,
     );
@@ -158,48 +159,16 @@ function authenticationHelp(detail: string, host: string): string {
   return `${detail}\nThe managed Boxers SSH authorization is missing or invalid. Re-run \`boxers connect ${host} --reverse-host <this-host-as-seen-by-${host}>\` to repair reciprocal access.`;
 }
 
-function runCaptured(cmd: string, args: string[], timeoutMs: number): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      finish(new Error(`Command timed out after ${timeoutMs}ms.`));
-    }, timeoutMs);
-    const finish = (error?: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (error) reject(error);
-      else resolve(stdout);
-    };
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => (stdout += chunk));
-    child.stderr.on("data", (chunk: string) => (stderr += chunk));
-    child.on("error", (error) => finish(error));
-    child.on("close", (code) =>
-      finish(
-        code === 0
-          ? undefined
-          : new Error((stderr || stdout).trim() || `Command exited with status ${code ?? 1}.`),
-      ),
-    );
-  });
-}
-
 export async function queryRemoteMachine(
   machine: RemoteMachine,
   refreshStatus = false,
   acceptNewHostKey = false,
 ): Promise<MachineView> {
   try {
-    const output = await runCaptured(
-      "ssh",
-      remoteArgs(machine, "snapshot", refreshStatus, acceptNewHostKey),
-      refreshStatus ? 30_000 : SNAPSHOT_TIMEOUT_MS,
+    const output = await captureSsh(
+      machine.sshHost,
+      ["remote", "snapshot", ...(refreshStatus ? ["--refresh-status"] : [])],
+      { timeout: refreshStatus ? 30_000 : SNAPSHOT_TIMEOUT_MS, acceptNewHostKey },
     );
     const snapshot = parseRemoteSnapshot(output);
     return { id: machine.id, name: machine.name, connection: "online", snapshot };

@@ -1,3 +1,4 @@
+import { TASK_VIEW_PROTOCOL_VERSION } from "../../src/v2/types.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -47,7 +48,7 @@ describe("peer projection cache", () => {
       createdAt: "2026-08-26T00:00:00.000Z",
     };
     const snapshot: RemoteSnapshot = {
-      protocolVersion: 3,
+      protocolVersion: TASK_VIEW_PROTOCOL_VERSION,
       machine: {
         version: 1,
         id: machine.id,
@@ -84,7 +85,7 @@ describe("peer projection cache", () => {
     cleanup.push(home);
     process.env.BOXERS_HOME = home;
     const snapshot: RemoteSnapshot = {
-      protocolVersion: 3,
+      protocolVersion: TASK_VIEW_PROTOCOL_VERSION,
       machine: {
         version: 1,
         id: "peer-id",
@@ -123,7 +124,7 @@ describe("peer projection cache", () => {
       createdAt: "2026-08-26T00:00:00.000Z",
     };
     const projection = (observedAt: string, phase: "idle" | "working"): RemoteSnapshot => ({
-      protocolVersion: 3,
+      protocolVersion: TASK_VIEW_PROTOCOL_VERSION,
       machine: {
         version: 1,
         id: machine.id,
@@ -166,7 +167,7 @@ describe("peer projection cache", () => {
     process.env.BOXERS_HOME = home;
     const machine = { id: "peer-id", name: "peer", sshHost: "peer.example" };
     const snapshot = (servedAt: string): RemoteSnapshot => ({
-      protocolVersion: 3,
+      protocolVersion: TASK_VIEW_PROTOCOL_VERSION,
       machine: {
         version: 1,
         id: machine.id,

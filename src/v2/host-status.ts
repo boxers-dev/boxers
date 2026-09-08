@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { humanTimestamp } from "../core/time.ts";
 import { readVersion } from "../core/version.ts";
-import { DAEMON_PROTOCOL_VERSION } from "./daemon-protocol.ts";
+import { daemonReleaseMatches } from "./daemon-identity.ts";
 import { atomicWriteJson, hostStatusPath, readJson } from "./paths.ts";
 import { command } from "./process.ts";
 import { defaultRuntime } from "./runtime/registry.ts";
@@ -21,15 +21,9 @@ export function daemonStatusChecks(
   managedBuildId: string | null | undefined = activeManagedBuildId(),
 ): HostStatusCheck[] {
   const serviceReady = !service.supported || (service.installed && service.enabled);
-  const buildReady =
-    managedBuildId === null ||
-    managedBuildId === undefined ||
-    service.boxersBuildId === managedBuildId;
   const protocolReady =
     service.active &&
-    service.protocolVersion === DAEMON_PROTOCOL_VERSION &&
-    service.boxersVersion === cliVersion &&
-    buildReady;
+    daemonReleaseMatches(service, { version: cliVersion, buildId: managedBuildId });
   return [
     {
       id: "daemon.process",

@@ -1,25 +1,24 @@
+import { parseTaskIntent } from "./core/task-intent.ts";
+import { isTaskIntentCommand } from "./core/entrypoint.ts";
+import { UsageError } from "./core/usage.ts";
+export { UsageError } from "./core/usage.ts";
 import { readFileSync } from "node:fs";
+import { activateHostRelease } from "./v2/host-release.ts";
 import { basename } from "node:path";
 import {
   attach,
+  executeTaskIntent,
   authenticate,
-  check as checkTask,
   cloneAndInitializeProject,
   doctor,
   initialize,
   list,
-  promote,
   newTask,
   newTaskInProject,
-  preview,
   printDoctor,
   projectStatus,
-  discard,
-  review as reviewTask,
   debugShell,
   status as taskStatus,
-  sync,
-  setup as setupTask,
 } from "./v2/commands.ts";
 import {
   runDaemonIntentWorker,
@@ -100,6 +99,7 @@ Project
 Fleet
   boxers connect <ssh-target> [--name <name>] [--reverse-host <target>]
       [--no-install] [--observe-only]
+    Aligns the exact local build and daemon before enrollment; --no-install requires a matching build.
   boxers hosts
   boxers hosts rename <machine> <new-name>
   boxers disconnect <name-or-id>
@@ -141,8 +141,6 @@ on first use) that holds the native agent session. Closing this terminal or
 losing the connection only loses the view — the task keeps running. Ctrl-C
 detaches deliberately without stopping it.
 `;
-
-export class UsageError extends Error {}
 
 function value(args: string[], index: number, flag: string): string {
   const result = args[index + 1];
@@ -317,27 +315,6 @@ function parseNew(args: string[]): {
   };
 }
 
-function parsePromote(args: string[]): { message?: string; skipChecks: boolean } {
-  let message: string | undefined;
-  let skipChecks = false;
-  for (let index = 0; index < args.length; index++) {
-    const arg = args[index];
-    if (arg === "--message") {
-      if (message !== undefined) throw new UsageError("--message may only be specified once.");
-      message = value(args, index, arg);
-      index++;
-    } else if (arg?.startsWith("--message=")) {
-      if (message !== undefined) throw new UsageError("--message may only be specified once.");
-      message = arg.slice(10);
-    } else if (arg === "--skip-checks") skipChecks = true;
-    else throw new UsageError(`Unexpected argument for promote: ${arg}`);
-  }
-  return {
-    ...(message !== undefined ? { message } : {}),
-    skipChecks,
-  };
-}
-
 function parseSessionSettings(args: string[]): { model?: string; effort?: string; fast?: boolean } {
   let model: string | undefined;
   let effort: string | undefined;
@@ -423,6 +400,14 @@ export async function dispatch(argv: string[]): Promise<number> {
     const [, payload, ...unexpected] = argv;
     if (!payload || unexpected.length) throw new Error("Invalid daemon intent worker invocation.");
     return runDaemonIntentWorker(payload);
+  }
+  if (argv[0] === "__activate-release") {
+    only(argv.slice(1), [], "__activate-release");
+    const installed = await activateHostRelease(readFileSync(0));
+    process.stdout.write(
+      `${JSON.stringify({ ...remoteIdentity(), executable: installed.stableExecutable, buildId: installed.manifest.buildId })}\n`,
+    );
+    return 0;
   }
   if (argv[0] === "__update-continue") {
     if (argv.length !== 1) throw new Error("Invalid Boxers update continuation invocation.");
@@ -718,7 +703,7 @@ export async function dispatch(argv: string[]): Promise<number> {
     }
     if (command === "update") {
       if (args.length !== 1) throw new UsageError("remote update requires one request.");
-      process.stdout.write(`${JSON.stringify(acceptManagedUpdate(args[0] as string))}\n`);
+      process.stdout.write(`${JSON.stringify(await acceptManagedUpdate(args[0] as string))}\n`);
       return 0;
     }
     if (command === "install-release") {
@@ -871,6 +856,10 @@ export async function dispatch(argv: string[]): Promise<number> {
         !(taskCommand === "status" && args.includes("--json")),
       );
   }
+  if (isTaskIntentCommand(taskCommand)) {
+    const { intent } = parseTaskIntent([first, taskCommand!, ...args]);
+    return executeTaskIntent(first, intent);
+  }
   switch (taskCommand) {
     case "new": {
       const options = parseNew(args);
@@ -893,31 +882,6 @@ export async function dispatch(argv: string[]): Promise<number> {
     case "status":
       only(args, ["--json", "--refresh"], "status");
       return taskStatus(first, args.includes("--json"), args.includes("--refresh"));
-    case "review":
-      only(args, [], "review");
-      return reviewTask(first);
-    case "check":
-      only(args, [], "check");
-      return checkTask(first);
-    case "setup":
-      only(args, [], "setup");
-      return setupTask(first);
-    case "promote": {
-      const options = parsePromote(args);
-      return promote(first, options.message, options.skipChecks);
-    }
-    case "sync":
-      only(args, [], "sync");
-      return sync(first);
-    case "preview": {
-      const action = args[0] ?? "show";
-      if (!["show", "start", "stop", "restart", "logs"].includes(action) || args.length > 1)
-        throw new UsageError("preview accepts start, stop, restart, or logs.");
-      return preview(first, action as "show" | "start" | "stop" | "restart" | "logs");
-    }
-    case "discard":
-      only(args, ["--force"], "discard");
-      return discard(first, args.includes("--force"));
     default:
       throw new UsageError(`Unknown command: ${taskCommand}. Run "boxers help".`);
   }

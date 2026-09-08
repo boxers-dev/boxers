@@ -9,6 +9,7 @@ export interface CommandResult {
 }
 
 export interface StreamingCommandOptions {
+  input?: string | Buffer;
   timeout?: number;
   signal?: AbortSignal;
   onStdout?: (chunk: string) => void;
@@ -134,9 +135,13 @@ export function commandStreaming(
 ): Promise<StreamingCommandResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, [...args], {
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
+    if (options.input !== undefined) {
+      child.stdin!.on("error", () => undefined);
+      child.stdin!.end(options.input);
+    }
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -171,13 +176,13 @@ export function commandStreaming(
     };
     options.signal?.addEventListener("abort", onAbort, { once: true });
     if (options.signal?.aborted) onAbort();
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
+    child.stdout!.setEncoding("utf8");
+    child.stderr!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => {
       stdout += chunk;
       options.onStdout?.(chunk);
     });
-    child.stderr.on("data", (chunk: string) => {
+    child.stderr!.on("data", (chunk: string) => {
       stderr += chunk;
       options.onStderr?.(chunk);
     });

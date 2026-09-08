@@ -1,3 +1,4 @@
+import { activeManagedExecutable } from "./release.ts";
 import {
   accessSync,
   constants,
@@ -102,13 +103,10 @@ function executableFile(path: string): string | undefined {
 
 /** Resolve a real CLI file without asking a shell to interpret aliases or command text. */
 export function resolveBoxersExecutable(
-  entry = process.argv[1],
+  entry = activeManagedExecutable() ?? process.argv[1],
   path = process.env["PATH"],
 ): string {
-  if (entry && isAbsolute(entry)) {
-    const resolved = executableFile(entry);
-    if (resolved) return resolved;
-  }
+  if (entry && isAbsolute(entry) && executableFile(entry)) return entry;
   for (const directory of (path ?? "").split(delimiter)) {
     if (!directory) continue;
     const resolved = executableFile(join(directory, "boxers"));

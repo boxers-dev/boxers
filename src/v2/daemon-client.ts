@@ -1,9 +1,13 @@
+import { boxersLaunch } from "../core/launcher.ts";
+import { parseTaskIntent as parseDaemonIntent } from "../core/task-intent.ts";
+export { parseTaskIntent as parseDaemonIntent } from "../core/task-intent.ts";
+import { daemonReleaseMatches } from "./daemon-identity.ts";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, fstatSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
 import { dirname } from "node:path";
-import { colorEnabled, resetTerminalInputModes } from "../core/ansi.ts";
+import { resetTerminalInputModes } from "../core/ansi.ts";
 import { readVersion } from "../core/version.ts";
 import { boxersHome, daemonLogPath, daemonSocketPath } from "./paths.ts";
 import {
@@ -15,7 +19,7 @@ import {
   type TaskIntent,
 } from "./daemon-protocol.ts";
 import type { RemoteSnapshot } from "./types.ts";
-import { activeManagedExecutable } from "./release.ts";
+import { activeReleaseBuildId, activeManagedExecutable } from "./release.ts";
 
 const CONNECT_RETRY_DELAY_MS = 150;
 const CONNECT_RETRY_ATTEMPTS = 40; // ~6s of retrying while a fresh daemon boots.
@@ -113,13 +117,11 @@ function wait(ms: number): Promise<void> {
 /** `tsx`-run sources can't be handed to a plain `node` child; match how "dev" launches. */
 export function daemonSpawnCommand(
   entry = process.argv[1] ?? "",
-  managedExecutable = process.env["BOXERS_EXECUTABLE"] ?? activeManagedExecutable(),
+  managedExecutable = activeManagedExecutable() ?? process.env["BOXERS_EXECUTABLE"],
 ): { command: string; args: string[] } {
-  // Fleet bootstrap records the authoritative launcher explicitly. Preserve
-  // that boundary instead of assuming it is JavaScript for this Node runtime.
-  if (managedExecutable) return { command: managedExecutable, args: ["__daemon-run"] };
+  if (managedExecutable) return boxersLaunch(managedExecutable, ["__daemon-run"]);
   if (entry.endsWith(".ts")) return { command: "npx", args: ["tsx", entry, "__daemon-run"] };
-  return { command: process.execPath, args: [entry, "__daemon-run"] };
+  return boxersLaunch(entry, ["__daemon-run"]);
 }
 
 const DAEMON_ERROR_LOG_BYTES = 8 * 1024;
@@ -213,6 +215,7 @@ export async function ensureDaemonReady(allowVersionMismatch = false): Promise<v
 function helloOnSocket(socket: Socket): Promise<{
   protocolVersion: number;
   boxersVersion: string;
+  boxersBuildId?: string | undefined;
   epoch: string;
   revision: number;
 }> {
@@ -228,7 +231,13 @@ function helloOnSocket(socket: Socket): Promise<{
     };
     const finish = (
       result:
-        | { protocolVersion: number; boxersVersion: string; epoch: string; revision: number }
+        | {
+            protocolVersion: number;
+            boxersVersion: string;
+            boxersBuildId?: string | undefined;
+            epoch: string;
+            revision: number;
+          }
         | Error,
     ): void => {
       cleanup();
@@ -268,7 +277,13 @@ async function readyDaemonSocket(allowVersionMismatch = false): Promise<Socket> 
   const socket = await ensureDaemonRunning(daemonSocketPath());
   try {
     const hello = await helloOnSocket(socket);
-    if (!allowVersionMismatch) assertDaemonVersion(hello.boxersVersion);
+    if (!allowVersionMismatch) {
+      assertDaemonVersion(hello.boxersVersion);
+      if (!daemonReleaseMatches(hello, { version: readVersion(), buildId: activeReleaseBuildId() }))
+        throw new Error(
+          "The Boxers daemon build or protocol does not match this CLI. Run `boxers update` to align the active build and daemon.",
+        );
+    }
     return socket;
   } catch (error) {
     socket.destroy();
@@ -354,6 +369,7 @@ export function runningDaemonSnapshot(
 export async function daemonHello(): Promise<{
   protocolVersion: number;
   boxersVersion: string;
+  boxersBuildId?: string | undefined;
   epoch: string;
   revision: number;
 }> {
@@ -451,62 +467,6 @@ export async function subscribeDaemonChanges(
     }),
   );
   return () => socket.destroy();
-}
-
-export function parseDaemonIntent(args: string[]): { task: string; intent: TaskIntent } {
-  const task = args[0];
-  const command = args[1];
-  if (!task || !command) throw new Error("A daemon intent requires a task and command.");
-  const rest = args.slice(2);
-  switch (command) {
-    case "sync":
-    case "check":
-    case "setup":
-      if (rest.length) throw new Error(`${command} does not accept arguments.`);
-      return { task, intent: { kind: command } };
-    case "review":
-      if (rest.length) throw new Error(`${command} does not accept arguments.`);
-      return { task, intent: { kind: command, color: colorEnabled() } };
-    case "promote": {
-      let message: string | undefined;
-      let skipChecks = false;
-      for (let index = 0; index < rest.length; index++) {
-        const argument = rest[index];
-        if (argument === "--skip-checks") skipChecks = true;
-        else if (argument === "--message") {
-          message = rest[++index];
-          if (!message) throw new Error("--message requires a value.");
-        } else if (argument?.startsWith("--message=")) message = argument.slice(10);
-        else throw new Error(`Unexpected argument for promote: ${argument}`);
-      }
-      return {
-        task,
-        intent: {
-          kind: "promote",
-          ...(message ? { message } : {}),
-          skipChecks,
-        },
-      };
-    }
-    case "preview": {
-      const action = rest[0] ?? "show";
-      if (
-        action !== "show" &&
-        action !== "start" &&
-        action !== "stop" &&
-        action !== "restart" &&
-        action !== "logs"
-      )
-        throw new Error(`Invalid preview action ${action}.`);
-      return { task, intent: { kind: "preview", action } };
-    }
-    case "discard":
-      if (rest.some((argument) => argument !== "--force") || rest.length > 1)
-        throw new Error("discard accepts only --force.");
-      return { task, intent: { kind: "discard", force: rest.includes("--force") } };
-    default:
-      throw new Error(`Unsupported daemon intent ${command}.`);
-  }
 }
 
 export async function runTypedDaemonIntent(task: string, intent: TaskIntent): Promise<number> {

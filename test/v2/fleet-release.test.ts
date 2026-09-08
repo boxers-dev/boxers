@@ -1,7 +1,8 @@
+import * as service from "../../src/v2/service.ts";
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   enrollFleetMember,
   ensureFleet,
@@ -52,7 +53,19 @@ function restore(name: keyof typeof environment, variable: string): void {
   else process.env[variable] = value;
 }
 
+beforeEach(() => {
+  vi.spyOn(service, "installDaemonService").mockReturnValue({
+    supported: true,
+    installed: true,
+    enabled: true,
+    active: false,
+    platform: "test",
+    detail: "test service",
+  });
+});
+
 afterEach(() => {
+  vi.restoreAllMocks();
   restore("home", "HOME");
   restore("data", "XDG_DATA_HOME");
   restore("state", "BOXERS_HOME");

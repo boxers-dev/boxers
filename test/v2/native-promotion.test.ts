@@ -27,6 +27,7 @@ import {
   runPostTurn,
   status,
   sync,
+  setup,
 } from "../../src/v2/commands.ts";
 import {
   createTaskManifest,
@@ -1028,6 +1029,72 @@ exec "$FAKE_REAL_GIT" "$@"
     );
     await expect(review("native", false)).rejects.toThrow("unfinished reconciliation");
   });
+
+  it.each(["review", "check", "sync", "setup", "preview"] as const)(
+    "%s reconciles target configuration and files before starting setup or preview",
+    async (operation) => {
+      const { root, project, workspace } = reconciliationFixture();
+      writeFileSync(join(root, "upstream.txt"), "required by new setup\n");
+      writeFileSync(
+        join(root, ".boxers/config.yml"),
+        "version: 3\nsetup:\n  run: test -f upstream.txt && printf prepared > generated.txt\n  timeout: 10s\npreview:\n  run: test -f upstream.txt\n  ports: [3000]\n",
+      );
+      git(root, "add", ".");
+      git(root, "commit", "-q", "-m", "advance files and configuration");
+      const calls = {
+        review: () => review("native", false),
+        check: () => check("native"),
+        sync: () => sync("native"),
+        setup: () => setup("native"),
+        preview: () => preview("native", "start"),
+      };
+      await expect(calls[operation]()).resolves.toBe(0);
+      const task = requireTask(project, "native");
+      expect(readSetupStatus(task)?.state).toBe("passed");
+      expect(readSetupStatus(task)?.attempt).toBe(1);
+      expect(git(workspace, "rev-parse", "HEAD")).toBe(git(root, "rev-parse", "HEAD"));
+      expect(readFileSync(join(workspace, "generated.txt"), "utf8")).toBe("prepared");
+      if (operation !== "setup") {
+        expect(task.lastSnapshot?.candidateTreeOid).toBeTruthy();
+        expect(git(project.seedPath, "show", `refs/boxers/review/${task.id}:generated.txt`)).toBe(
+          "prepared",
+        );
+      }
+    },
+  );
+
+  it.each(["review", "check", "sync", "setup", "preview", "promote"] as const)(
+    "%s uses the same active-agent guard before mutating the workspace",
+    async (operation) => {
+      const { project, task, bin } = reconciliationFixture();
+      recordLifecycleEvent(project, task, {
+        version: 1,
+        sequence: 1,
+        event: {
+          version: 1,
+          kind: "user_prompt",
+          provider: "codex",
+          providerSessionId: "session",
+          prompt: "continue",
+          recordedAt: new Date().toISOString(),
+        },
+        source: { provider: "codex", hookEvent: "UserPromptSubmit", rawBytes: 20 },
+      });
+      const calls = {
+        review: () => review("native", false),
+        check: () => check("native"),
+        sync: () => sync("native"),
+        setup: () => setup("native"),
+        preview: () => preview("native", "start"),
+        promote: () => promote("native"),
+      };
+      await expect(calls[operation]()).rejects.toThrow("actively working");
+      expect(readTaskState(project, requireTask(project, "native")).agentTurnState).toBe("working");
+      expect(requireTask(project, "native").lastSnapshot?.failure).toBeUndefined();
+      const log = join(bin, "sbx.log");
+      if (existsSync(log)) expect(readFileSync(log, "utf8")).not.toContain("reset --hard");
+    },
+  );
 
   it("installs target files before starting that target's new setup command", async () => {
     const { root, project, workspace } = reconciliationFixture();

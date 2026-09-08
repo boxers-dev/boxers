@@ -667,6 +667,45 @@ function ensureAgentWorkspaceStable(project: ProjectManifest, task: TaskManifest
   );
 }
 
+/** Common preparation for commands that require an idle, settled workspace. */
+async function prepareTaskWorkspace(name: string) {
+  let current = requireRegisteredTask(name);
+  await waitForSetup(current.task);
+  current = requireRegisteredTask(name);
+  drainTaskLifecycleEvents(current.project, current.task);
+  current = requireRegisteredTask(name);
+  ensureAgentWorkspaceStable(current.project, current.task);
+  return current;
+}
+
+/**
+ * Explicit commands wait for setup started by reconciliation before consuming
+ * the candidate. Promotion alone may reuse an exact reviewed tree.
+ */
+async function prepareTaskCandidate(
+  name: string,
+  options: { reuseReviewed?: boolean; runSetup?: boolean } = {},
+) {
+  let { project, task } = await prepareTaskWorkspace(name);
+  if (options.reuseReviewed && !pendingDelivery(task)) {
+    const targetOid = refreshSeed(project);
+    recordAdvancedTargetPending(project, task, targetOid);
+    const prepared = recordedPreparedCandidate(project, task, targetOid);
+    if (prepared) return { project, task, snapshot: prepared.snapshot };
+  }
+  let snapshot = await refreshSettledCandidate(name, undefined, {
+    runSetup: options.runSetup ?? true,
+  });
+  while (snapshot.setup?.state === "running") {
+    ({ project, task } = await prepareTaskWorkspace(name));
+    snapshot = await refreshSettledCandidate(name, undefined, {
+      runSetup: options.runSetup ?? true,
+    });
+  }
+  ({ project, task } = requireRegisteredTask(name));
+  return { project, task, snapshot };
+}
+
 function recordAdvancedTargetPending(
   project: ProjectManifest,
   task: TaskManifest,
@@ -1251,13 +1290,8 @@ export async function debugShell(name: string): Promise<number> {
 }
 
 export async function sync(name: string, announce = true): Promise<number> {
-  let { project, task } = requireRegisteredTask(name);
-  await waitForSetup(task);
-  ({ project, task } = requireRegisteredTask(name));
-  drainTaskLifecycleEvents(project, task);
-  ensureAgentWorkspaceStable(project, task);
-  const before = task.lastSnapshot?.targetOid;
-  const snapshot = await refreshSettledCandidate(name);
+  const before = requireRegisteredTask(name).task.lastSnapshot?.targetOid;
+  const { snapshot } = await prepareTaskCandidate(name);
   if (snapshot.question || snapshot.failure) return 1;
   if (announce)
     writeStdout(
@@ -1831,7 +1865,7 @@ async function prepareCandidate(
   initial: TaskSnapshot,
   targetOid: string,
 ): Promise<PreparedCandidate | { conflictStatus: 1 }> {
-  let previous = initial;
+  const previous = initial;
   const conflicts = taskConflictPaths(task);
   if (conflicts.length) {
     recordUnresolvedNativeConflicts(project, task, previous, conflicts);
@@ -1839,22 +1873,6 @@ async function prepareCandidate(
       `Task ${task.name} still has unresolved reconciliation conflicts:\n${conflicts.map((path) => `  ${path}`).join("\n")}\nRun \`boxers ${task.name} attach\` to resolve and stage them, then try again.\n`,
     );
     return { conflictStatus: 1 };
-  }
-  if (previous.targetOid && previous.targetOid !== targetOid) {
-    note("The target advanced; reconciling the task.");
-    const result = await reconcileNativeTask(
-      project,
-      task,
-      previous,
-      previous.targetOid,
-      targetOid,
-    );
-    if (result.status === "conflicted")
-      return { conflictStatus: reportNativeReconciliationConflict(project, task, result) };
-    previous = result.snapshot;
-    writeStdout(
-      `Target advanced from ${result.fromTargetOid} to ${targetOid}; reconciled automatically.\n`,
-    );
   }
   const candidateTreeOid = materializeNativeCandidate(project, task, targetOid);
   return publishCandidateObservation(project, task, previous, targetOid, candidateTreeOid, true);
@@ -1868,7 +1886,7 @@ async function prepareCandidate(
 export async function refreshSettledCandidate(
   name: string,
   onPhase?: (phase: "refreshing" | "reconciling" | "capturing") => void,
-  capture = true,
+  options: { runSetup?: boolean } = {},
 ): Promise<TaskSnapshot> {
   let { project, task } = requireRegisteredTask(name);
   assertReconciliationSettled(task);
@@ -1928,7 +1946,10 @@ export async function refreshSettledCandidate(
   }
 
   // A target's setup command must run against that target's installed files.
-  setup = ensureCurrentSetup(task, config?.setup, config?.preview?.run);
+  setup =
+    options.runSetup === false
+      ? undefined
+      : ensureCurrentSetup(task, config?.setup, config?.preview?.run);
   if (setup?.state === "running") {
     const snapshot = { ...(task.lastSnapshot ?? previous), setup, runtimeState: "running" };
     updateTask(project, task, snapshot, undefined, "command");
@@ -1936,16 +1957,7 @@ export async function refreshSettledCandidate(
   }
 
   onPhase?.("capturing");
-  const prepared = capture
-    ? await prepareCandidate(project, task, task.lastSnapshot ?? previous, targetOid)
-    : publishCandidateObservation(
-        project,
-        task,
-        task.lastSnapshot ?? previous,
-        targetOid,
-        taskWorkspaceTreeAt(task, taskWorkspacePath(task)),
-        false,
-      );
+  const prepared = await prepareCandidate(project, task, task.lastSnapshot ?? previous, targetOid);
   if ("conflictStatus" in prepared) return requireRegisteredTask(name).task.lastSnapshot!;
   return prepared.snapshot;
 }
@@ -2004,6 +2016,19 @@ export async function runPostTurn(
   };
 }
 
+function candidateCheckMatches(
+  snapshot: TaskSnapshot,
+  targetOid: string,
+  candidateTreeOid: string,
+  configHash: string,
+): boolean {
+  return (
+    snapshot.check?.targetOid === targetOid &&
+    snapshot.check.candidateTreeOid === candidateTreeOid &&
+    snapshot.check.configHash === configHash
+  );
+}
+
 /** Run or reuse the configured check for the task's currently captured candidate. */
 export async function refreshAutomaticCheck(name: string): Promise<TaskSnapshot | undefined> {
   const { project, task } = requireRegisteredTask(name);
@@ -2013,11 +2038,7 @@ export async function refreshAutomaticCheck(name: string): Promise<TaskSnapshot 
   const checkConfig = config.check;
   if (!checkConfig?.commands.length) return snapshot;
   const configHash = checkConfigHash(checkConfig);
-  if (
-    snapshot.check?.targetOid === snapshot.targetOid &&
-    snapshot.check.candidateTreeOid === snapshot.candidateTreeOid &&
-    snapshot.check.configHash === configHash
-  )
+  if (candidateCheckMatches(snapshot, snapshot.targetOid, snapshot.candidateTreeOid, configHash))
     return correctReconciliationAfterCheck(project, task, snapshot, config, configHash);
   return executeChecks(
     project,
@@ -2340,15 +2361,9 @@ function checkConfigHash(check: NonNullable<ProjectConfig["check"]>): string {
 }
 
 export async function review(name: string, color = colorEnabled()): Promise<number> {
-  let { project, task } = requireRegisteredTask(name);
-  await waitForSetup(task);
-  ({ project, task } = requireRegisteredTask(name));
+  const { project, task, snapshot } = await prepareTaskCandidate(name);
   note(`Reviewing ${name} against ${project.integration.base}.`);
-  drainTaskLifecycleEvents(project, task);
-  ensureAgentWorkspaceStable(project, task);
   try {
-    const snapshot = await refreshSettledCandidate(name);
-    ({ project, task } = requireRegisteredTask(name));
     const targetOid = snapshot.targetOid;
     if (snapshot.question || snapshot.failure) return 1;
     if (!targetOid) throw new Error("Candidate capture did not record a target commit.");
@@ -2398,14 +2413,8 @@ export async function review(name: string, color = colorEnabled()): Promise<numb
 }
 
 export async function check(name: string): Promise<number> {
-  let { project, task } = requireRegisteredTask(name);
-  await waitForSetup(task);
-  ({ project, task } = requireRegisteredTask(name));
-  drainTaskLifecycleEvents(project, task);
-  ensureAgentWorkspaceStable(project, task);
+  const { project, task, snapshot: captured } = await prepareTaskCandidate(name);
   note(`Checking ${name} against ${project.integration.base}.`);
-  const captured = await refreshSettledCandidate(name);
-  ({ project, task } = requireRegisteredTask(name));
   if (captured.question || captured.failure) return 1;
   if (!captured.candidateTreeOid) {
     writeStdout(`Task ${name} has no changes to check.\n`);
@@ -2431,8 +2440,10 @@ export async function check(name: string): Promise<number> {
 }
 
 export async function setup(name: string): Promise<number> {
-  const { project, task } = requireRegisteredTask(name);
-  const targetOid = refreshSeed(project);
+  const { project, task, snapshot } = await prepareTaskCandidate(name, { runSetup: false });
+  if (snapshot.question || snapshot.failure) return 1;
+  const targetOid = snapshot.targetOid;
+  if (!targetOid) throw new Error("Task preparation did not record a target commit.");
   const configured = parseProjectConfig(targetConfig(project, targetOid).text).setup;
   if (!configured) {
     writeStdout("No task setup is configured.\n");
@@ -2663,11 +2674,7 @@ function hostIdentity(project: ProjectManifest): NodeJS.ProcessEnv {
 }
 
 export async function promote(name: string, message?: string, skipChecks = false): Promise<number> {
-  let { project, task } = requireRegisteredTask(name);
-  await waitForSetup(task);
-  ({ project, task } = requireRegisteredTask(name));
-  drainTaskLifecycleEvents(project, task);
-  ensureAgentWorkspaceStable(project, task);
+  let { project, task } = await prepareTaskWorkspace(name);
   let lock: (() => void) | undefined;
   try {
     if (pendingDelivery(task)) {
@@ -2677,30 +2684,20 @@ export async function promote(name: string, message?: string, skipChecks = false
       releaseLock(lock);
       lock = undefined;
     }
-    const targetOid = refreshSeed(project);
-    recordAdvancedTargetPending(project, task, targetOid);
-    const target = targetConfig(project, targetOid);
-    const config = parseProjectConfig(target.text);
+    const candidate = await prepareTaskCandidate(name, { reuseReviewed: true });
+    ({ project, task } = candidate);
+    if (candidate.snapshot.question || candidate.snapshot.failure) return 1;
+    const targetOid = candidate.snapshot.targetOid;
+    if (!targetOid) throw new Error("Candidate capture did not record a target commit.");
+    const config = parseProjectConfig(targetConfig(project, targetOid).text);
     const checkConfig = config.check;
-    let prepared: PreparedCandidate | { conflictStatus: 1 } | undefined = recordedPreparedCandidate(
-      project,
-      task,
+    let prepared: PreparedCandidate = {
+      snapshot: candidate.snapshot,
       targetOid,
-    );
-    if (!prepared) {
-      note(`Preparing ${name} for promotion against ${project.integration.base}.`);
-      const captured = await refreshSettledCandidate(name);
-      ({ project, task } = requireRegisteredTask(name));
-      prepared =
-        captured.question || captured.failure
-          ? { conflictStatus: 1 }
-          : {
-              snapshot: captured,
-              targetOid: captured.targetOid ?? targetOid,
-              ...(captured.candidateTreeOid ? { candidateTreeOid: captured.candidateTreeOid } : {}),
-            };
-    }
-    if ("conflictStatus" in prepared) return prepared.conflictStatus;
+      ...(candidate.snapshot.candidateTreeOid
+        ? { candidateTreeOid: candidate.snapshot.candidateTreeOid }
+        : {}),
+    };
     if (!prepared.candidateTreeOid) {
       writeStdout(`Task ${name} has no changes to promote.\n`);
       return 0;
@@ -2710,9 +2707,8 @@ export async function promote(name: string, message?: string, skipChecks = false
     const configHash = checkConfig ? checkConfigHash(checkConfig) : undefined;
     const reusablePass =
       snapshot.check?.status === "passed" &&
-      snapshot.check.targetOid === targetOid &&
-      snapshot.check.candidateTreeOid === prepared.candidateTreeOid &&
-      snapshot.check.configHash === configHash;
+      configHash !== undefined &&
+      candidateCheckMatches(snapshot, targetOid, prepared.candidateTreeOid, configHash);
     if (checkConfigured && skipChecks)
       writeStderr("Skipping configured checks by explicit request.\n");
     else if (checkConfigured && reusablePass)
@@ -2846,6 +2842,21 @@ export async function preview(
     const status = inspectTaskJob(task, jobId);
     return status && ["failed", "timed_out", "interrupted"].includes(status.state) ? 1 : 0;
   }
+  let configuredPreview: ProjectConfig["preview"];
+  if (action === "start" || action === "restart") {
+    const prepared = await prepareTaskCandidate(name);
+    ({ project, task } = prepared);
+    if (prepared.snapshot.question || prepared.snapshot.failure) return 1;
+    const setup = prepared.snapshot.setup;
+    if (setup && setup.state !== "passed")
+      throw new Error(`Preview cannot start because setup ${setup.state}.`);
+    if (!prepared.snapshot.targetOid)
+      throw new Error("Task preparation did not record a target commit.");
+    configuredPreview = parseProjectPreview(
+      targetConfig(project, prepared.snapshot.targetOid).text,
+    );
+    if (!configuredPreview) throw new Error("No preview is configured on the canonical target.");
+  }
   const previousJobId = task.lastSnapshot?.preview?.jobId;
   if ((action === "stop" || action === "restart") && previousJobId)
     stopTaskPreview(task, previousJobId);
@@ -2855,12 +2866,6 @@ export async function preview(
     source: "command",
   };
   if (action === "start" || action === "restart") {
-    const setup = await waitForSetup(task);
-    ({ project, task } = requireRegisteredTask(name));
-    if (setup && setup.state !== "passed")
-      throw new Error(`Preview cannot start because setup ${setup.state}.`);
-    const target = refreshSeed(project);
-    const configuredPreview = parseProjectPreview(targetConfig(project, target).text);
     if (!configuredPreview) throw new Error("No preview is configured on the canonical target.");
     const handle = startTaskPreview(task, configuredPreview.run);
     let urls = task.lastSnapshot?.preview?.urls ?? taskPublishedUrls(task);

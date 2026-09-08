@@ -422,8 +422,10 @@ export interface HostStatusObservation {
   checks: HostStatusCheck[];
 }
 
+export const TASK_VIEW_PROTOCOL_VERSION = 4;
+
 export interface RemoteSnapshot {
-  protocolVersion: 3;
+  protocolVersion: typeof TASK_VIEW_PROTOCOL_VERSION;
   machine: MachineIdentity & { boxersVersion: string };
   observedAt: string;
   servedAt?: string | undefined;

@@ -1,3 +1,4 @@
+import { TASK_VIEW_PROTOCOL_VERSION } from "./types.ts";
 import { basename } from "node:path";
 import { existsSync } from "node:fs";
 import { taskReconciliationPath, taskDeliveryPath } from "./paths.ts";
@@ -115,7 +116,7 @@ export function captureStateProjection(
     }),
   );
   return {
-    protocolVersion: 3,
+    protocolVersion: TASK_VIEW_PROTOCOL_VERSION,
     machine: { ...localMachineIdentity(), boxersVersion: readVersion() },
     observedAt,
     servedAt,

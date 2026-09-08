@@ -14,6 +14,10 @@ export function isDaemonBackedTaskInvocation(args: readonly string[]): boolean {
   // Machine-qualified tasks must first pass through CLI routing so the typed
   // command reaches its owning host. That host then queues it locally.
   if (!task || task === "daemon" || task.includes("/")) return false;
-  if (DAEMON_BACKED_TASK_INTENTS.has(command ?? "")) return true;
+  if (isTaskIntentCommand(command)) return true;
   return false;
+}
+
+export function isTaskIntentCommand(command: string | undefined): boolean {
+  return DAEMON_BACKED_TASK_INTENTS.has(command ?? "");
 }
