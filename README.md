@@ -1,8 +1,8 @@
 # boxers
 
-Boxers runs Codex and Claude in durable, isolated Docker Sandboxes. Each task
-gets its own workspace and keeps the agent's native session, so closing a
-terminal or losing an SSH connection does not stop the work.
+Boxers gives every Codex and Claude task a durable, isolated Docker Sandbox.
+Each task retains its own workspace and the agent's native session, so the work
+continues even if you close the terminal or lose an SSH connection.
 
 ## Quick start
 
