@@ -59,6 +59,18 @@ export function projectDir(id: string): string {
   return join(projectsDir(), id);
 }
 
+export function projectSeedLockPath(id: string): string {
+  return join(projectDir(id), "seed.lock");
+}
+
+export function projectTargetPath(id: string): string {
+  return join(projectDir(id), "target.json");
+}
+
+export function projectPromotionLockPath(id: string): string {
+  return join(projectDir(id), "promote.lock");
+}
+
 export function taskDir(projectId: string, taskId: string): string {
   return join(projectDir(projectId), "tasks", taskId);
 }
@@ -74,6 +86,19 @@ export function taskStatePath(projectId: string, taskId: string): string {
 
 export function taskRepairLogPath(projectId: string, taskId: string): string {
   return join(taskDir(projectId, taskId), "repair.log");
+}
+
+export function taskRepairStatePath(projectId: string, taskId: string): string {
+  return join(taskDir(projectId, taskId), "repair.json");
+}
+
+export function taskDeliveryPath(projectId: string, taskId: string): string {
+  return join(taskDir(projectId, taskId), "delivery.json");
+}
+
+/** Retained after uncertain interruption; it is not a stale-PID lock. */
+export function taskReconciliationPath(projectId: string, taskId: string): string {
+  return join(taskDir(projectId, taskId), "reconciliation.json");
 }
 
 export function taskManifestLockPath(projectId: string, taskId: string): string {

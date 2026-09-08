@@ -200,6 +200,7 @@ export function isTaskState(value: unknown, taskId: string): value is TaskState 
       "lifecycleDiagnostic",
       "hasUnmergedChanges",
       "baseOid",
+      "observedTargetOid",
       "candidateTreeOid",
       "lastDelivery",
       "setup",
@@ -270,9 +271,13 @@ export function isTaskState(value: unknown, taskId: string): value is TaskState 
             ["passed", "skipped", "not_configured"].includes(String(delivery.checks)))
         );
       })) &&
-    [state.baseOid, state.candidateTreeOid, state.summary, state.failure].every(
-      (candidate) => candidate === undefined || typeof candidate === "string",
-    )
+    [
+      state.baseOid,
+      state.observedTargetOid,
+      state.candidateTreeOid,
+      state.summary,
+      state.failure,
+    ].every((candidate) => candidate === undefined || typeof candidate === "string")
   );
 }
 
@@ -303,6 +308,7 @@ export function ensureTaskState(project: ProjectManifest, task: TaskManifest): T
 export interface TaskStateUpdate {
   hasUnmergedChanges?: boolean | "unknown";
   baseOid?: string | null;
+  observedTargetOid?: string | null;
   candidateTreeOid?: string | null;
   setup?: TaskSnapshot["setup"] | null;
   check?: TaskSnapshot["check"] | null;
@@ -361,6 +367,7 @@ export function updateTaskState(
     };
     for (const [field, value] of [
       ["baseOid", update.baseOid],
+      ["observedTargetOid", update.observedTargetOid],
       ["candidateTreeOid", update.candidateTreeOid],
       ["setup", update.setup],
       ["check", update.check],

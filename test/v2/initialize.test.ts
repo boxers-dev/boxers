@@ -99,6 +99,7 @@ describe("boxers project init", () => {
     cleanup.push(source, otherSource, destination);
     for (const root of [source, otherSource]) {
       git(root, "init", "-q", "-b", "main");
+    git(root, "remote", "add", "origin", root);
       git(root, "config", "user.name", "Test User");
       git(root, "config", "user.email", "test@example.invalid");
       writeFileSync(join(root, "README.md"), `${root}\n`);
@@ -134,12 +135,13 @@ describe("boxers project init", () => {
     cleanup.push(root, state);
     process.env["BOXERS_HOME"] = state;
     git(root, "init", "-q", "-b", "main");
+    git(root, "remote", "add", "origin", root);
     git(root, "config", "user.name", "Test User");
     git(root, "config", "user.email", "test@example.invalid");
     writeFileSync(join(root, "README.md"), "base\n");
     git(root, "add", "README.md");
     git(root, "commit", "-q", "-m", "base");
-    git(root, "remote", "add", "origin", join(root, "missing-remote.git"));
+    git(root, "remote", "set-url", "origin", join(root, "missing-remote.git"));
     process.chdir(root);
 
     await expect(initialize({ yes: true })).rejects.toThrow("Git remote origin is not reachable");
@@ -153,6 +155,7 @@ describe("boxers project init", () => {
     cleanup.push(root, state);
     process.env["BOXERS_HOME"] = state;
     git(root, "init", "-q", "-b", "main");
+    git(root, "remote", "add", "origin", root);
     git(root, "config", "user.name", "Test User");
     git(root, "config", "user.email", "test@example.invalid");
     writeFileSync(
@@ -170,7 +173,7 @@ describe("boxers project init", () => {
     const configPath = join(root, ".boxers", "config.yml");
     const firstText = readFileSync(configPath, "utf8");
     const firstConfig = parseProjectConfig(firstText);
-    expect(firstConfig.integration).toEqual({ mode: "local", base: "main" });
+    expect(firstConfig.integration).toEqual({ remote: "origin", base: "main" });
     expect(firstConfig.setup).toEqual({ run: "npm install", timeoutMs: 900_000 });
     expect(firstConfig.check).toMatchObject({
       commands: [
@@ -190,13 +193,13 @@ describe("boxers project init", () => {
     ]);
 
     git(root, "branch", "next");
-    prompts.answers = ["local", "next", "", "no"];
+    prompts.answers = ["next", "", "", "no"];
     await expect(initialize()).resolves.toBe(0);
     expect(parseProjectConfig(readFileSync(configPath, "utf8")).integration).toEqual({
-      mode: "local",
+      remote: "origin",
       base: "next",
     });
-    expect(listProjects()[0]?.integration).toEqual({ mode: "local", base: "next" });
+    expect(listProjects()[0]?.integration).toEqual({ remote: "origin", base: "next" });
     expect(stdout.mock.calls.flat().join("")).toContain(
       "Existing task environments were not modified; future reconciliation, review, check, and promote operations use the current integration settings.",
     );
@@ -208,6 +211,7 @@ describe("boxers project init", () => {
     cleanup.push(root, state);
     process.env["BOXERS_HOME"] = state;
     git(root, "init", "-q", "-b", "main");
+    git(root, "remote", "add", "origin", root);
     git(root, "config", "user.name", "Test User");
     git(root, "config", "user.email", "test@example.invalid");
     writeFileSync(join(root, "tracked.txt"), "tracked\n");
@@ -215,12 +219,12 @@ describe("boxers project init", () => {
     git(root, "commit", "-q", "-m", "base");
     const configDir = join(root, ".boxers");
     mkdirSync(configDir);
-    const configText = "version: 3\nintegration:\n  mode: local\n  base: main\n";
+    const configText = "version: 3\nintegration:\n  remote: origin\n  base: main\n";
     writeFileSync(join(configDir, "config.yml"), configText);
     process.chdir(root);
 
     const project = await requireOrRegisterProject();
-    expect(project.integration).toEqual({ mode: "local", base: "main" });
+    expect(project.integration).toEqual({ remote: "origin", base: "main" });
     expect(readFileSync(join(configDir, "config.yml"), "utf8")).toBe(configText);
     expect(await requireOrRegisterProject()).toEqual(project);
   });
@@ -231,6 +235,7 @@ describe("boxers project init", () => {
     cleanup.push(root, state);
     process.env["BOXERS_HOME"] = state;
     git(root, "init", "-q", "-b", "main");
+    git(root, "remote", "add", "origin", root);
     git(root, "config", "user.name", "Test User");
     git(root, "config", "user.email", "test@example.invalid");
     writeFileSync(
@@ -264,6 +269,7 @@ describe("boxers project init", () => {
     cleanup.push(root, state);
     process.env["BOXERS_HOME"] = state;
     git(root, "init", "-q", "-b", "main");
+    git(root, "remote", "add", "origin", root);
     git(root, "config", "user.name", "Test User");
     git(root, "config", "user.email", "test@example.invalid");
     writeFileSync(join(root, "README.md"), "preview fixture\n");
@@ -290,6 +296,7 @@ describe("boxers project init", () => {
     cleanup.push(root, state);
     process.env["BOXERS_HOME"] = state;
     git(root, "init", "-q", "-b", "main");
+    git(root, "remote", "add", "origin", root);
     git(root, "config", "user.name", "Test User");
     git(root, "config", "user.email", "test@example.invalid");
     writeFileSync(join(root, "README.md"), "preview fixture\n");

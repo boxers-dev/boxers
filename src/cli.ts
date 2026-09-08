@@ -35,7 +35,7 @@ import {
   runDaemonReplacement,
   runDaemonForeground,
 } from "./v2/daemon-commands.ts";
-import { isAgent, type Agent, type IntegrationMode } from "./v2/types.ts";
+import { isAgent, type Agent } from "./v2/types.ts";
 import {
   remoteSnapshot,
   remoteWatch,
@@ -90,7 +90,7 @@ Auth
 
 Project
   boxers project status [--json]
-  boxers project init [--integration local|remote] [--base <branch>]
+  boxers project init [--base <branch>]
       [--remote <name-or-url>]
       [--agent codex|claude] [--model <name>] [--effort <level>] [--fast|--no-fast]
       [--checks|--no-checks] [--preview|--no-preview]
@@ -157,7 +157,6 @@ function only(args: string[], allowed: readonly string[], command: string): void
 }
 
 function parseInit(args: string[]): {
-  integration?: IntegrationMode;
   base?: string;
   remote?: string;
   checks?: boolean;
@@ -170,7 +169,6 @@ function parseInit(args: string[]): {
   effort?: string;
   fast?: boolean;
 } {
-  let integration: IntegrationMode | undefined;
   let base: string | undefined;
   let remote: string | undefined;
   let checks: boolean | undefined;
@@ -194,18 +192,7 @@ function parseInit(args: string[]): {
     else if (arg?.startsWith("--effort=")) effort = arg.slice(9);
     else if (arg === "--fast") fast = true;
     else if (arg === "--no-fast") fast = false;
-    else if (arg === "--integration") {
-      const candidate = value(args, index, arg);
-      if (candidate !== "local" && candidate !== "remote")
-        throw new UsageError("--integration must be local or remote.");
-      integration = candidate;
-      index++;
-    } else if (arg?.startsWith("--integration=")) {
-      const candidate = arg.slice(14);
-      if (candidate !== "local" && candidate !== "remote")
-        throw new UsageError("--integration must be local or remote.");
-      integration = candidate;
-    } else if (arg === "--base") {
+    else if (arg === "--base") {
       base = value(args, index, arg);
       index++;
     } else if (arg?.startsWith("--base=")) base = arg.slice(7);
@@ -237,8 +224,6 @@ function parseInit(args: string[]): {
     } else if (arg === "-y" || arg === "--yes") yes = true;
     else throw new UsageError(`Unexpected argument for project init: ${arg}`);
   }
-  if (integration === "local" && remote)
-    throw new UsageError("--remote applies only to remote integration.");
   if (preview === false && (previewCommand || previewPorts.length))
     throw new UsageError("--no-preview cannot be combined with preview command options.");
   if (previewCommand && !previewPorts.length)
@@ -246,7 +231,6 @@ function parseInit(args: string[]): {
   if (!previewCommand && previewPorts.length)
     throw new UsageError("--preview-port requires --preview-command.");
   return {
-    ...(integration ? { integration } : {}),
     ...(base ? { base } : {}),
     ...(remote ? { remote } : {}),
     ...(checks !== undefined ? { checks } : {}),

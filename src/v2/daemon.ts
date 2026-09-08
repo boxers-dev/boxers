@@ -12,6 +12,7 @@ import {
   daemonLockPath,
   daemonPidPath,
   daemonSocketPath,
+  taskReconciliationPath,
 } from "./paths.ts";
 import {
   DAEMON_PROTOCOL_VERSION,
@@ -27,7 +28,7 @@ import {
 import { readVersion } from "../core/version.ts";
 import type { OutputSink } from "../core/output.ts";
 import { captureStateProjection } from "./projection.ts";
-import { listProjects, listTasks } from "./registry.ts";
+import { listProjects, listTasks, readSeedTarget } from "./registry.ts";
 import { startPeerObservers, type PeerObserverHandle } from "./peer-cache.ts";
 import { ensureTaskState, readTaskState, recordAgentExited, updateTaskState } from "./state.ts";
 import {
@@ -38,6 +39,7 @@ import {
   taskRuntimeId,
 } from "./runtime/task.ts";
 import type { RuntimeInfo } from "./runtime/types.ts";
+import type { RecordedTaskOperation, TaskOperationKind } from "./types.ts";
 import { gossipFleetMembership } from "./fleet-connect.ts";
 import { fleetReleaseNeedsDaemonReplacement, reconcileFleetRelease } from "./fleet-release.ts";
 import { activeManagedBuildId, activeReleaseBuildId } from "./release.ts";
@@ -64,11 +66,20 @@ const POST_TURN_ACTIVITY = {
   checking: "Running checks",
   generating_metadata: "Generating candidate metadata",
 };
+const POST_TURN_OPERATION: Record<keyof typeof POST_TURN_ACTIVITY, TaskOperationKind> = {
+  refreshing: "refreshing_target",
+  reconciling: "reconciling",
+  capturing: "capturing_changes",
+  checking: "running_checks",
+  generating_metadata: "generating_metadata",
+};
 
 interface PostTurnJob {
   sequence: number;
+  targetOid?: string;
   abort: AbortController;
   completion: Promise<void>;
+  operation: RecordedTaskOperation;
 }
 
 interface ViewerState {
@@ -114,6 +125,8 @@ export interface DaemonOptions {
     onProgress: (
       phase: "refreshing" | "reconciling" | "capturing" | "checking" | "generating_metadata",
     ) => void,
+    targetChanged?: boolean,
+    onOwnership?: (owned: boolean) => void,
   ) => Promise<
     | {
         targetOid?: string;
@@ -202,7 +215,7 @@ function startSession(
     inputFlushTimer: undefined,
     state: "running",
     controlParser: request.bridgeToken ? new PtyControlParser(request.bridgeToken) : undefined,
-    uncommittedInput: false,
+    uncommittedInput: request.startsTurn === true,
   };
   sessions.set(request.sessionId, session);
   proc.onData((chunk) => {
@@ -249,10 +262,13 @@ export function runDaemon(
   const busyTaskNames = new Set<string>();
   const intentTails = new Map<string, Promise<void>>();
   const intentControllers = new Map<string, AbortController>();
+  const intentOperations = new Map<string, RecordedTaskOperation>();
   const lifecycleTails = new Map<string, Promise<void>>();
   const postTurnJobs = new Map<string, PostTurnJob>();
   const postTurnHighWater = new Map<string, number>();
   const deferredPostTurns = new Set<string>();
+  const pendingTargets = new Map<string, string>();
+  const attemptedTargets = new Map<string, string>();
   let peerObservers: PeerObserverHandle | undefined;
   let updateReplacementRequested = false;
   let draining = false;
@@ -272,37 +288,150 @@ export function runDaemon(
   const abortPostTurn = (taskName: string): Promise<void> => {
     const job = postTurnJobs.get(taskName.toLowerCase());
     if (!job) return Promise.resolve();
+    if (job.targetOid && !pendingTargets.has(taskName.toLowerCase()))
+      pendingTargets.set(taskName.toLowerCase(), job.targetOid);
     job.abort.abort();
+    job.operation.state = "cancelling";
     return job.completion;
+  };
+
+  const unfinishedReconciliation = (taskName: string): boolean => {
+    const task = listProjects()
+      .flatMap((project) => listTasks(project))
+      .find((candidate) => candidate.name.toLowerCase() === taskName.toLowerCase());
+    return Boolean(task && existsSync(taskReconciliationPath(task.projectId, task.id)));
+  };
+
+  const taskHasPendingInput = (key: string): boolean =>
+    [...sessions.values()].some(
+      (session) =>
+        session.state === "running" &&
+        session.taskName?.toLowerCase() === key &&
+        (session.uncommittedInput || session.pendingInput.length > 0 || session.inputFlushPending),
+    );
+
+  const prepareAgentStart = async (taskName: string): Promise<string | undefined> => {
+    const key = taskName.toLowerCase();
+    const blocked = (): string | undefined => {
+      if (unfinishedReconciliation(taskName))
+        return `Task ${taskName} has an unfinished reconciliation; refusing to start an agent while the Sandbox mutation outcome is unknown. Recover or explicitly discard the task first.`;
+      if (intentTails.has(key) || postTurnJobs.get(key)?.operation.workspaceMutation)
+        return `Task ${taskName} has a workspace operation in progress; retry starting the agent after it finishes.`;
+      return undefined;
+    };
+    const failure = blocked();
+    if (failure) return failure;
+    if (busyTaskNames.has(key))
+      return `Task ${taskName} has a workspace operation in progress; retry after it finishes.`;
+    // Cancel only safe background work. This is ownership exclusion, not a
+    // target fetch or a mandatory pre-turn preparation passage.
+    busyTaskNames.add(key);
+    try {
+      await abortPostTurn(taskName);
+      return blocked();
+    } finally {
+      busyTaskNames.delete(key);
+    }
+  };
+
+  const drainPending = (taskName: string): void => {
+    const key = taskName.toLowerCase();
+    if (postTurnJobs.has(key) || (!pendingTargets.has(key) && !deferredPostTurns.has(key))) return;
+    for (const project of listProjects()) {
+      const task = listTasks(project).find((task) => task.name.toLowerCase() === key);
+      if (!task) continue;
+      const state = readTaskState(project, task);
+      if (pendingTargets.get(key) === state.baseOid) pendingTargets.delete(key);
+      if (!pendingTargets.has(key) && !deferredPostTurns.has(key)) return;
+      if (!["not_started", "awaiting_input", "exited"].includes(state.agentTurnState)) return;
+      if (task.lastSnapshot?.setup?.state === "running") return;
+      if (task.lastSnapshot?.runtimeState && task.lastSnapshot.runtimeState !== "running") return;
+      if (unfinishedReconciliation(task.name)) return;
+      startPostTurn(task.name, state.conversationHighWaterSequence, true);
+      return;
+    }
   };
 
   const startPostTurn = (taskName: string, sequence: number, resumeDeferred = false): void => {
     if (closing) return;
     const key = taskName.toLowerCase();
+    if (busyTaskNames.has(key) || intentTails.has(key) || taskHasPendingInput(key)) {
+      deferredPostTurns.add(key);
+      return;
+    }
+    const targetOid = pendingTargets.get(key);
+    const previous = postTurnJobs.get(key);
+    // Changed-target hints never cancel active preparation. Drain the newest
+    // pending target once that worker reaches its normal completion boundary.
+    if (previous && targetOid) {
+      deferredPostTurns.add(key);
+      return;
+    }
     if (
       (postTurnHighWater.get(key) ?? 0) >= sequence &&
-      !(resumeDeferred && deferredPostTurns.has(key))
+      !(resumeDeferred && deferredPostTurns.has(key)) &&
+      !targetOid
     )
       return;
     postTurnHighWater.set(key, sequence);
     deferredPostTurns.delete(key);
-    const previous = postTurnJobs.get(key);
     if (previous?.sequence === sequence) return;
+    pendingTargets.delete(key);
+    if (targetOid) attemptedTargets.set(key, targetOid);
     previous?.abort.abort();
     const abort = new AbortController();
-    const job = { sequence, abort, completion: Promise.resolve() } satisfies PostTurnJob;
+    const job: PostTurnJob = {
+      sequence,
+      ...(targetOid ? { targetOid } : {}),
+      abort,
+      completion: Promise.resolve(),
+      operation: { kind: "refreshing_target", state: "queued" },
+    };
+    let deferred = false;
     job.completion = Promise.resolve()
       .then(async () => {
+        // A replacement Stop must also wait for a protected previous worker.
+        await previous?.completion;
+        if (abort.signal.aborted) return;
         debug(`Started post-turn processing on sandbox ${debugValue(taskName)}.`);
-        const result = await (options.executePostTurn ?? postTurnInWorker)(
-          taskName,
-          sequence,
-          abort.signal,
-          (phase) => debug(`${POST_TURN_ACTIVITY[phase]} on sandbox ${debugValue(taskName)}.`),
-        );
+        job.operation = {
+          kind: "refreshing_target",
+          state: "running",
+          startedAt: new Date().toISOString(),
+        };
+        const progress: Parameters<NonNullable<DaemonOptions["executePostTurn"]>>[3] = (phase) => {
+          job.operation.kind = POST_TURN_OPERATION[phase];
+          publishChange();
+          debug(`${POST_TURN_ACTIVITY[phase]} on sandbox ${debugValue(taskName)}.`);
+        };
+        const ownership = (owned: boolean): void => {
+          job.operation.workspaceMutation = owned;
+          publishChange();
+        };
+        const result = options.executePostTurn
+          ? await options.executePostTurn(
+              taskName,
+              sequence,
+              abort.signal,
+              progress,
+              Boolean(targetOid),
+              ownership,
+            )
+          : await postTurnInWorker(
+              taskName,
+              sequence,
+              abort.signal,
+              progress,
+              undefined,
+              Boolean(targetOid),
+              ownership,
+            );
         if (!abort.signal.aborted) {
-          if (result?.deferred) deferredPostTurns.add(key);
-          else debug(`Finished post-turn processing on sandbox ${debugValue(taskName)}.`);
+          if (result?.deferred) {
+            deferred = true;
+            deferredPostTurns.add(key);
+            if (targetOid && !pendingTargets.has(key)) pendingTargets.set(key, targetOid);
+          } else debug(`Finished post-turn processing on sandbox ${debugValue(taskName)}.`);
         }
       })
       .catch((error) => {
@@ -314,6 +443,7 @@ export function runDaemon(
       .finally(() => {
         if (postTurnJobs.get(key) === job) postTurnJobs.delete(key);
         publishChange();
+        if (!deferred) drainPending(taskName);
       });
     postTurnJobs.set(key, job);
   };
@@ -352,10 +482,11 @@ export function runDaemon(
             `Received ${events.length} lifecycle event${events.length === 1 ? "" : "s"} for sandbox ${debugValue(taskName)}: ${events.map((event) => `${event.kind}#${event.sequence}`).join(", ")}.`,
           );
         else debug(`No new lifecycle events for sandbox ${debugValue(taskName)}.`);
-        acceptLifecycle(taskName, events);
-        if (events.length)
+        if (events.some((event) => event.kind === "user_prompt"))
           for (const session of sessions.values())
             if (session.taskName?.toLowerCase() === key) session.uncommittedInput = false;
+        acceptLifecycle(taskName, events);
+        drainPending(taskName);
         publishChange();
       })
       .catch((error) => {
@@ -548,6 +679,18 @@ export function runDaemon(
       session.inputFlushTimer = timer;
       return;
     }
+    // A dead worker may have left a live mutator inside the Sandbox. Retain
+    // input until the uncertainty is explicitly resolved; PID death is not proof.
+    if (session.taskName) {
+      if (unfinishedReconciliation(session.taskName)) {
+        if (session.activeWriter)
+          send(session.activeWriter, {
+            type: "error",
+            message: `Task ${session.taskName} has an unfinished reconciliation; input is held until the Sandbox operation is known stopped and recovered, or the task is explicitly discarded.`,
+          });
+        return;
+      }
+    }
     const input = session.pendingInput.splice(0).join("");
     if (input && session.state === "running") session.proc.write(input);
   };
@@ -594,6 +737,11 @@ export function runDaemon(
               undefined,
               onWorkerSpawn,
               signal,
+              (owned) => {
+                const operation = intentOperations.get(message.task.toLowerCase());
+                if (operation) operation.workspaceMutation = owned;
+                publishChange();
+              },
             )
           : await executeIntentDirect(message.task, message.intent, output);
     } catch (error) {
@@ -620,7 +768,7 @@ export function runDaemon(
     debug(
       `Received ${debugValue(message.intent.kind)} command for sandbox ${debugValue(message.task)}.`,
     );
-    if (intentTails.has(taskKey)) {
+    if (intentTails.has(taskKey) || busyTaskNames.has(taskKey)) {
       send(socket, {
         type: "error",
         intentId: message.intentId,
@@ -628,8 +776,39 @@ export function runDaemon(
       });
       return;
     }
+    const needsStableInput =
+      !(message.intent.kind === "discard" && message.intent.force) &&
+      !(
+        message.intent.kind === "preview" &&
+        ["show", "logs", "stop"].includes(message.intent.action ?? "show")
+      );
+    const assertNoPendingInput = (): void => {
+      if (needsStableInput && taskHasPendingInput(taskKey))
+        throw new Error(
+          `Task ${message.task} has input awaiting its lifecycle acknowledgment; finish the prompt or wait for the agent turn, then retry.`,
+        );
+    };
+    const kinds: Record<typeof message.intent.kind, TaskOperationKind> = {
+      sync: "reconciling",
+      review: "reviewing",
+      check: "running_checks",
+      setup: "setup",
+      promote: "promoting",
+      preview: "starting_preview",
+      discard: "discarding",
+    };
+    const operation: RecordedTaskOperation = {
+      kind: kinds[message.intent.kind],
+      state: "queued",
+      intentId: message.intentId,
+    };
+    intentOperations.set(taskKey, operation);
     const running = (async () => {
+      assertNoPendingInput();
       await abortPostTurn(taskKey);
+      assertNoPendingInput();
+      operation.state = "running";
+      operation.startedAt = new Date().toISOString();
       const intentController = new AbortController();
       intentControllers.set(taskKey, intentController);
       busyTaskNames.add(taskKey);
@@ -649,6 +828,8 @@ export function runDaemon(
       })
       .finally(() => {
         if (intentTails.get(taskKey) === running) intentTails.delete(taskKey);
+        intentOperations.delete(taskKey);
+        drainPending(message.task);
       });
     intentTails.set(taskKey, running);
   };
@@ -690,6 +871,11 @@ export function runDaemon(
           void (async () => {
             let session = sessions.get(message.sessionId);
             if (!session || session.state === "exited") {
+              const failure = await prepareAgentStart(message.taskName);
+              if (failure) {
+                send(socket, { type: "error", requestId: message.requestId, message: failure });
+                return;
+              }
               session = startSession(sessions, message, message.taskName, onSessionEvent);
               debug(`Started agent session on sandbox ${debugValue(message.taskName)}.`);
             }
@@ -741,12 +927,18 @@ export function runDaemon(
           return;
         }
         case "get_snapshot": {
+          const operations = new Map<string, RecordedTaskOperation[]>();
+          for (const key of new Set([...pendingTargets.keys(), ...deferredPostTurns]))
+            operations.set(key, [{ kind: "reconciling", state: "queued" }]);
+          for (const [key, job] of postTurnJobs) operations.set(key, [job.operation]);
+          for (const [key, operation] of intentOperations)
+            operations.set(key, [...(operations.get(key) ?? []), operation]);
           send(socket, {
             type: "snapshot",
             requestId: message.requestId,
             epoch,
             revision,
-            snapshot: captureStateProjection(),
+            snapshot: captureStateProjection(operations),
           });
           return;
         }
@@ -776,6 +968,7 @@ export function runDaemon(
             );
             if (!task) continue;
             const state = readTaskState(project, task);
+            drainPending(taskName);
             if (
               state.agentTurnState === "awaiting_input" &&
               state.conversationHighWaterSequence > 0
@@ -784,6 +977,47 @@ export function runDaemon(
             break;
           }
           publishChange();
+          return;
+        }
+        case "target_changed": {
+          const project = listProjects().find((project) => project.id === message.projectId);
+          if (!project) return;
+          const targetOid = readSeedTarget(project);
+          if (!targetOid) return;
+          for (const task of listTasks(project)) {
+            const key = task.name.toLowerCase();
+            const state = readTaskState(project, task);
+            if (state.observedTargetOid !== targetOid)
+              updateTaskState(project, task, { observedTargetOid: targetOid }, "git");
+            if (state.baseOid === targetOid) {
+              pendingTargets.delete(key);
+              continue;
+            }
+            if (
+              attemptedTargets.get(key) === targetOid ||
+              postTurnJobs.get(key)?.targetOid === targetOid
+            )
+              continue;
+            pendingTargets.set(key, targetOid);
+            drainPending(task.name);
+          }
+          publishChange();
+          return;
+        }
+        case "prepare_task": {
+          for (const project of listProjects()) {
+            const task = listTasks(project).find(
+              (task) => task.name.toLowerCase() === message.taskName.toLowerCase(),
+            );
+            if (!task) continue;
+            const key = task.name.toLowerCase();
+            const targetOid = readSeedTarget(project);
+            const state = readTaskState(project, task);
+            if (targetOid && state.baseOid !== targetOid && attemptedTargets.get(key) !== targetOid)
+              pendingTargets.set(key, targetOid);
+            drainPending(task.name);
+            break;
+          }
           return;
         }
         case "run_intent": {
@@ -822,6 +1056,14 @@ export function runDaemon(
             );
             let session = sessions.get(message.sessionId);
             if (!session || session.state === "exited") {
+              const failure = taskName ? await prepareAgentStart(taskName) : undefined;
+              if (failure) {
+                send(socket, {
+                  type: "error",
+                  message: failure,
+                });
+                return;
+              }
               session = startSession(sessions, message, taskName, onSessionEvent);
               debug(
                 `Started agent session on sandbox ${debugValue(taskName ?? message.sessionId)}.`,

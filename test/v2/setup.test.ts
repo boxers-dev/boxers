@@ -47,7 +47,7 @@ function fixture(name: string): {
   writeFileSync(join(root, "base.txt"), "base\n");
   execFileSync("git", ["-C", root, "add", "."]);
   execFileSync("git", ["-C", root, "commit", "-q", "-m", "base"]);
-  const project = initProject({ integration: "local", base: "main", cwd: root });
+  const project = initProject({ remote: root, base: "main", cwd: root });
   const task = createTaskManifest(project, name, "codex");
   writeFileSync(
     join(bin, "sbx"),

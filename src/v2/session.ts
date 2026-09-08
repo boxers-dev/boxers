@@ -133,6 +133,7 @@ export async function runAgentSessionInteractive(
     return await attachInteractive(taskRuntimeId(task), spec.command, spec.args, {
       taskName: task.name,
       bridgeToken: task.lifecycleBridgeToken,
+      startsTurn: options.prompt !== undefined,
     });
   } finally {
     resetTerminalInputModes();
@@ -151,6 +152,7 @@ export async function runAgentSessionDetached(
     task.lifecycleBridgeToken,
     spec.command,
     spec.args,
+    options.prompt !== undefined,
   );
 }
 

@@ -105,7 +105,7 @@ describe("fleet identity and administration", () => {
 
   it("recovers a fleet lock left by a dead writer", () => {
     process.env.BOXERS_HOME = stateDirectory();
-    writeFileSync(fleetLockPath(), "2147483647\n");
+    writeFileSync(fleetLockPath(), "2147483647\ninterrupted-test\n");
     expect(ensureFleet().members).toHaveLength(1);
   });
 
@@ -149,7 +149,7 @@ describe("fleet identity and administration", () => {
     const encoded = encodeAdminRequest("1.2.3");
 
     process.env.BOXERS_HOME = receiverHome;
-    writeFileSync(fleetAdminStateLockPath(), "2147483647\n");
+    writeFileSync(fleetAdminStateLockPath(), "2147483647\ninterrupted-test\n");
     expect(decodeAdminRequest(encoded)).toMatchObject({
       fleetId: senderFleet.fleetId,
       requesterHostId: sender.hostId,

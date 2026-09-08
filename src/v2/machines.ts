@@ -76,7 +76,7 @@ export function parseRemoteSnapshot(text: string): RemoteSnapshot {
           typeof project.id !== "string" ||
           typeof project.name !== "string" ||
           typeof project.base !== "string" ||
-          (project.integration !== "local" && project.integration !== "remote") ||
+          typeof project.remote !== "string" ||
           (project.source !== undefined && typeof project.source !== "string"),
       ))
   )

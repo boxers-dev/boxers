@@ -15,5 +15,5 @@ export function isDaemonBackedTaskInvocation(args: readonly string[]): boolean {
   // command reaches its owning host. That host then queues it locally.
   if (!task || task === "daemon" || task.includes("/")) return false;
   if (DAEMON_BACKED_TASK_INTENTS.has(command ?? "")) return true;
-  return command === "status" && args.includes("--refresh");
+  return false;
 }

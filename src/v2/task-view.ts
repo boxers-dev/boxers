@@ -8,6 +8,7 @@ import type {
   TaskIssue,
   TaskState,
   TaskView,
+  ProjectTargetObservation,
 } from "./types.ts";
 
 export interface TaskViewInput {
@@ -20,6 +21,9 @@ export interface TaskViewInput {
   operations?: readonly RecordedTaskOperation[];
   runtimeState?: string;
   reconciliationConflicts?: readonly string[];
+  target?: ProjectTargetObservation;
+  reconciliationUncertain?: boolean;
+  deliveryPending?: boolean;
 }
 
 const AGENT_LABEL = {
@@ -89,16 +93,31 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
     ["refreshing_target", "reconciling"].includes(operation.kind),
   );
   const captureOperation = operations.find((operation) => operation.kind === "capturing_changes");
+  const observedTargetOid = input.target?.oid ?? state.observedTargetOid;
+  const uncertain =
+    input.reconciliationUncertain &&
+    !operations.some(
+      (operation) => operation.workspaceMutation === true && operation.state !== "queued",
+    );
+  const mutationRunning = input.reconciliationUncertain && !uncertain;
 
-  const reconciliation: TaskView["reconciliation"] = conflicted
-    ? { state: "conflicted", ...(conflicts.length ? { conflicts } : {}) }
-    : setup.state === "running" || setup.state === "retrying"
-      ? { state: "awaiting_setup" }
-      : reconciliationOperation
-        ? { state: reconciliationOperation.state === "queued" ? "queued" : "running" }
-        : state.baseOid
-          ? { state: "current" }
-          : { state: "not_needed" };
+  const reconciliation: TaskView["reconciliation"] = mutationRunning
+    ? { state: "running" }
+    : uncertain || input.target?.failure
+      ? { state: "failed" }
+      : conflicted
+        ? { state: "conflicted", ...(conflicts.length ? { conflicts } : {}) }
+        : setup.state === "running" || setup.state === "retrying"
+          ? { state: "awaiting_setup" }
+          : reconciliationOperation
+            ? { state: reconciliationOperation.state === "queued" ? "queued" : "running" }
+            : observedTargetOid && observedTargetOid !== state.baseOid
+              ? { state: "queued" }
+              : state.baseOid && observedTargetOid
+                ? { state: "current" }
+                : state.baseOid
+                  ? { state: "unknown" }
+                  : { state: "not_needed" };
 
   const changes: TaskView["changes"] = conflicted
     ? { state: "conflicted", observedAt: state.hasUnmergedChanges.observedAt }
@@ -113,16 +132,20 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
             : { state: "none", observedAt: state.hasUnmergedChanges.observedAt };
 
   const currentCheck = exactCheck(state, input.checkConfigHash);
-  const checksConfigured = input.checksConfigured === true || Boolean(state.check);
-  const checks: TaskView["checks"] =
-    setup.state === "running" ||
-    setup.state === "retrying" ||
-    setup.state === "failed" ||
-    setup.state === "timed_out" ||
-    setup.state === "interrupted" ||
-    setup.state === "stale"
+  const checksConfigured =
+    input.checksConfigured === true ||
+    Boolean(state.check) ||
+    Boolean(delivery && changes.state === "none" && delivery.checks !== "not_configured");
+  const checks: TaskView["checks"] = !checksConfigured
+    ? { state: "not_configured" }
+    : setup.state === "running" ||
+        setup.state === "retrying" ||
+        setup.state === "failed" ||
+        setup.state === "timed_out" ||
+        setup.state === "interrupted" ||
+        setup.state === "stale"
       ? { state: "awaiting_setup" }
-      : ["queued", "running", "conflicted"].includes(reconciliation.state)
+      : ["queued", "running", "conflicted", "failed"].includes(reconciliation.state)
         ? { state: "awaiting_reconciliation" }
         : changes.state === "capturing"
           ? { state: "awaiting_candidate" }
@@ -139,13 +162,40 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
                           ? "not_configured"
                           : "not_run",
                   }
-                : !checksConfigured
-                  ? { state: "not_configured" }
-                  : !state.candidateTreeOid
-                    ? { state: "awaiting_candidate" }
-                    : { state: "not_run" };
+                : !state.candidateTreeOid
+                  ? { state: "awaiting_candidate" }
+                  : { state: "not_run" };
 
   const issues: TaskIssue[] = [];
+  if (input.target?.failure)
+    issues.push({
+      code: "target_refresh_failed",
+      source: "reconciliation",
+      owner: "host",
+      message: `Target freshness could not be verified: ${input.target.failure}`,
+      remediation: action(
+        "refresh",
+        "Refresh status",
+        "Retry target observation.",
+        `boxers ${name} status`,
+      ),
+    });
+  if (uncertain)
+    issues.push({
+      code: "operation_failed",
+      source: "reconciliation",
+      owner: "boxers",
+      message:
+        "Unfinished reconciliation: workspace mutation outcome is unknown. The checkpoint is retained and generation is blocked; inspect the failure or explicitly discard and recreate the task.",
+    });
+  if (input.deliveryPending && !operations.some((operation) => operation.kind === "promoting"))
+    issues.push({
+      code: "operation_failed",
+      source: "reconciliation",
+      owner: "boxers",
+      message:
+        "Delivery is pending confirmation or workspace advancement. Retry promote to resolve the existing attempt without duplicating it.",
+    });
   if (["failed", "timed_out", "interrupted", "stale"].includes(setup.state)) {
     const retry = action(
       "retry_setup",
@@ -169,7 +219,7 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
       remediation: retry,
     });
   }
-  if (conflicted)
+  if (conflicted && !mutationRunning && !uncertain)
     issues.push({
       code: "reconciliation_conflict",
       source: "reconciliation",
@@ -221,7 +271,7 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
         "boxers doctor",
       ),
     });
-  if (state.failure && !conflicted)
+  if (state.failure && !conflicted && !mutationRunning)
     issues.push({
       code: "operation_failed",
       source: "daemon",
@@ -245,8 +295,13 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
     state.hasUnmergedChanges.conversationSequence !== undefined &&
     state.hasUnmergedChanges.conversationSequence === state.conversationHighWaterSequence;
   const removal: TaskView["removal"] =
-    state.agentTurnState === "working"
-      ? { state: "blocked_by_activity", reason: "The agent is generating." }
+    state.agentTurnState === "working" || input.reconciliationUncertain
+      ? {
+          state: "blocked_by_activity",
+          reason: input.reconciliationUncertain
+            ? "Workspace mutation is active or its outcome is unknown."
+            : "The agent is generating.",
+        }
       : changes.state === "unmerged" || changes.state === "conflicted"
         ? { state: "blocked_by_unmerged_changes", reason: "Unmerged task changes remain." }
         : changes.state === "unknown"
@@ -266,7 +321,16 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
               };
 
   const actions: TaskActionView[] = [];
-  if (foregroundOperationActive)
+  if (uncertain)
+    actions.push(
+      action(
+        "discard",
+        "Discard and recreate",
+        "Explicitly discard this task's work if recovery is not worthwhile.",
+        `boxers ${name} discard --force`,
+      ),
+    );
+  else if (foregroundOperationActive)
     actions.push(action("wait", "Wait", "A Boxers operation is in progress."));
   else if (conflicted)
     actions.push(
@@ -402,6 +466,22 @@ export function deriveTaskView(input: TaskViewInput): TaskView {
 
   return {
     agent: { state: state.agentTurnState, label: AGENT_LABEL[state.agentTurnState] },
+    ...(input.target
+      ? {
+          target: {
+            branch: input.target.base,
+            state: input.target.failure
+              ? ("unavailable" as const)
+              : input.target.oid
+                ? ("observed" as const)
+                : ("unknown" as const),
+            ...(state.baseOid ? { installedOid: state.baseOid } : {}),
+            ...(observedTargetOid ? { observedOid: observedTargetOid } : {}),
+            ...(input.target.observedAt ? { observedAt: input.target.observedAt } : {}),
+            ...(input.target.failure ? { failure: input.target.failure } : {}),
+          },
+        }
+      : {}),
     operations,
     setup,
     reconciliation,
@@ -432,6 +512,13 @@ function setupView(status: SetupStatus | undefined, configured: boolean): TaskVi
 
 export function formatTaskView(name: string, view: TaskView): string {
   const lines = [name, "", `Agent: ${view.agent.label}`];
+  if (view.target) {
+    lines.push(`Target: ${view.target.branch} (${view.target.state})`);
+    lines.push(`Installed base: ${view.target.installedOid ?? "unknown"}`);
+    lines.push(
+      `Observed target: ${view.target.observedOid ?? "unknown"}${view.target.observedAt ? ` at ${view.target.observedAt}` : ""}`,
+    );
+  }
   if (view.operations.length)
     lines.push(
       `Operations: ${view.operations.map((operation) => `${operation.kind.replaceAll("_", " ")} (${operation.state})`).join(", ")}`,
@@ -501,6 +588,7 @@ export function isTaskView(value: unknown): value is TaskView {
     Object.keys(value).every((key) =>
       [
         "agent",
+        "target",
         "operations",
         "setup",
         "reconciliation",
@@ -515,12 +603,25 @@ export function isTaskView(value: unknown): value is TaskView {
     ) &&
     view.agent &&
     typeof view.agent.label === "string" &&
+    (view.target === undefined ||
+      (typeof view.target === "object" &&
+        view.target !== null &&
+        typeof view.target.branch === "string" &&
+        oneOf(view.target.state, ["observed", "unknown", "unavailable"]) &&
+        [
+          view.target.installedOid,
+          view.target.observedOid,
+          view.target.observedAt,
+          view.target.failure,
+        ].every((value) => value === undefined || typeof value === "string"))) &&
     oneOf(view.agent.state, ["not_started", "working", "awaiting_input", "exited", "unknown"]) &&
     Array.isArray(view.operations) &&
     view.operations.every(
       (operation) =>
         operation &&
         typeof operation === "object" &&
+        (operation.workspaceMutation === undefined ||
+          typeof operation.workspaceMutation === "boolean") &&
         oneOf(operation.state, ["queued", "running", "cancelling"]) &&
         oneOf(operation.kind, [
           "setup",
@@ -551,6 +652,7 @@ export function isTaskView(value: unknown): value is TaskView {
     typeof view.reconciliation === "object" &&
     oneOf(view.reconciliation.state, [
       "not_needed",
+      "unknown",
       "awaiting_setup",
       "queued",
       "running",
@@ -604,6 +706,7 @@ export function isTaskView(value: unknown): value is TaskView {
           "runtime_unavailable",
           "lifecycle_capture_failed",
           "operation_failed",
+          "target_refresh_failed",
         ]) &&
         oneOf(issue.source, [
           "setup",
@@ -645,6 +748,7 @@ const title = (value: string): string =>
   value.replaceAll("_", " ").replace(/^./, (letter) => letter.toUpperCase());
 const reconciliationLabel = (state: TaskView["reconciliation"]["state"]): string =>
   ({
+    unknown: "Target freshness unknown",
     awaiting_setup: "Waiting for setup",
     queued: "Queued",
     running: "In progress",
@@ -666,7 +770,7 @@ const removalLabel = (state: TaskView["removal"]["state"]): string =>
   ({
     safe: "Can be discarded safely",
     verification_required: "Workspace verification required",
-    blocked_by_activity: "Cannot be discarded safely - agent is generating",
+    blocked_by_activity: "Cannot be discarded safely - workspace activity is unresolved",
     blocked_by_unmerged_changes: "Cannot be discarded safely - unmerged changes remain",
     unknown: "Unknown - refresh required",
   })[state];

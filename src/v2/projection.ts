@@ -1,6 +1,8 @@
 import { basename } from "node:path";
+import { existsSync } from "node:fs";
+import { taskReconciliationPath, taskDeliveryPath } from "./paths.ts";
 import { readVersion } from "../core/version.ts";
-import { listProjects, listTasks, localMachineIdentity } from "./registry.ts";
+import { listProjects, listTasks, localMachineIdentity, readProjectTarget } from "./registry.ts";
 import { readTaskState } from "./state.ts";
 import type {
   ProjectManifest,
@@ -10,6 +12,8 @@ import type {
   TaskState,
   TaskSnapshot,
   TaskView,
+  RecordedTaskOperation,
+  ProjectTargetObservation,
 } from "./types.ts";
 import { readHostStatus } from "./host-status.ts";
 import { fleetReleaseIsAcknowledged, readFleetUpdateState } from "./fleet-update.ts";
@@ -30,17 +34,39 @@ export function projectTaskView(
   project: ProjectManifest,
   task: TaskManifest,
   recordedState = readTaskState(project, task),
-  _options: { ignoreOperationKind?: string } = {},
+  options: {
+    ignoreOperationKind?: string;
+    operations?: readonly RecordedTaskOperation[];
+    target?: ProjectTargetObservation;
+    workspaceChanges?: boolean;
+  } = {},
 ): TaskView {
-  const state = recordedState;
+  const state =
+    options.workspaceChanges === undefined
+      ? recordedState
+      : {
+          ...recordedState,
+          hasUnmergedChanges: {
+            ...recordedState.hasUnmergedChanges,
+            value: options.workspaceChanges,
+          },
+        };
   const setupConfigured = state.setupConfigured ?? Boolean(state.setup);
   const checksConfigured = state.checksConfigured ?? Boolean(state.check);
   const checkConfigHash = state.checkConfigHash;
+  const target = options.target ?? readProjectTarget(project);
+  const operations = options.operations?.filter(
+    (operation) => operation.kind !== options.ignoreOperationKind,
+  );
   return deriveTaskView({
     name: task.name,
     state,
     setupConfigured,
     checksConfigured,
+    target: target ?? { ...project.integration, attemptedAt: "" },
+    ...(operations ? { operations } : {}),
+    reconciliationUncertain: existsSync(taskReconciliationPath(project.id, task.id)),
+    deliveryPending: existsSync(taskDeliveryPath(project.id, task.id)),
     ...(checkConfigHash ? { checkConfigHash } : {}),
     ...(task.lastSnapshot?.preview ? { preview: task.lastSnapshot.preview } : {}),
     ...(task.lastSnapshot?.runtimeState ? { runtimeState: task.lastSnapshot.runtimeState } : {}),
@@ -48,7 +74,9 @@ export function projectTaskView(
 }
 
 /** Materialize the host projection from durable state without subprocesses. */
-export function captureStateProjection(): RemoteSnapshot {
+export function captureStateProjection(
+  operationsByTask: ReadonlyMap<string, readonly RecordedTaskOperation[]> = new Map(),
+): RemoteSnapshot {
   const projects = listProjects();
   const hostStatus = readHostStatus();
   const update = readFleetUpdateState();
@@ -62,7 +90,9 @@ export function captureStateProjection(): RemoteSnapshot {
     listTasks(project).map((task) => {
       const snapshot = task.lastSnapshot ?? { phase: "idle" as const, agent: task.agent };
       const state = readTaskState(project, task);
-      const view = projectTaskView(project, task, state);
+      const view = projectTaskView(project, task, state, {
+        operations: operationsByTask.get(task.name.toLowerCase()) ?? [],
+      });
       if (state.updatedAt < observedAt) observedAt = state.updatedAt;
       return {
         id: task.id,
@@ -110,7 +140,7 @@ export function captureStateProjection(): RemoteSnapshot {
       name: basename(project.root),
       ...(project.source ? { source: project.source } : {}),
       base: project.integration.base,
-      integration: project.integration.mode,
+      remote: project.integration.remote,
     })),
     tasks,
   };

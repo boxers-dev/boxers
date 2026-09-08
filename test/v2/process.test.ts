@@ -1,5 +1,45 @@
 import { describe, expect, it } from "vitest";
-import { commandStreaming } from "../../src/v2/process.ts";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { commandStreaming, commandWithTreeTimeout } from "../../src/v2/process.ts";
+
+describe("bounded synchronous commands", () => {
+  it("retains output, exit status and discrete argument boundaries", () => {
+    expect(
+      commandWithTreeTimeout(
+        process.execPath,
+        [
+          "-e",
+          "console.log(process.argv[1]); console.error('failure'); process.exitCode=7;",
+          "a $literal; value",
+        ],
+        1_000,
+      ),
+    ).toEqual({ status: 7, stdout: "a $literal; value\n", stderr: "failure\n" });
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "stops timeout descendants before they can keep writing",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "boxers-tree-timeout-"));
+      const marker = join(root, "late-write");
+      try {
+        const descendant = `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'unsafe'), 900);`;
+        const parent = `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: 'inherit' }); console.log('started'); setInterval(() => {}, 1000);`;
+        const started = Date.now();
+        const result = commandWithTreeTimeout(process.execPath, ["-e", parent], 300);
+        expect(result).toMatchObject({ status: 124, stdout: "started\n" });
+        expect(result.stderr).toContain("ETIMEDOUT");
+        expect(Date.now() - started).toBeLessThan(1_500);
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        expect(existsSync(marker)).toBe(false);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+});
 
 describe("streaming commands", () => {
   it("delivers output while the child is still running", async () => {

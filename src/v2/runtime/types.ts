@@ -45,6 +45,16 @@ export interface RuntimeGitStatus {
   committedBehind: number;
 }
 
+/** A failed advancement may be retried only after the runtime confirms it ended. */
+export class WorkspaceAdvancementError extends Error {
+  constructor(
+    message: string,
+    readonly completed: boolean,
+  ) {
+    super(message);
+  }
+}
+
 export interface RuntimeReconciliationResult {
   status: "clean" | "conflicted";
   conflicts: string[];

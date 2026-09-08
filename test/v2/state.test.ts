@@ -37,12 +37,23 @@ function fixture() {
   writeFileSync(join(root, "tracked.txt"), "base\n");
   execFileSync("git", ["-C", root, "add", "tracked.txt"]);
   execFileSync("git", ["-C", root, "commit", "-q", "-m", "base"]);
-  const project = initProject({ integration: "local" as const, base: "main", cwd: root });
+  const project = initProject({ remote: root, base: "main", cwd: root });
   const task = createTaskManifest(project, "task", "codex");
   return { project, task };
 }
 
 describe("durable task state", () => {
+  it("records target observation without changing the installed base", () => {
+    const { project, task } = fixture();
+    updateTaskState(project, task, { baseOid: "installed", candidateTreeOid: "tree" }, "git");
+    updateTaskState(project, task, { observedTargetOid: "new-target" }, "git");
+    expect(readTaskState(project, task)).toMatchObject({
+      baseOid: "installed",
+      observedTargetOid: "new-target",
+      candidateTreeOid: "tree",
+    });
+  });
+
   it("derives turn state and deduplicates provider lifecycle identity", () => {
     const { project, task } = fixture();
     const stop = {
@@ -175,7 +186,7 @@ describe("durable task state", () => {
   it("recovers a state lock left by a dead writer", () => {
     const { project, task } = fixture();
     const path = taskStatePath(project.id, task.id);
-    writeFileSync(`${path}.lock`, "2147483647\n");
+    writeFileSync(`${path}.lock`, "2147483647\ninterrupted-test\n");
     updateTaskState(project, task, { failure: "attention" }, "daemon");
     expect(readTaskState(project, task).failure).toBe("attention");
   });
@@ -331,7 +342,7 @@ describe("durable task state", () => {
 
   it("recovers a task-manifest lock left by a dead writer", () => {
     const { project, task } = fixture();
-    writeFileSync(taskManifestLockPath(project.id, task.id), "2147483647\n");
+    writeFileSync(taskManifestLockPath(project.id, task.id), "2147483647\ninterrupted-test\n");
     expect(
       updateTask(project, task, { phase: "idle", agent: task.agent }).lastSnapshot?.phase,
     ).toBe("idle");

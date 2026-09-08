@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   command,
   commandAsync,
@@ -17,6 +17,7 @@ import type {
   RuntimePreviewHandle,
 } from "./runtime/types.ts";
 import { note } from "../core/ui.ts";
+import { WorkspaceAdvancementError } from "./runtime/types.ts";
 
 export interface SandboxInfo {
   name: string;
@@ -340,7 +341,14 @@ set -euo pipefail
 cd -- "$1"
 index=$(mktemp)
 trap 'rm -f "$index"' EXIT
-GIT_INDEX_FILE="$index" git read-tree HEAD
+# Preserve the real index's tracked-file selection, including force-staged
+# ignored additions. Starting from HEAD silently omits those from check trees.
+source_index=$(git rev-parse --git-path index)
+if test -f "$source_index"; then
+  cp -- "$source_index" "$index"
+else
+  GIT_INDEX_FILE="$index" git read-tree HEAD
+fi
 GIT_INDEX_FILE="$index" git add -A -- .
 GIT_INDEX_FILE="$index" git write-tree
 `;
@@ -690,20 +698,32 @@ export function advanceNativeWorkspace(
   base: string,
   targetOid: string,
 ): boolean {
+  const completionToken = randomUUID();
   const script = `
 set -eu
+completion_token="$3"
+fetch_error=
+finished() {
+  code=$?
+  trap - EXIT
+  if test -n "$fetch_error"; then rm -f "$fetch_error"; fi
+  printf '\\nboxers-advance:%s:%s\\n' "$completion_token" "$code"
+  exit "$code"
+}
+trap finished EXIT
 fetch_error=$(mktemp)
-trap 'rm -f "$fetch_error"' EXIT
-if ! git fetch --no-tags -q origin "refs/heads/$1" 2>"$fetch_error"; then
+# Install the accepted commit, even if another task has already advanced the
+# branch. Boxers keeps this exact OID reachable in the sanitized host seed.
+if ! git fetch --no-tags -q origin "$2" 2>"$fetch_error"; then
   if grep -q "commit graph file but not in the object database" "$fetch_error"; then
-    git fetch --refetch --no-tags -q origin "refs/heads/$1"
+    git fetch --refetch --no-tags -q origin "$2"
   else
     cat "$fetch_error" >&2
     exit 1
   fi
 fi
 rm -f "$fetch_error"
-trap - EXIT
+fetch_error=
 actual=$(git rev-parse FETCH_HEAD^{commit})
 if test "$actual" != "$2"; then
   printf 'fetched %s, expected %s\n' "$actual" "$2" >&2
@@ -712,11 +732,28 @@ fi
 git reset --mixed -q "$actual"
 git status --porcelain=v1 --untracked-files=all
 `;
-  const status = requireSuccess(
-    sbx(["exec", task.runtime.id, "bash", "-lc", script, "boxers", base, targetOid]),
-    `Could not advance native workspace ${task.name}`,
+  const result = sbx([
+    "exec",
+    task.runtime.id,
+    "bash",
+    "-lc",
+    script,
+    "boxers",
+    base,
+    targetOid,
+    completionToken,
+  ]);
+  const completion = new RegExp(`\\nboxers-advance:${completionToken}:(\\d+)\\n$`).exec(
+    result.stdout,
   );
-  return Boolean(status.trim());
+  const code = completion ? Number(completion[1]) : undefined;
+  if (result.status !== 0 || code !== 0)
+    throw new WorkspaceAdvancementError(
+      `Could not advance native workspace ${task.name}: ${(result.stderr || result.stdout).trim() || `exit ${result.status}`}`,
+      // Signal/timeout termination is not a confirmed consistent boundary.
+      code !== undefined && code < 128,
+    );
+  return Boolean(result.stdout.slice(0, completion!.index).trim());
 }
 
 export function publishPorts(task: TaskManifest, ports: readonly number[]): string[] {

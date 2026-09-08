@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { deriveTaskView, formatTaskView } from "../../src/v2/task-view.ts";
+import { deriveTaskView, formatTaskView, isTaskView } from "../../src/v2/task-view.ts";
 import type { TaskState } from "../../src/v2/types.ts";
 
 const now = "2030-01-01T00:00:00.000Z";
@@ -21,6 +21,57 @@ function state(overrides: Partial<TaskState> = {}): TaskState {
 }
 
 describe("structured task view", () => {
+  it("does not infer target freshness from an installed base alone", () => {
+    const view = deriveTaskView({ name: "task", state: state({ baseOid: "installed" }) });
+    expect(view.reconciliation.state).toBe("unknown");
+    expect(formatTaskView("task", view)).toContain("Target freshness unknown");
+    expect(isTaskView(view)).toBe(true);
+  });
+
+  it("keeps unconfigured checks distinct from pending reconciliation", () => {
+    const view = deriveTaskView({
+      name: "task",
+      checksConfigured: false,
+      state: state({ baseOid: "installed", observedTargetOid: "new-target" }),
+    });
+    expect(view.reconciliation.state).toBe("queued");
+    expect(view.checks.state).toBe("not_configured");
+  });
+
+  it("requires acknowledged mutation ownership to explain an unfinished marker", () => {
+    const input = {
+      name: "task",
+      state: state(),
+      reconciliationUncertain: true,
+      operations: [{ kind: "running_checks", state: "running" }] as const,
+    };
+    const uncertain = deriveTaskView(input);
+    expect(uncertain.reconciliation.state).toBe("failed");
+    expect(uncertain.actions[0]?.command).toBe("boxers task discard --force");
+    expect(uncertain.removal.reason).not.toContain("generating");
+    const active = deriveTaskView({
+      ...input,
+      operations: [{ kind: "reviewing", state: "running", workspaceMutation: true }],
+    });
+    expect(active.reconciliation.state).toBe("running");
+    expect(active.issues).toEqual([]);
+    expect(isTaskView(active)).toBe(true);
+    expect(
+      isTaskView({
+        ...active,
+        operations: [{ ...active.operations[0], workspaceMutation: "yes" }],
+      }),
+    ).toBe(false);
+  });
+
+  it("does not label an observed target current before it is installed", () => {
+    const view = deriveTaskView({
+      name: "task",
+      state: state({ baseOid: "installed", observedTargetOid: "new-target" }),
+    });
+    expect(view.reconciliation.state).toBe("queued");
+  });
+
   it.each([
     {
       name: "generation and setup are independent running facts",

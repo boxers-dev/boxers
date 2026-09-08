@@ -316,6 +316,41 @@ export async function daemonSnapshot(): Promise<{
   });
 }
 
+/** Best-effort observation only: no startup, negotiation, or exclusive intent. */
+export function runningDaemonSnapshot(
+  timeoutMs = 500,
+  prepareTask?: string,
+): Promise<RemoteSnapshot | undefined> {
+  return new Promise((resolve) => {
+    const socket = connect(daemonSocketPath());
+    const requestId = randomUUID();
+    const decoder = new LineDecoder();
+    let finished = false;
+    const finish = (snapshot?: RemoteSnapshot): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(snapshot);
+    };
+    const timer = setTimeout(() => finish(), timeoutMs);
+    socket.setEncoding("utf8");
+    socket.once("connect", () => {
+      if (prepareTask) socket.write(encodeMessage({ type: "prepare_task", taskName: prepareTask }));
+      socket.write(encodeMessage({ type: "get_snapshot", requestId }));
+    });
+    socket.on("data", (chunk: string) => {
+      for (const line of decoder.push(chunk)) {
+        const message = parseServerMessage(line);
+        if (message?.type === "snapshot" && message.requestId === requestId)
+          finish(message.snapshot as RemoteSnapshot);
+      }
+    });
+    socket.once("error", () => finish());
+    socket.once("close", () => finish());
+  });
+}
+
 export async function daemonHello(): Promise<{
   protocolVersion: number;
   boxersVersion: string;
@@ -335,6 +370,15 @@ export function notifyDaemonStateChanged(): void {
   const socket = connect(daemonSocketPath());
   socket.once("connect", () => {
     socket.end(encodeMessage({ type: "state_changed" }));
+  });
+  socket.once("error", () => socket.destroy());
+}
+
+/** Notify a running daemon of a published target; never starts the daemon. */
+export function notifyDaemonTargetChanged(projectId: string): void {
+  const socket = connect(daemonSocketPath());
+  socket.once("connect", () => {
+    socket.end(encodeMessage({ type: "target_changed", projectId }));
   });
   socket.once("error", () => socket.destroy());
 }
@@ -415,10 +459,6 @@ export function parseDaemonIntent(args: string[]): { task: string; intent: TaskI
   if (!task || !command) throw new Error("A daemon intent requires a task and command.");
   const rest = args.slice(2);
   switch (command) {
-    case "status":
-      if (rest.some((argument) => argument !== "--refresh" && argument !== "--json"))
-        throw new Error("status --refresh accepts only --json.");
-      return { task, intent: { kind: "refresh", json: rest.includes("--json") } };
     case "sync":
     case "check":
     case "setup":
@@ -524,7 +564,7 @@ export async function attachInteractive(
   sessionId: string,
   command: string,
   args: string[],
-  lifecycle?: { taskName: string; bridgeToken: string },
+  lifecycle?: { taskName: string; bridgeToken: string; startsTurn?: boolean },
 ): Promise<number> {
   const socket = await readyDaemonSocket();
   const decoder = new LineDecoder();
@@ -635,6 +675,7 @@ export async function startViewerlessSession(
   bridgeToken: string,
   command: string,
   args: string[],
+  startsTurn = false,
 ): Promise<void> {
   const socket = await readyDaemonSocket();
   const requestId = randomUUID();
@@ -667,6 +708,7 @@ export async function startViewerlessSession(
         sessionId,
         taskName,
         bridgeToken,
+        startsTurn,
         command,
         args,
         cols: 80,

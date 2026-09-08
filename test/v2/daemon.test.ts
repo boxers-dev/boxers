@@ -1,4 +1,5 @@
 import { connect, type Socket } from "node:net";
+import { execFileSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -28,9 +29,17 @@ import {
   daemonSocketPath,
   fleetPath,
   orphanedTaskDir,
+  taskReconciliationPath,
 } from "../../src/v2/paths.ts";
-import { listProjects, listTasks } from "../../src/v2/registry.ts";
-import { readTaskState, recordLifecycleEvent } from "../../src/v2/state.ts";
+import {
+  createTaskManifest,
+  initProject,
+  listProjects,
+  listTasks,
+  refreshSeed,
+  updateTask,
+} from "../../src/v2/registry.ts";
+import { readTaskState, recordLifecycleEvent, updateTaskState } from "../../src/v2/state.ts";
 import { encodeLifecycleWakeFrame } from "../../src/v2/pty-control.ts";
 
 const cleanupDirs: string[] = [];
@@ -77,7 +86,7 @@ function registerTask(state: string, name: string, runtimeId: string): void {
       id: "project-id",
       root: "/tmp/project",
       seedPath: "/tmp/seed",
-      integration: { mode: "local", base: "main" },
+      integration: { remote: "origin", base: "main" },
       createdAt: "2026-08-26T00:00:00.000Z",
     })}\n`,
   );
@@ -97,6 +106,254 @@ function registerTask(state: string, name: string, runtimeId: string): void {
     })}\n`,
   );
 }
+
+function targetChangeFixture() {
+  const state = useTemporaryState();
+  const root = join(state, "checkout");
+  mkdirSync(root);
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim();
+  git("init", "-q", "-b", "main");
+  git("config", "user.name", "Test");
+  git("config", "user.email", "test@example.invalid");
+  git("commit", "--allow-empty", "-q", "-m", "base");
+  const project = initProject({ base: "main", remote: root, cwd: root });
+  const baseOid = git("rev-parse", "HEAD");
+  const task = (name: string, runtimeState = "running") => {
+    const created = createTaskManifest(project, name, "codex");
+    return updateTask(project, created, {
+      phase: "idle",
+      agent: "codex",
+      targetOid: baseOid,
+      runtimeState,
+    });
+  };
+  const advance = () => {
+    git("commit", "--allow-empty", "-q", "-m", "upstream");
+    return refreshSeed(project);
+  };
+  return { project, task, advance };
+}
+
+it("coalesces target hints, refreshes idle siblings, and defers working or stopped tasks", async () => {
+  const fixture = targetChangeFixture();
+  const accepted = fixture.task("accepted");
+  const idle = fixture.task("idle");
+  const working = fixture.task("working");
+  const stopped = fixture.task("stopped", "stopped");
+  recordLifecycleEvent(fixture.project, working, {
+    version: 1,
+    sequence: 1,
+    event: {
+      version: 1,
+      kind: "user_prompt",
+      provider: "codex",
+      providerSessionId: "session",
+      prompt: "work",
+      recordedAt: new Date().toISOString(),
+    },
+    source: { provider: "codex", hookEvent: "UserPromptSubmit", rawBytes: 1 },
+  });
+  const targetOid = fixture.advance();
+  updateTaskState(fixture.project, accepted, { baseOid: targetOid }, "git");
+  const starts: { name: string; sequence: number; targetChanged?: boolean }[] = [];
+  const socketPath = tempSocketPath();
+  daemon = runDaemon(socketPath, {
+    executePostTurn: async (name, sequence, _signal, _progress, targetChanged) => {
+      starts.push({ name, sequence, targetChanged: Boolean(targetChanged) });
+      return {};
+    },
+  });
+  const client = await connectClient(socketPath);
+  client.send({ type: "target_changed", projectId: fixture.project.id });
+  client.send({ type: "target_changed", projectId: fixture.project.id });
+  await waitUntil(() => starts.length === 1);
+  expect(starts).toEqual([{ name: idle.name, sequence: 0, targetChanged: true }]);
+  for (const task of [idle, working, stopped])
+    expect(readTaskState(fixture.project, task).observedTargetOid).toBe(targetOid);
+
+  fixture.advance();
+  client.send({ type: "target_changed", projectId: fixture.project.id });
+  await waitUntil(() => starts.length === 3); // Both formerly accepted and idle are now behind.
+  expect(starts.filter((start) => start.name === idle.name)).toHaveLength(2);
+  expect(starts.some((start) => [working.name, stopped.name].includes(start.name))).toBe(false);
+});
+
+it("drains the newest target after an explicit operation without canceling it", async () => {
+  const fixture = targetChangeFixture();
+  const task = fixture.task("busy");
+  let release!: () => void;
+  const operation = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let running = false;
+  const starts: string[] = [];
+  const socketPath = tempSocketPath();
+  daemon = runDaemon(socketPath, {
+    executeIntent: async () => {
+      running = true;
+      await operation;
+      return 0;
+    },
+    executePostTurn: async () => {
+      starts.push(readTaskState(fixture.project, task).observedTargetOid!);
+      return {};
+    },
+  });
+  const client = await connectClient(socketPath);
+  client.send({
+    type: "run_intent",
+    intentId: "busy",
+    task: task.name,
+    intent: { kind: "review" },
+  });
+  await waitUntil(() => running);
+  fixture.advance();
+  client.send({ type: "target_changed", projectId: fixture.project.id });
+  const latest = fixture.advance();
+  client.send({ type: "target_changed", projectId: fixture.project.id });
+  await waitUntil(() => readTaskState(fixture.project, task).observedTargetOid === latest);
+  expect(starts).toEqual([]);
+  release();
+  await client.next((message) => message.type === "intent_exited");
+  await waitUntil(() => starts.length === 1);
+  expect(starts).toEqual([latest]);
+});
+
+it("retains a newer target while preparation runs and does not interrupt repair", async () => {
+  const fixture = targetChangeFixture();
+  const task = fixture.task("preparing");
+  let release!: () => void;
+  const operation = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const starts: string[] = [];
+  let firstSignal: AbortSignal | undefined;
+  const socketPath = tempSocketPath();
+  daemon = runDaemon(socketPath, {
+    executePostTurn: async (_name, _sequence, signal) => {
+      const target = readTaskState(fixture.project, task).observedTargetOid!;
+      starts.push(target);
+      if (starts.length === 1) {
+        firstSignal = signal;
+        await operation;
+      }
+      updateTaskState(fixture.project, task, { baseOid: target }, "git");
+      return { targetOid: target };
+    },
+  });
+  const client = await connectClient(socketPath);
+  const first = fixture.advance();
+  client.send({ type: "target_changed", projectId: fixture.project.id });
+  await waitUntil(() => starts.length === 1);
+  const latest = fixture.advance();
+  client.send({ type: "target_changed", projectId: fixture.project.id });
+  await waitUntil(() => readTaskState(fixture.project, task).observedTargetOid === latest);
+  expect(firstSignal?.aborted).toBe(false);
+  release();
+  await waitUntil(() => starts.length === 2);
+  expect(starts).toEqual([first, latest]);
+});
+
+it("retains target work canceled by a command that does not prepare the candidate", async () => {
+  const fixture = targetChangeFixture();
+  const task = fixture.task("canceled-target");
+  let launches = 0;
+  const socketPath = tempSocketPath();
+  daemon = runDaemon(socketPath, {
+    executeIntent: async () => 0,
+    executePostTurn: async (_name, _sequence, signal) => {
+      launches++;
+      if (launches === 1)
+        await new Promise<void>((resolve) =>
+          signal.addEventListener("abort", () => resolve(), { once: true }),
+        );
+      else
+        updateTaskState(
+          fixture.project,
+          task,
+          { baseOid: readTaskState(fixture.project, task).observedTargetOid! },
+          "git",
+        );
+      return {};
+    },
+  });
+  const client = await connectClient(socketPath);
+  fixture.advance();
+  client.send({ type: "target_changed", projectId: fixture.project.id });
+  await waitUntil(() => launches === 1);
+  client.send({
+    type: "run_intent",
+    intentId: "preview",
+    task: task.name,
+    intent: { kind: "preview", action: "logs" },
+  });
+  await client.next((message) => message.type === "intent_exited");
+  await waitUntil(() => launches === 2);
+});
+
+it("drains a working task's pending target when its real Stop wake arrives", async () => {
+  const fixture = targetChangeFixture();
+  const task = fixture.task("working-target");
+  recordLifecycleEvent(fixture.project, task, {
+    version: 1,
+    sequence: 1,
+    event: {
+      version: 1,
+      kind: "user_prompt",
+      provider: "codex",
+      providerSessionId: "session",
+      prompt: "work",
+      recordedAt: new Date().toISOString(),
+    },
+    source: { provider: "codex", hookEvent: "UserPromptSubmit", rawBytes: 1 },
+  });
+  let launches = 0;
+  const socketPath = tempSocketPath();
+  daemon = runDaemon(socketPath, {
+    ingestLifecycle: async (_name, through) => {
+      if (through !== 2) return [];
+      recordLifecycleEvent(fixture.project, task, {
+        version: 1,
+        sequence: 2,
+        event: {
+          version: 1,
+          kind: "turn_finished",
+          provider: "codex",
+          providerSessionId: "session",
+          recordedAt: new Date().toISOString(),
+        },
+        source: { provider: "codex", hookEvent: "Stop", rawBytes: 1 },
+      });
+      return [{ sequence: 2, kind: "turn_finished" }];
+    },
+    executePostTurn: async (_name, sequence, _signal, _progress, targetChanged) => {
+      expect(sequence).toBe(2);
+      expect(targetChanged).toBe(true);
+      launches++;
+      return {};
+    },
+  });
+  const client = await connectClient(socketPath);
+  const targetOid = fixture.advance();
+  client.send({ type: "target_changed", projectId: fixture.project.id });
+  await waitUntil(() => readTaskState(fixture.project, task).observedTargetOid === targetOid);
+  expect(launches).toBe(0);
+  const frame = encodeLifecycleWakeFrame(task.lifecycleBridgeToken!, 2);
+  client.send({
+    type: "start_session",
+    requestId: "finish",
+    sessionId: task.runtime.id,
+    taskName: task.name,
+    bridgeToken: task.lifecycleBridgeToken!,
+    command: process.execPath,
+    args: ["-e", `process.stdout.write(${JSON.stringify(frame)});setInterval(()=>{},1000)`],
+    cols: 80,
+    rows: 24,
+  });
+  await client.next((message) => message.type === "session_started");
+  await waitUntil(() => launches === 1);
+});
 
 it("does not strand the daemon lock when synchronous startup fails", () => {
   useTemporaryState();
@@ -640,7 +897,7 @@ describe("daemon session lifecycle", () => {
       type: "run_intent",
       intentId: "settled-status-refresh",
       task: task.name,
-      intent: { kind: "refresh", json: false },
+      intent: { kind: "sync" },
     });
     await client.next(
       (message) =>
@@ -698,6 +955,129 @@ describe("daemon session lifecycle", () => {
     expect(echoed.type).toBe("output");
     expect(aborted).toBe(true);
   });
+
+  it.each(["reconciliation", "delivery_advance"])(
+    "holds agent input when interrupted %s has an uncertain outcome",
+    async (kind) => {
+      const state = useTemporaryState();
+      registerTask(state, "interrupted", "boxers-interrupted");
+      const socketPath = tempSocketPath();
+      daemon = runDaemon(socketPath);
+      const viewer = await connectClient(socketPath);
+      const received = join(state, "received-input");
+      viewer.send({
+        type: "attach",
+        sessionId: "interrupted-session",
+        taskName: "interrupted",
+        command: process.execPath,
+        args: [
+          "-e",
+          `process.stdout.write('ready');process.stdin.on('data',d=>require('fs').writeFileSync(${JSON.stringify(received)},d))`,
+        ],
+        cols: 80,
+        rows: 24,
+      });
+      await viewer.next((message) => message.type === "output");
+      atomicWriteJson(taskReconciliationPath("project-id", "task-id"), {
+        kind,
+        oldTargetOid: "old",
+        targetOid: "new",
+        checkpointOid: "work",
+      });
+      viewer.send({
+        type: "input",
+        sessionId: "interrupted-session",
+        dataBase64: Buffer.from("continue\n").toString("base64"),
+      });
+      await expect(viewer.next((message) => message.type === "error")).resolves.toMatchObject({
+        type: "error",
+        message: expect.stringContaining("unfinished reconciliation"),
+      });
+      expect(existsSync(received)).toBe(false);
+    },
+  );
+  it.each(["attach", "start_session"] as const)(
+    "refuses %s launch while delivery advancement is uncertain",
+    async (type) => {
+      const state = useTemporaryState();
+      registerTask(state, "uncertain", "runtime-uncertain");
+      atomicWriteJson(taskReconciliationPath("project-id", "task-id"), {
+        kind: "delivery_advance",
+        checkpointOid: "accepted",
+      });
+      const marker = join(state, "unexpected-agent");
+      const socketPath = tempSocketPath();
+      daemon = runDaemon(socketPath);
+      const client = await connectClient(socketPath);
+      const common = {
+        sessionId: "runtime-uncertain",
+        taskName: "uncertain",
+        bridgeToken: "test-token",
+        command: process.execPath,
+        args: ["-e", `require('fs').writeFileSync(${JSON.stringify(marker)},'started')`],
+        cols: 80,
+        rows: 24,
+      };
+      client.send(
+        type === "attach" ? { type, ...common } : { type, requestId: "start", ...common },
+      );
+      await expect(client.next((message) => message.type === "error")).resolves.toMatchObject({
+        message: expect.stringContaining("unfinished reconciliation"),
+      });
+      expect(existsSync(marker)).toBe(false);
+    },
+  );
+
+  it.each(["initial_prompt", "forwarded_input"] as const)(
+    "refuses strong commands while %s awaits its lifecycle hook",
+    async (mode) => {
+      const state = useTemporaryState();
+      registerTask(state, "input-race", "runtime-input-race");
+      let executions = 0;
+      const socketPath = tempSocketPath();
+      daemon = runDaemon(socketPath, {
+        executeIntent: async () => {
+          executions++;
+          return 0;
+        },
+      });
+      const viewer = await connectClient(socketPath);
+      viewer.send({
+        type: "attach",
+        sessionId: "runtime-input-race",
+        taskName: "input-race",
+        startsTurn: mode === "initial_prompt",
+        command: process.execPath,
+        args: ["-e", ECHO_SCRIPT],
+        cols: 80,
+        rows: 24,
+      });
+      await viewer.next((message) => message.type === "output");
+      if (mode === "forwarded_input") {
+        viewer.send({
+          type: "input",
+          sessionId: "runtime-input-race",
+          dataBase64: Buffer.from("continue\n").toString("base64"),
+        });
+        await viewer.next(
+          (message) =>
+            message.type === "output" &&
+            Buffer.from(message.dataBase64, "base64").toString().includes("echo:"),
+        );
+      }
+      viewer.send({
+        type: "run_intent",
+        intentId: "racing-sync",
+        task: "input-race",
+        intent: { kind: "sync" },
+      });
+      await expect(viewer.next((message) => message.type === "error")).resolves.toMatchObject({
+        message: expect.stringContaining("input awaiting its lifecycle acknowledgment"),
+      });
+      expect(executions).toBe(0);
+    },
+  );
+
   it("negotiates protocol, serves a recorded snapshot, and publishes revisions", async () => {
     useTemporaryState();
     const socketPath = tempSocketPath();
@@ -816,7 +1196,7 @@ describe("daemon session lifecycle", () => {
     });
   });
 
-  it("keeps attach available while an intent is running", async () => {
+  it("keeps observation-only attach to an existing session available during an intent", async () => {
     const state = useTemporaryState();
     registerTask(state, "leased", "runtime-leased");
     const socketPath = tempSocketPath();
@@ -826,6 +1206,17 @@ describe("daemon session lifecycle", () => {
         return 0;
       },
     });
+    const existing = await connectClient(socketPath);
+    existing.send({
+      type: "attach",
+      sessionId: "runtime-leased",
+      taskName: "leased",
+      command: process.execPath,
+      args: ["-e", ECHO_SCRIPT],
+      cols: 80,
+      rows: 24,
+    });
+    await existing.next((message) => message.type === "output");
     const operation = await connectClient(socketPath);
     operation.send({
       type: "run_intent",

@@ -1,6 +1,6 @@
 version: 3
 integration:
-  mode: local
+  remote: origin
   base: main
 setup:
   run: npm ci

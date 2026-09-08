@@ -64,6 +64,52 @@ export function commandWithInput(
   return { status: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
+// A synchronous caller cannot run a JS timeout while spawnSync is blocked.
+// Its built-in timeout kills only the immediate child, so use a small host-side
+// supervisor for networked commands whose descendants may still write on timeout.
+const TREE_TIMEOUT_RUNNER = `
+const { spawn } = require('node:child_process');
+const [cmd, args, timeout] = JSON.parse(process.argv[1]);
+const child = spawn(cmd, args, { stdio: ['ignore', 'inherit', 'inherit'], detached: process.platform !== 'win32' });
+let terminalCode;
+const stop = (code) => {
+  terminalCode = code;
+  if (code === 124) process.stderr.write('Command timed out (ETIMEDOUT).\\n');
+  if (child.pid === undefined) return;
+  try {
+    if (process.platform === 'win32') child.kill('SIGKILL');
+    else process.kill(-child.pid, 'SIGKILL');
+  } catch (error) {
+    if (error.code !== 'ESRCH') throw error;
+  }
+};
+const timer = setTimeout(() => stop(124), timeout);
+process.once('SIGTERM', () => stop(143));
+process.once('SIGINT', () => stop(130));
+child.once('error', error => {
+  process.stderr.write(error.message + '\\n');
+  terminalCode = error.code === 'ENOENT' ? 127 : 1;
+});
+child.once('close', code => {
+  clearTimeout(timer);
+  process.exitCode = terminalCode ?? code ?? 1;
+});
+`;
+
+/** Bound a host command and its process group, including transport descendants. */
+export function commandWithTreeTimeout(
+  cmd: string,
+  args: readonly string[],
+  timeoutMs: number,
+  env: NodeJS.ProcessEnv = process.env,
+): CommandResult {
+  return command(
+    process.execPath,
+    ["--eval", TREE_TIMEOUT_RUNNER, JSON.stringify([cmd, args, Math.max(1, timeoutMs)])],
+    { env },
+  );
+}
+
 export function commandAsync(cmd: string, args: readonly string[]): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, [...args], {

@@ -5,6 +5,7 @@ import type { TaskIntent } from "./daemon-protocol.ts";
 import { requireRegisteredTask } from "./registry.ts";
 import { drainTaskLifecycleEvents, recordedLifecycleHighWater } from "./lifecycle-ingestion.ts";
 import { readTaskState } from "./state.ts";
+import { enableWorkerWorkspaceOwnership } from "./worker-ownership.ts";
 
 interface WorkerResult {
   type: "boxers-worker-result";
@@ -53,6 +54,7 @@ function runWorker(
   onSpawn?: (pid: number) => void,
   startAfterReady = false,
   onProgress?: (phase: WorkerProgress["phase"]) => void,
+  onOwnership?: (owned: boolean) => void,
 ): Promise<WorkerResult | undefined> {
   const entry = launch.entry ?? process.argv[1];
   if (!entry) throw new Error("Could not locate the boxers executable for a daemon worker.");
@@ -61,6 +63,7 @@ function runWorker(
     let ready = false;
     let settled = false;
     let aborted = false;
+    let ownsWorkspace = false;
     let abortKillTimer: ReturnType<typeof setTimeout> | undefined;
     const child = fork(entry, args, {
       execArgv: launch.execArgv ?? process.execArgv,
@@ -74,6 +77,28 @@ function runWorker(
     });
     if (!startAfterReady && child.pid !== undefined) onSpawn?.(child.pid);
     child.on("message", (message: unknown) => {
+      if (
+        message &&
+        typeof message === "object" &&
+        (message as { type?: unknown }).type === "boxers-worker-ownership"
+      ) {
+        const request = message as { id: string; action: "acquire" | "release" };
+        if (request.action === "acquire") {
+          // If input won the race, never authorize the destructive section.
+          if (aborted || abortSignal?.aborted) return;
+          ownsWorkspace = true;
+          onOwnership?.(true);
+        } else {
+          ownsWorkspace = false;
+          onOwnership?.(false);
+          if (aborted) {
+            onAbort();
+            return;
+          }
+        }
+        child.send({ type: "boxers-worker-ownership-ack", id: request.id });
+        return;
+      }
       if (
         message &&
         typeof message === "object" &&
@@ -131,6 +156,9 @@ function runWorker(
     };
     const onAbort = (): void => {
       aborted = true;
+      // A host signal cannot establish that an in-Sandbox process stopped.
+      // Let replacement/repair reach its acknowledged boundary before killing.
+      if (ownsWorkspace) return;
       if (ready && child.connected) child.send({ type: "boxers-worker-abort" });
       signalWorkerTree("SIGTERM");
       abortKillTimer = setTimeout(() => signalWorkerTree("SIGKILL"), 2_000);
@@ -138,6 +166,8 @@ function runWorker(
     };
     abortSignal?.addEventListener("abort", onAbort, { once: true });
     const cleanup = (): void => {
+      if (ownsWorkspace) onOwnership?.(false);
+      ownsWorkspace = false;
       abortSignal?.removeEventListener("abort", onAbort);
       if (abortKillTimer) clearTimeout(abortKillTimer);
     };
@@ -183,13 +213,16 @@ export async function postTurnInWorker(
   signal: AbortSignal,
   onProgress?: (phase: WorkerProgress["phase"]) => void,
   launch?: DaemonWorkerLaunch,
+  targetChanged = false,
+  onOwnership?: (owned: boolean) => void,
 ): Promise<
   | { targetOid?: string; candidateTreeOid?: string; deferred?: boolean; needsInput?: string }
   | undefined
 > {
-  const payload = Buffer.from(JSON.stringify({ taskName, triggerSequence }), "utf8").toString(
-    "base64",
-  );
+  const payload = Buffer.from(
+    JSON.stringify({ taskName, triggerSequence, targetChanged }),
+    "utf8",
+  ).toString("base64");
   const result = await runWorker(
     ["__daemon-post-turn-worker", payload],
     true,
@@ -199,6 +232,7 @@ export async function postTurnInWorker(
     undefined,
     false,
     onProgress,
+    onOwnership,
   );
   if (!result) return undefined;
   return {
@@ -238,6 +272,7 @@ export async function executeIntentInWorker(
   launch?: DaemonWorkerLaunch,
   onSpawn?: (pid: number) => void,
   signal?: AbortSignal,
+  onOwnership?: (owned: boolean) => void,
 ): Promise<number> {
   const payload = Buffer.from(JSON.stringify({ taskName, intent }), "utf8").toString("base64");
   const result = await runWorker(
@@ -248,6 +283,8 @@ export async function executeIntentInWorker(
     output,
     onSpawn,
     true,
+    undefined,
+    onOwnership,
   );
   return result?.code ?? 1;
 }
@@ -262,6 +299,7 @@ export function executeIntentDirect(
 }
 
 export async function runDaemonIntentWorker(value: string): Promise<number> {
+  enableWorkerWorkspaceOwnership();
   await new Promise<void>((resolve, reject) => {
     const onMessage = (message: unknown): void => {
       if (
@@ -310,18 +348,24 @@ export async function runDaemonIntentWorker(value: string): Promise<number> {
 }
 
 export async function runDaemonPostTurnWorker(value: string): Promise<number> {
+  enableWorkerWorkspaceOwnership();
   const payload = JSON.parse(Buffer.from(value, "base64").toString("utf8")) as {
     taskName?: unknown;
     triggerSequence?: unknown;
+    targetChanged?: unknown;
   };
   if (
     typeof payload.taskName !== "string" ||
     !Number.isSafeInteger(payload.triggerSequence) ||
-    Number(payload.triggerSequence) < 1
+    Number(payload.triggerSequence) < (payload.targetChanged === true ? 0 : 1) ||
+    (payload.targetChanged !== undefined && typeof payload.targetChanged !== "boolean")
   )
     throw new Error("Invalid daemon post-turn worker payload.");
-  const result = await runPostTurn(payload.taskName, Number(payload.triggerSequence), (phase) =>
-    process.send?.({ type: "boxers-worker-progress", phase } satisfies WorkerProgress),
+  const result = await runPostTurn(
+    payload.taskName,
+    Number(payload.triggerSequence),
+    (phase) => process.send?.({ type: "boxers-worker-progress", phase } satisfies WorkerProgress),
+    payload.targetChanged === true,
   );
   process.send?.({ type: "boxers-worker-result", ...result } satisfies WorkerResult);
   return 0;

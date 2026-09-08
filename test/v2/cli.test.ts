@@ -35,7 +35,7 @@ vi.mock("../../src/v2/registry.ts", () => ({
   requireProject: vi.fn(() => ({
     id: "project-id",
     root: "/work/boxers",
-    integration: { mode: "remote", base: "main", remote: "origin" },
+    integration: { base: "main", remote: "origin" },
   })),
 }));
 
@@ -256,7 +256,6 @@ describe("v2 CLI", () => {
     await dispatch([
       "project",
       "init",
-      "--integration=remote",
       "--remote",
       "origin",
       "--base",
@@ -272,7 +271,6 @@ describe("v2 CLI", () => {
       "--fast",
     ]);
     expect(commands.initialize).toHaveBeenLastCalledWith({
-      integration: "remote",
       remote: "origin",
       base: "main",
       checks: true,

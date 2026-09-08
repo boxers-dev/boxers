@@ -1,585 +1,358 @@
-# Remote target integration implementation plan
-
-Status: proposed, not implemented. Written on 2026-09-08.
-
-This plan records the agreed Git integration design and the work needed to
-implement it. It does not describe current behavior. Existing architecture
-documentation remains the description of the running implementation until the
-corresponding changes land.
-
-Compatibility constraint: this product is not currently in use. Backward
-compatibility, migration support, old-schema readers, deprecated command aliases,
-and mixed-version fleet operation are not requirements. Change the configuration,
-state, protocol, and tests directly to the new contract. Development registrations
-and fixtures can be recreated; this plan does not authorize deleting existing
-workspaces or other user data automatically.
-
-## Objective and agreed decisions
-
-Simplify Boxers around one configured remote target branch per project. Each
-task has a private Sandbox workspace and a reusable provider conversation. Each
-successful promotion delivers the current increment as one commit directly to
-the target, then advances the originating workspace to that accepted commit.
-
-Tasks remain usable after promotion. For example, an agent can implement a
-feature, promote it, and later use the same conversation to fix a problem found
-while testing the result elsewhere. The follow-up promotion is another commit
-containing only the new increment.
-
-The agreed contract is:
-
-- All tasks in a project integrate against the same remote branch, whether that
-  is `main` or another explicitly configured branch.
-- Remove local promotion, persistent remote delivery branches, PR-branch reuse,
-  and force-push replacement logic. Host Git owns upstream authentication,
-  delivery-commit creation, and the push.
-- Keep the existing Sandbox-native architecture and sanitized seed. The real
-  host checkout's working files, Git configuration, hooks, and credentials must
-  not be copied into task workspaces.
-- A task's deliverable is its current file tree relative to its installed base.
-  Agent-created commits and staging choices do not define delivery history.
-  Internal checkpoint commits are permitted and are not published as task
-  history.
-- Reconcile automatically after agent turns and on project target-change events,
-  with command-triggered preparation as needed. New ordinary turns do not require
-  a fresh fetch or reconciliation; strict pre-turn freshness is deferred.
-  Conflicts should trigger bounded
-  repair in a fresh, non-persistent provider session with explicit task intent
-  and relevant context. Keep the original task conversation available for normal
-  work; generating in the main session and repair must never overlap.
-- Review should present the increment against the latest observed target.
-  Status should report target freshness and preparation progress accurately.
-- A successful promotion, or any fetch that discovers a changed target, should
-  notify other tasks in that project that reconciliation may be required.
-- A task is durable across interruptions but intended for reasonably recent,
-  active work. Expensive or ambiguous recovery may stop with a clear
-  discard/restart option. There is no automatic expiry or deletion.
-- Promotion does not complete, close, or discard the task. A subsequent turn
-  starts another increment on its updated base.
-- Never silently lose work, force a target update, duplicate an accepted
-  promotion on retry, or claim a stale candidate has current passing checks.
-
-Direct pushes require a target branch whose repository policy permits them.
-Branches that require PRs are outside this initial delivery model; do not add a
-fallback PR route.
-
-## Current implementation and changes to preserve
-
-The current system already has the major building blocks:
-
-| Current component                                       | Keep or change                                                                                           |
-| ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| Sanitized seed and Sandbox clone                        | Keep; verify the seed-to-Sandbox fetch contract with current Docker documentation and a live smoke test. |
-| Host-side candidate materialization and commit creation | Keep the boundary; unify candidate identity and remove alternative delivery paths.                       |
-| `UserPromptSubmit` and `Stop` recorders                 | Keep as lightweight event recorders and daemon notifications.                                            |
-| Daemon-owned PTYs and host workers                      | Keep; improve task-operation coordination and cancellation boundaries.                                   |
-| Post-turn refresh, capture, checks, and commit metadata | Reuse through a shared preparation operation.                                                            |
-| Fresh provider session for conflict repair              | Keep the existing bounded execution path; improve context and exclusive workspace ownership.             |
-| Explicit intents aborting post-turn work                | Join compatible preparation instead of routinely canceling it.                                           |
-| Matching Git/check identities                           | Keep and make consistent across every caller.                                                            |
-| Mixed reset after delivery preserving newer files       | Preserve that safety property while verifying clean advancement.                                         |
-| Local promotion and remote PR branches                  | Remove.                                                                                                  |
-
-The assessment found two concrete defects to cover during implementation:
-
-1. An interruption immediately after the reconciliation hard reset can be
-   followed by a retry that replaces both checkpoint refs and reports a clean
-   result without the original task work.
-2. A force-staged ignored file can be present in the review candidate but absent
-   from the tree used to validate checks.
-
-The existing promotion tests use real temporary Git repositories behind a fake
-`sbx`. They are useful for Git correctness but do not prove Docker clone behavior
-or provider-native session continuity.
-
-## Ownership and minimal persisted state
-
-| Responsibility                                                                   | Owner                                                |
-| -------------------------------------------------------------------------------- | ---------------------------------------------------- |
-| Workspace, provider history, setup/check/preview execution                       | Sandbox                                              |
-| Prompt and turn-finished event recording                                         | Sandbox hooks                                        |
-| PTYs, viewers, input gating, scheduling, and joining task operations             | Host daemon                                          |
-| Fetch, reconciliation orchestration, certification, and promotion                | Host workers scheduled by the daemon                 |
-| Git workspace mutation and agent repair                                          | Inside the Sandbox, coordinated by the owning daemon |
-| Registry, exact Git identities, checkpoints, delivery attempts, and observations | Host storage and application-owned Git refs          |
-
-Use four distinct identities. Do not overload the installed base with a newer
-target merely because a fetch succeeded.
-
-| Identity                | Required meaning                                                                                                                            |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| Observed project target | Configured remote/ref, last fetched OID, observation time, and current fetch failure if any.                                                |
-| Installed task base     | Commit actually underneath the current task increment.                                                                                      |
-| Candidate identity      | Installed base OID and exact candidate tree OID. Checks additionally bind to check configuration and the relevant conversation observation. |
-| Delivery identity       | Attempted/accepted commit OID, parent/base OID, candidate tree OID, destination, and delivery outcome.                                      |
-
-Use unambiguous names such as `observedTargetOid` for the project observation and
-`installedBaseOid` for the task baseline. Update the stored state, task snapshots,
-and their consumers together; no old field aliases or conversion layer are
-needed. Publish the installed baseline through one helper so host representations
-cannot drift. Reuse the existing storage architecture rather than redesigning it
-as part of these schema changes.
-
-Add only the durable information required at irreversible boundaries:
-
-- A reconciliation checkpoint identifying the operation, original base, intended
-  target, checkpoint ref/OID, and enough progress information to detect an
-  interrupted workspace replacement.
-- A delivery attempt recorded before pushing, so a lost response can be
-  resolved without creating another delivery commit.
-- A bounded repair-attempt identity/outcome, so repeated status requests or
-  daemon restarts cannot reset an exhausted automatic repair budget.
-
-Daemon queues and waiter lists remain disposable. Do not introduce a general
-durable workflow engine, persistent execution DAG, or legacy recovery route.
-
-## Shared preparation and event behavior
-
-Preparation has reusable stages:
-
-```text
-fetch/observe target
-    -> acquire a safe workspace boundary
-    -> capture increment against installed base
-    -> reconcile onto observed target
-    -> repair in a fresh, bounded session when necessary
-    -> capture resulting candidate
-    -> run/reuse requested checks
-    -> prepare matching commit metadata when requested
-```
-
-Callers request the stages they need. Review requires reconciliation and capture;
-it does not start the configured check suite merely to display a diff. Normal
-post-turn preparation may independently run those checks. Check and promotion
-require validation; promotion alone adds remote delivery.
-
-Freshness and mutual exclusion are separate requirements. A new prompt does not
-start or wait for a fresh-target check merely because the task may be behind.
-If no workspace mutation owns the task, the main agent can work on its installed
-base and reconcile after its turn. If reconciliation or repair already owns the
-workspace, input waits until that operation reaches a safe release point. This
-uses task-operation coordination, not a new provider-specific pre-submit hook.
-
-| Trigger                           | Intended behavior                                                                                                                                                   |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Task creation                     | Fetch the target and create the workspace at that exact commit.                                                                                                     |
-| New ordinary agent turn           | Start from the installed base without a mandatory fetch/reconciliation. Wait only if a workspace mutation or repair already owns the task.                          |
-| Ordinary provider `Stop` event    | Schedule preparation, including automatic reconciliation, checks, and candidate metadata as configured. Never push automatically.                                   |
-| Repair subprocess finishes        | Continue the owning preparation operation using its captured result; do not treat it as an ordinary task Stop event.                                                |
-| `sync`                            | Join/request reconciliation and capture, waiting for required repair.                                                                                               |
-| Task `status`                     | Perform a bounded host target refresh, report actual freshness/activity, and schedule needed preparation without waiting for a lengthy repair.                      |
-| `review`                          | Join/request a reconciled candidate and display its exact diff.                                                                                                     |
-| `check`                           | Join/request the current candidate's validation.                                                                                                                    |
-| `promote`                         | Join/request preparation and required checks, then execute the guarded delivery passage.                                                                            |
-| Setup completion observed by host | Resume preparation that was deferred for setup.                                                                                                                     |
-| Project target-change event       | Schedule idle tasks, mark working tasks pending for post-turn preparation, and leave stopped tasks pending until a later post-turn or explicit preparation request. |
-| Provider process exits            | Preserve recorded work, release execution ownership safely, and report the session state. Process exit is not equivalent to a successful turn finish.               |
-
-Keep aggregate `list`, machine views, and fleet projections cheap and cached,
-with freshness information. Task `status` observes the remote target by default;
-remove its redundant `--refresh` flag rather than keeping a compatibility alias.
-This change is scoped to task status: other commands' refresh controls have their
-own semantics and need not be removed. Update help, routing, and JSON expectations
-together.
-
-A fetch failure must not be reported as current. Display the last known target
-with an unknown/stale freshness indication. Review/promotion requiring a fresh
-target cannot silently proceed on that cached observation.
-
-### Project target-change event
-
-Use one semantic event, tentatively named `project_target_changed`, containing
-the project/target identity, observed OID, observation ordering information, and
-source (`fetch` or `promotion`). This is a host-daemon event, not another Sandbox
-hook.
-
-Publish it when:
-
-1. A push is confirmed accepted into the configured target.
-2. Any authoritative fetch discovers a target OID different from the project's
-   current observation. This includes fetches made during another task's
-   reconciliation, status refresh, or preparation.
-
-Do not broadcast solely because a reconciliation succeeded. Reconciliation
-changes a workspace, not the remote target. If A and B both reconcile onto C,
-B's completion must not trigger A again.
-
-On receipt:
-
-- Skip tasks whose installed base already matches the observed target.
-- Join existing preparation for a task rather than start another worker.
-- If the target changes during preparation, record the newest pending target
-  and reconsider at the next safe stage boundary.
-- Queue idle tasks; defer working tasks until their turn finishes; keep stopped
-  Sandboxes stopped and retain pending target information. Resuming does not
-  force a refresh before user input; a later post-turn or explicit preparation
-  request handles that pending target.
-- Do not restart an exhausted repair merely because the same target is observed
-  again. A newer target also must not enable an unlimited repair loop.
-- Coalesce notifications and preserve authoritative observation ordering; Git
-  OIDs are identities, not values that can be sorted for recency.
-- Treat a potentially delayed promotion notification as a reason to refresh
-  when a newer target observation may already exist, rather than overwriting
-  that observation with an older accepted commit.
-
-Initially implement fan-out within the owning host. Other hosts stay correct by
-fetching at their own post-turn and command-preparation boundaries. Existing fleet notifications may
-carry an invalidation hint for the same canonical remote/ref, but must not become
-a distributed lock or be trusted as authoritative replacement for a host fetch.
-
-## Delivery and reusable tasks
-
-For installed base B and candidate tree T, promotion prepares a commit P whose
-tree is T and sole parent is the freshly verified target B.
-
-```text
-remote B -> host creates P(B, T) -> non-forced push -> accepted P
-                                                   -> task base becomes P
-                                                   -> notify sibling tasks
-                                                   -> same session can continue
-```
-
-If the remote advances before the push, normal non-fast-forward rejection ends
-the attempt without modifying the target. A later preparation reconciles again.
-Avoid an unlimited prepare/check/push retry loop.
-
-After acceptance:
-
-- Record delivery independently of whether advancing the originating Sandbox
-  succeeds. Never describe an accepted push as an unaccepted promotion just
-  because local follow-up failed.
-- Advance the task to P and clear the delivered candidate, old checks, and
-  candidate metadata. Preserve the provider session and conversation.
-- Update the conversation checkpoint used to describe subsequent increments.
-- Verify clean state. If files changed after capture, preserve and report the
-  residual increment instead of resetting it away.
-- Keep discard safety based on current unpromoted work, not on whether the task
-  has a past delivery.
-- If another remote commit has already followed P, mark the task pending for
-  that newer target. Acceptance does not imply perpetual freshness.
-
-On a retry after an uncertain push outcome, fetch and inspect whether the
-recorded attempted commit is the target or an ancestor of it. If so, record the
-original acceptance and finish workspace advancement; do not generate another
-commit. If the result cannot be established, preserve the attempt and report
-the uncertainty rather than guessing from the push exit code alone.
-
-## Implementation sequence
-
-The numbered changes are intended as reviewable increments, not new runtime
-modes. Reuse the existing fresh-repair and post-turn mechanisms, then land one
-coherent execution path. Implement the new schemas and consumers together, with direct
-push enabled only once its delivery safeguards are in place. There is no staged
-migration or requirement to operate old and new implementations simultaneously.
-
-### Preliminary implementation checks: repair isolation and seed access
-
-Inspect current official Docker Sandboxes documentation/CLI reference and current
-provider-native interfaces before changing launch, resume, or lifecycle behavior.
-Record the tested versions and concrete behavior with the implementation.
-
-Verify for both Codex and Claude:
-
-- Reuse the existing fresh repair commands for both providers. Verify that their
-  sessions are non-persistent and do not change which conversation normal task
-  attach/resume selects.
-- Exactly one agent generates against the workspace at a time. The main provider
-  may remain alive and awaiting input while the repair subprocess runs, but new
-  user prompts must be held until repair finishes or is confirmed terminated.
-- Acquire that ownership atomically with the agent-state check. Checking that the
-  main agent is idle and then launching repair without excluding new input is
-  insufficient.
-- Repair completion is observed by its owning worker through the subprocess
-  result. Do not install the main task's lifecycle bridge for the repair session;
-  verify that inherited hooks cannot cancel or recursively start preparation.
-- Ordinary input proceeds without fetching or reconciling when no workspace
-  mutation owns the task. Input waits while an active mutation or repair owns it;
-  once ownership is released, the user turn can proceed without starting another
-  mandatory freshness operation.
-- The seed remains reachable from the clone without exposing the real host
-  repository's remotes or credentials. The Sandbox's seed-fetch remote is not
-  the host's authenticated upstream `origin`.
-
-Continuing the original conversation for repair is not required. The existing
-fresh-session path avoids a new internal-turn protocol for a live conversation.
-Strict pre-turn freshness is out of scope for this implementation. These checks
-verify existing runtime boundaries during implementation; they are not an
-open-ended investigation into new provider input-control mechanisms.
-
-### Change 1: single-target configuration and precise identities
-
-Primary files: `src/v2/types.ts`, `config.ts`, `init.ts`, `registry.ts`, `state.ts`,
-`paths.ts`, `src/cli.ts`, and projection/validation consumers.
-
-1. Replace integration-mode branching with remote plus target branch. Remove the
-   mode field and `--integration` option outright. `remote` and `base` remain
-   reasonable configuration names because they describe the new destination,
-   not because their old spelling must be supported.
-2. Add separate project target observations and centralized installed-base
-   publication. Define candidate/check/delivery tuple semantics.
-3. Define the minimal checkpoint, repair-attempt, and delivery-attempt records;
-   use restricted atomic writes and centralized ref/path construction.
-4. Update strict validators and fleet projections that currently expose
-   `IntegrationMode` or assume the previous state shapes.
-5. Change configuration, state, and protocol schemas directly and update their
-   fixtures. Keep ordinary input validation; do not add converters, dual-version
-   readers, or a schema-version bump solely to support a migration passage.
-6. Remove compatibility code for local/PR delivery. Recreate development
-   registrations when needed; supporting inspection or execution of old records
-   is not a requirement. Existing data is not automatically deleted by this
-   documentation or by a compatibility cleanup routine.
-
-Acceptance: one configured delivery destination, precise base/target identities,
-and current schemas and consumers that agree without compatibility machinery.
-
-### Change 2: canonical capture and safe reconciliation
-
-Primary files: `src/v2/sandbox.ts`, `registry.ts`, `commands.ts`, `lock.ts`, and
-existing runtime adapters. Extract focused reusable Git helpers if needed;
-keep lifecycle orchestration in `commands.ts`.
-
-1. Use one canonical tree-capture helper for review, reconciliation, and check
-   verification. Capture current bytes without modifying the agent's real index.
-   Include tracked files, non-ignored new files, and explicitly index-added new
-   files, including force-added ignored files. Staging does not select an older
-   version of a file's contents.
-2. Export that exact tree to the host using the existing credential-free
-   transport boundary. If retaining binary patches, derive them from the
-   canonical tree and verify that host materialization yields the same tree OID.
-   Disable presentation-only diff transforms for machine capture.
-3. Reject unresolved index conflicts before ordinary capture. Explicitly detect
-   unsupported Git layouts/history states before replacing files.
-4. Serialize shared seed fetch/checkout/ref mutations across project tasks. Keep
-   locks narrow and never hold a project Git lock during agent repair or checks.
-5. Capture against the installed base before installing a newer target. Persist
-   an operation-specific checkpoint before any hard reset or cleanup.
-6. Use Git three-way integration with the original base. On conflicts retain
-   the original checkpoint and the index stages needed for repair.
-7. Establish a consistent installed-base update point and safe cancellation
-   boundary. Do not let ordinary new input kill the reset/apply passage halfway
-   through. On crash, detect unfinished replacement before any new capture.
-8. Keep recovery bounded: finish a clearly identifiable operation or report
-   recovery/restart required with the checkpoint preserved. Never replace the
-   only checkpoint during an uncertain retry.
-
-Acceptance: equivalent capture everywhere; committed, staged, unstaged, binary,
-deleted, and new content survives clean reconciliation; interruption cannot
-silently erase the increment.
-
-### Change 3: fresh-session repair context, ownership, and validation
-
-Primary files: `src/v2/session.ts`, provider adapters, `daemon.ts`,
-`daemon-protocol.ts`, lifecycle ingestion, and preparation orchestration.
-
-1. Keep `runRepairAgent` and its fresh, bounded provider invocation. Preserve
-   trust/access arguments. Do not resume, replace, or append the repair run to the
-   original task conversation; preserve `sessionStartedAt` and normal resume
+# Remote target integration: gap analysis and minimal plan
+
+Status: implementation in progress. Original code assessment: 2026-09-08 at
+`577fc49`. This replaces the earlier, broader plan; the contract and four changes
+below remain the completion requirements.
+
+Implementation checkpoint:
+
+- Change 1 implemented with retained reconciliation checkpoints, aligned capture,
+  observed-versus-installed target identity, serialized seed refresh, setup after
+  installation, repair context, acknowledged mutation ownership, and bounded
+  check-driven correction. PID locks now publish complete ownership atomically
+  and serialize stale-owner reclamation. Eight-process contention tests cover
+  dead-owner recovery without overlapping critical sections. Interrupted lock
+  reclamation stops with an explicit diagnostic rather than guessing ownership.
+  Seed locks additionally refuse automatic reclamation after abrupt worker loss:
+  an actual killed-worker regression demonstrates that its Git child can remain
+  alive. Normal group cancellation unwinds and releases the seed lock; both
+  outcomes have cross-process tests. Live runtime verification remains.
+- Change 2 implemented: remote/base-only configuration, direct non-forced target
+  push, retained attempted/accepted delivery, exact accepted-OID advancement, and
+  reusable tasks. Fixtures now use separate remote targets; no local/PR delivery
+  route remains in application code. Tests cover non-fast-forward and policy
+  rejection, lost responses, retrying the same commit, sync without pushing,
+  advancement failure, newer edits and two promotions from one task.
+- Change 3 implemented through existing daemon post-turn jobs: changed-target
+  hints, same-sequence refresh, pending-target coalescing and draining after
+  commands/turns. Tests cover idle/working/stopped tasks, changes during repair,
+  cancellation by commands, and notification deduplication. Confirmed acceptance
+  publishes the seed target even if the subsequent network refresh fails. A real
+  Git promotion now has integration coverage through the notification socket,
+  daemon and a separate actual command worker into an idle sibling's workspace;
+  stopped and unrelated tasks remain untouched. The Sandbox adapter is simulated.
+- Change 4 implemented: bounded nonexclusive target observation for both status
+  forms, installed/observed target reporting, explicit offline/unknown freshness,
+  and live worker operations. Mutation activity is based on acknowledged ownership,
+  not an unrelated operation's phase. Tests show status returning while a separate
+  repair worker remains blocked. `--refresh` observes runtime/workspace facts without
+  publishing a candidate or waiting for reconciliation. Fetch timeout terminates
+  the POSIX transport process group, and projected failures omit raw credential-bearing
+  Git output. Local Git metadata calls in the target-refresh passage share its
+  deadline; tests cover stalls in ref lookup, remote resolution and config cleanup.
+  README and control-plane status descriptions are updated.
+- Accepted-delivery advancement now uses the existing uncertainty marker and a
+  tokenized terminal receipt. Known completed failures remain retryable; missing
+  completion or actual host-worker death blocks capture/generation without losing
+  the accepted commit. Initial prompts and raw input awaiting lifecycle acknowledgment
+  are included in admission checks for both launch forms and strong commands.
+- Provider nonzero/timeout outcomes, one-correction exhaustion, recent conversation
+  context for both providers, status during cross-process seed contention, and
+  status observation races have deterministic regressions. Provider executables
+  and Sandbox execution in these tests remain simulated.
+- Latest full suite: 398 passing tests across 49 files (2026-09-08).
+  `npm run check` and `npm run build` pass, with the existing regex lint warning.
+  The previous list display regression is fixed. The preview test now waits for
+  the detached job's observable log readiness instead of racing its startup;
+  preview production behavior is unchanged. These tests do not establish live
+  Sandbox/provider behavior.
+- Current official Docker Git-workflow and `sbx exec`/`create` references were
+  checked before runtime edits. The official [installation requirements](https://docs.docker.com/ai/sandboxes/install/)
+  and [`sbx exec` reference](https://docs.docker.com/reference/cli/sbx/exec/)
+  were checked again on 2026-09-08. Docker Engine 29.7.2 is reachable, but no `sbx`
+  executable, Sandbox plugin, `/dev/kvm`, running containers, or configured Boxers
+  fleet host is available. Linux Sandboxes requires KVM; installing a CLI alone
+  would not satisfy the runtime gate. No runtime was installed or host reconfigured.
+
+Remaining completion gates:
+
+- Run the live smoke sequence on a Sandbox-capable host for both providers:
+  create from the sanitized seed, reconcile a conflicting increment, verify input
+  exclusion and repair hook isolation, promote directly, and resume the original
+  conversation for a second increment. Include sibling refresh and a stopped sibling.
+- Record actual runtime/provider versions and results. The deterministic evidence
+  below does not prove live seed transport, provider hook inheritance, native resume
+  selection, or in-Sandbox termination behavior. These remain completion gates,
+  not waived requirements.
+
+## Conclusion
+
+Boxers does not need another architecture rewrite. Most of the intended flow
+already exists: shared preparation, automatic reconciliation, fresh repair,
+exact candidate checks, and continued task use after promotion. The earlier
+plan incorrectly presented some of these as new infrastructure.
+
+The smallest defensible change is to protect the existing reconciliation path,
+simplify its delivery destination, and add target-change invalidation to the
+existing daemon. Status needs a small but real behavior change. Safe cancellation
+and workspace ownership are the difficult part, not a new way to run agents.
+
+No backward compatibility or migration is required. Delete obsolete behavior
+directly, but do not rename unrelated concepts, rewrite all persisted state, or
+delete user work merely because compatibility is unnecessary.
+
+## Agreed contract
+
+- One configured remote target per project, defaulting to `origin` and the selected
+  base branch. Host Git owns credentials, fetches, commit creation and
+  fast-forward-only pushes. Keep sanitized Sandbox seeds.
+- One product increment produces one commit **per promotion**, not per task
+  lifetime. Promotion leaves the task and native conversation reusable. Agent
+  history is not published; internal checkpoint commits remain permissible.
+- Reconcile after agent turns, during candidate-preparing commands, and on
+  discovered project target changes. No mandatory fetch/reconciliation before
+  new prompts or resume. An active mutation or repair can temporarily hold input.
+- Keep fresh automatic repair with relevant task context, bounded to one repair
+  turn and at most one check-driven corrective turn. Repeated observations cannot
+  restart exhausted repair. Ambiguity/exhaustion leaves an actionable failure;
+  discard/recreate is an explicit escape hatch, not automatic deletion.
+- Review uses the latest successfully fetched target and does not itself require
+  checks. Status fetches target state and reports pending/running preparation
+  without waiting for lengthy repair.
+- Successful promotion and discovery of a changed target notify same-host sibling
+  tasks. Reconciliation against an already-known target does not rebroadcast.
+  Busy tasks catch up after their turn/operation.
+- Remove local integration, persistent remote task/PR branches, branch reuse and
+  forced replacement. Do not add a fallback delivery route.
+
+“Latest” means the latest successful observation at these boundaries, not
+continuous synchronization. A remote race can reject promotion; report it and
+allow retry, without an unlimited fetch/repair/check/push loop.
+
+## Code comparison: keep, adjust, add, remove
+
+Source links identify existing owners; function names are search anchors.
+
+| Area                     | Already implemented                                                                                                                                                                                 | Actual delta                                                                                                                |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Shared preparation       | `refreshSettledCandidate` already fetches, reconciles and captures for post-turn work and commands; `prepareCandidate` handles changed bases in [commands.ts](../../src/v2/commands.ts).            | **Adjust** safety/ordering inside these functions. No new preparation service.                                              |
+| Turn automation          | `runPostTurn` prepares, checks and generates metadata; `acceptLifecycle` launches it on Stop in [daemon.ts](../../src/v2/daemon.ts).                                                                | **Keep**, adding a changed-target reason that can refresh without a new Stop sequence.                                      |
+| Work transplantation     | Host `materializeNativeCandidateUnsafe` creates an exact-tree synthetic checkpoint; `reconcileNativeWorkspace` resets to the target and squash-applies it in [sandbox.ts](../../src/v2/sandbox.ts). | **Keep** the algorithm; protect its checkpoint and destructive interval. No history-rebase machinery.                       |
+| Automatic repair         | `attemptAutomaticReconciliationRepair` already calls `runRepairAgent`; [session.ts](../../src/v2/session.ts) already uses ephemeral/non-persistent execution with a ten-minute timeout.             | **Adjust** context, validation and exclusive generation. Add one local corrective turn, not a retry service.                |
+| Candidate/check identity | `recordedPreparedCandidate`, `executeChecksUnsafe` and metadata caching already compare target/tree/config/conversation identity in [commands.ts](../../src/v2/commands.ts).                        | **Keep** identity/caching; fix differing capture semantics.                                                                 |
+| Delivery                 | `promote` already prepares/checks, creates a commit, locks/rechecks the target and advances the Sandbox.                                                                                            | **Remove** local and PR-branch paths; push the existing synthetic commit directly to the target. Record acceptance earlier. |
+| Continued task use       | `advanceNativeWorkspace` uses mixed reset to preserve newer files; promotion updates `promotionConversationCheckpoint`.                                                                             | **Keep**. Remove the remote-PR special case that labels clean delivered work unmerged. No task completion changes.          |
+| Input coordination       | `postTurnJobs`, `busyTaskNames`, intent tracking and input buffering exist in [daemon.ts](../../src/v2/daemon.ts).                                                                                  | **Adjust** cancellation/ownership in place. Do not replace PTYs or lifecycle architecture.                                  |
+| Target observation       | `refreshSeed` publishes the target through the shared seed in [registry.ts](../../src/v2/registry.ts).                                                                                              | **Add** narrow seed serialization and changed-target notification; distinguish observed target from installed base.         |
+| Status                   | Plain status is cached; `status --refresh` can synchronously repair. [entrypoint.ts](../../src/core/entrypoint.ts) explicitly routes them differently.                                              | **Adjust** task status to observe the target and request background preparation without waiting for repair.                 |
+| Setup                    | `ensureCurrentSetup` already manages durable setup/configuration hashes in [setup.ts](../../src/v2/setup.ts).                                                                                       | **Keep** machinery; run changed-target setup after installing the target files.                                             |
+| Project events           | `setup_completed` and `state_changed` provide notification patterns in [daemon-client.ts](../../src/v2/daemon-client.ts) and [daemon-protocol.ts](../../src/v2/daemon-protocol.ts).                 | **Add** one project-target notification. State notifications alone do not schedule sibling reconciliation.                  |
+
+## Concrete issues to fix
+
+1. **Interrupted reconciliation can overwrite its recovery checkpoint.** The
+   Sandbox script fetches into fixed work/target refs, then runs hard reset and
+   clean. Retrying can recapture that partially replaced workspace and overwrite
+   those refs. A disposable-repository reproduction stopped after reset and
+   demonstrated the original work disappearing from the retained checkpoint on
+   retry. Add a small in-progress marker; never overwrite its checkpoint while
+   the outcome is unresolved.
+2. **Capture and check trees can disagree.** Patch capture includes a force-staged
+   ignored addition; `nativeWorkspaceTreeAt` starts from HEAD and uses `add -A`,
+   which can omit it. This was reproduced with unequal tree OIDs. Align
+   file-selection semantics while preserving ordinary staged/unstaged/untracked
    behavior.
-2. Give one operation exclusive workspace ownership during reconciliation and
-   repair, while keeping status and observation available. Start only when the
-   main agent is not generating, and queue new prompts until repair finishes.
-   If repair is canceled, confirm it has stopped before releasing that ownership;
-   host worker exit alone must not be treated as proof of Sandbox termination.
-3. Supply a self-contained repair request: task goal, relevant recent user
-   instructions/recorded context, the captured increment, old/new base identities,
-   upstream change evidence, and conflict paths/stages. Reuse existing bounded
-   conversation-record reads. A fresh session cannot infer omitted intent from
-   the original conversation. If available context cannot disambiguate the goal,
-   stop clearly rather than inventing it. Ask the agent to adapt the increment,
-   not merely clear conflict markers; do not ask it to commit or push.
-4. Use the repair subprocess result to continue the owning preparation. Keep its
-   lifecycle separate from the main task's prompt/Stop stream. Persist a repair
-   report describing the target update, resolution, and any remaining issues so
-   the user and original agent can inspect what changed.
-5. Verify the installed base and conflict state, recapture the result, and
-   invalidate old checks/messages. When validation is requested, certify only
-   the resulting tree and configuration with a causally current observation.
-6. Initial bound: one repair turn and, when requested checks expose
-   a repair problem, one corrective turn. Retain a bounded timeout. Reuse the
-   outcome for repeated requests; require explicit continuation after exhaustion.
-7. Give ambiguous intent, unresolved conflicts, and failed validation distinct
-   actionable outcomes. Discard/restart remains an ordinary escape hatch.
+3. **Observed target becomes installed base too early.**
+   `recordAdvancedTargetPending` passes the new target to `recordTaskSnapshot`
+   in [state.ts](../../src/v2/state.ts), which writes `baseOid` before workspace
+   reconciliation. Keep installed-base updates at the actual transition and
+   record target observation separately.
+4. **Cancellation crosses unsafe phases.** Input and explicit intents call
+   `abortPostTurn` without distinguishing replacement/repair.
+   [daemon-worker.ts](../../src/v2/daemon-worker.ts) kills the host worker group;
+   that does not prove an in-Sandbox repair process stopped. Progress callbacks
+   currently log activity; they are not an ownership handshake.
+5. **Shared seed mutations are not serialized.** Different task workers can
+   interleave `refreshSeed` fetch/checkout/reset. The promotion lock does not
+   cover all callers. Reuse the PID-lock approach in [lock.ts](../../src/v2/lock.ts)
+   for a narrow project seed transaction.
+6. **Smaller gaps:** repair accepts no remaining unmerged paths even after a failed
+   provider exit; changed setup can run on old files; delivery acceptance is saved
+   only after Sandbox advancement; [task-view.ts](../../src/v2/task-view.ts) can
+   call reconciliation current merely because a base OID exists.
 
-Acceptance: fresh repair has sufficient task context, cannot overlap main-agent
-work or recurse indefinitely, preserves normal task resume, and cannot produce
-a passing certificate for stale content.
+The checkpoint/capture reproductions exercise Git scripts, not live Docker.
+Cross-process cancellation and concurrent seed use require additional integration
+coverage; existing passing tests do not prove these boundaries safe.
 
-### Change 4: shared preparation, freshness, and target-change fan-out
+## Four narrowly scoped implementation changes
 
-Primary files: `src/v2/daemon.ts`, `daemon-worker.ts`, `commands.ts`,
-`daemon-protocol.ts`, `daemon-client.ts`, `setup.ts`, task views, and CLI routing.
+### 1. Protect the existing reconciliation path
 
-1. Route post-turn events and explicit intents through one task preparation
-   operation with stage-specific waiters. Compatible requests join existing
-   work. Serialize incompatible workspace actions with explicit outcomes.
-2. Keep target fetch/status observation available while preparation owns the
-   workspace. Do not make a status request wait behind a ten-minute repair.
-3. Reuse input coordination to exclude new generation only while a workspace
-   mutation or repair owns the task. Do not add a fetch/reconciliation gate to
-   each new prompt or resume. Distinguish safe cancellation of obsolete
-   checks/metadata from interruption of a workspace mutation.
-4. Implement the project target-change event and coalescing rules above. Publish
-   changes at the common authoritative-fetch boundary, so every discovery path
-   can notify sibling tasks.
-5. Remember newer pending targets during a turn or preparation. Before issuing
-   a ready/current result, compare with the latest project observation.
-6. Coordinate setup: wait for existing setup before workspace replacement, run
-   new target setup against the installed new workspace, and settle/recapture
-   setup-related file changes before candidate certification. Respect the
-   existing prohibition on concurrent dependency installation.
-7. Account for Boxers-owned preview/check jobs that may still write. Treat
-   observed background edits as invalidating the candidate rather than as a
-   reason to delete those edits.
-8. On daemon restart derive pending work from durable identities and unfinished
-   boundary records. Do not require replaying an in-memory queue or waking all
-   stopped Sandboxes.
+Owners: `sandbox.ts`, `commands.ts`, `registry.ts`, `state.ts`, `daemon.ts`,
+`daemon-worker.ts`; small supporting path/type additions.
 
-Acceptance: automatic and explicit entry points cooperate, target changes
-propagate without loops, status remains truthful/responsive, and active agent
-work is not modified underneath it.
+- Add a reconciliation marker with old base, target, immutable checkpoint and
+  bounded repair outcome. Persist before destructive replacement; clear only on
+  known completion. Ordinary capture/retry must not overwrite an unresolved
+  checkpoint. Interrupted/ambiguous work can stop with a recovery/discard choice;
+  do not build arbitrary crash replay.
+- Extend existing worker/input coordination for exclusive replacement and repair.
+  Input/strong intents wait through that unsafe interval, then proceed. Acquire
+  ownership with acknowledgment before mutation, not a late progress message.
+  Check already-buffered input as well as recorded lifecycle state. Retain
+  cancellation at safe phases and observation-only attach.
+- On abnormal worker loss, confirm the Sandbox mutator stopped before allowing
+  generation, or expose a blocked operation. Do not solve this by replacing the
+  native session. No freshness gate is added before ordinary turns.
+- Align candidate/check capture; retain existing exact-identity validation.
+  Separate observed target from installed base without globally renaming
+  `baseOid`, `targetOid`, `candidateTreeOid` or snapshot storage.
+- Serialize shared seed publication/mutations with explicit lock ordering relative
+  to promotion. Never hold a project seed lock through repair/checks. Fetch can
+  exceed the state-lock timeout, so choose an appropriate bounded wait.
+- Move changed-config setup behind successful reconciliation; keep setup deferral.
+  Supply repair with intent/relevant instructions using existing bounded
+  conversation reading, plus original diff and conflict context. Keep provider
+  invocation/resume settings.
+- Validate repair completion, base and index before recapturing. When the workflow
+  requests checks, allow at most one repair-related corrective turn, then
+  recapture/recheck. Persist its small exhausted outcome so events/status cannot
+  reset the budget. Unrelated check failures are not a general repair loop.
 
-### Change 5: direct single-commit promotion and continued use
+Tests: interruption after reset/during repair; checkpoint retention; force-staged
+ignored additions; observed-versus-installed base; concurrent seed refresh;
+changed setup; input exclusion; failed repair exit and bounded correction.
+Preserve existing Stop and native-session tests.
 
-Primary files: `src/v2/commands.ts`, state/registry helpers, and promotion tests.
+### 2. Simplify promotion to direct remote delivery
 
-1. Delete local branch/worktree advancement, delivery-branch naming and reuse,
-   patch-equivalence replacement, and force-with-lease pushes.
-2. Join preparation and required checks. Preserve the existing explicit
-   `--skip-checks` behavior unless separately changed; it does not bypass target
-   or workspace identity verification.
-3. Own the task's promotion passage, revalidate the candidate and remote target,
-   and create a commit with the candidate tree and one parent: that target.
-4. Persist its delivery attempt before a non-forced push to the configured
-   target. Resolve races or unknown push outcomes as described above.
-5. Once acceptance is known, record it and publish the target-change event even
-   if subsequent originating-workspace advancement fails.
-6. Advance the originating task base without deleting post-capture edits.
-   Clear delivered candidate/check/message state and update the conversation
-   checkpoint. Retain the same session and permit subsequent turns/promotions.
-7. Handle an empty increment without creating an empty commit. Report when
-   upstream already contains the work and leave the reusable task current.
-8. Keep the real host checkout's branch, index, and worktree untouched. Host Git
-   may read identity/remote configuration but delivery operates from
-   application-owned storage.
+Owners: `commands.ts`, `registry.ts`, `config.ts`, `types.ts`, `cli.ts`,
+and existing integration fields in `projection.ts`.
 
-Acceptance: one accepted commit per promotion, repeated promotions from the same
-task contain only subsequent work, no force updates, and no duplicate delivery
-after a lost push response.
+- Remove local/remote mode selection and local checkout advancement. Retain
+  remote/base configuration, defaulting remote to `origin`. Delete delivery-branch
+  naming, PR reporting, reuse/cherry comparisons and forced replacement. Update
+  readers/fixtures directly; no migrations or legacy aliases.
+- Keep preparation, checks, messages and final target recheck. Create one commit
+  with the prepared target as parent and the checked candidate as tree. Push it
+  to `refs/heads/<base>`, without force.
+- Save a small pending-delivery record before push: expected target, candidate,
+  delivery commit and conversation checkpoint. After an uncertain response,
+  fetch and test whether that exact commit is on the target before retrying.
+  Do not duplicate an already accepted increment.
+- Persist confirmed acceptance before Sandbox advancement. Reuse mixed reset and
+  preserve newer files. Failure after acceptance means “delivered; workspace
+  reconciliation pending”, not “promotion failed”. If a sibling advances the
+  remote immediately, install the exact accepted commit via the seed or leave
+  advancement pending; never substitute an unverified branch tip.
+- Keep the task/conversation and existing promotion checkpoint. Invalidate stale
+  candidate/check/message state. A clean delivered workspace is on-base.
 
-### Change 6: remove obsolete code, document, and verify
+Tests: exact tree/parent; untouched host checkout; non-fast-forward rejection;
+lost push response; accepted push followed by advancement failure; newer local
+edits; two promotions from the same task. Replace PR-branch expectations, not
+useful working-tree coverage.
 
-Primary files: `README.md`, `AGENTS.md`, `src/cli.ts`, architecture documents,
-strict state/fleet projections, and affected tests.
+### 3. Add target-change fan-out to existing daemon jobs
 
-1. Update help, config examples, JSON views, status wording, and task actions to
-   reflect remote-only direct delivery, reusable tasks, and event-driven
-   reconciliation.
-2. Remove obsolete config examples, flags, compatibility readers, and
-   local/PR-delivery documentation. Document the direct-push branch-policy
-   requirement. No migration guide or compatibility implementation is needed.
-3. Update `daemon-control-plane.md`: its current claim that interrupted
-   orchestration is simply recomputed needs the narrow exceptions for workspace
-   replacement and uncertain push outcomes.
-4. Keep fleet/project source matching tied to the canonical repository and
-   target ref. Update fleet message/projection consumers and fixtures together.
-   Test with all development hosts on the same new build; mixed-version
-   operation and rolling-upgrade compatibility are out of scope.
-5. Replace tests that assume local integration or repeated delivery-branch PRs.
-   Keep coverage for session continuity, exact candidates, checks, and safe
-   discard after promotion and after subsequent edits.
-6. Run focused tests during each change, then `npm run check`, the full test
-   suite, and a build before release. Respect `.git/boxers/setup-status` before
-   running tests; do not launch concurrent dependency installation.
-7. Perform a live Docker smoke test with both supported providers. Confirm
-   clone/seed access, isolated fresh-session repair, turn events, direct promotion,
-   and continuing in the same task after delivery.
+Owners: `registry.ts`, `commands.ts`, `daemon-client.ts`,
+`daemon-protocol.ts`, `daemon.ts`, `daemon-worker.ts`.
 
-Acceptance: the documented contract and all entry points agree, including
-installed executable behavior and fleet projections.
+- Notify after a successful fetch changes the observed project target. Successful
+  promotion must invalidate siblings even if its own workspace advancement fails.
+  Coalesce push/fetch duplicates. Treat events as hints and re-read the seed target
+  so late notifications cannot regress observations.
+- Extend post-turn tracking with pending target/reason per task. Permit refresh at
+  the same conversation sequence for a changed target; keep duplicate Stop
+  suppression. No second scheduler, event ledger or preparation DAG.
+- Run the shared preparation path when safe. During generation, setup, input
+  forwarding or another operation, retain the latest pending request and drain at
+  the existing completion boundary. Use change 1's ownership; do not interrupt
+  active repair to chase a newer target.
+- Available not-yet-started workspaces can refresh without fabricated Stop events.
+  Do not start stopped Sandboxes for notifications. Later command/turn boundaries
+  fetch normally; daemon restart need not replay a durable event log.
+- Successful reconciliation against a known target emits no new target event.
+  Same-host fan-out suffices; other hosts fetch at command/post-turn boundaries.
 
-## Required verification scenarios
+Tests: promotion in A updates idle B; busy B defers; same sequence/new target runs;
+duplicate/late events coalesce; unrelated projects stay untouched; no event loop,
+implicit Sandbox startup or repair-budget reset.
 
-Use real temporary repositories and a local bare remote for Git behavior,
-simulated runtime calls for deterministic daemon tests, and limited live tests
-for provider/runtime integration. Add meaningful failure injection at mutation
-and delivery boundaries.
+### 4. Expose honest freshness and finish contract cleanup
 
-| Scenario                                                                     | Required result                                                                                                                                |
-| ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Upstream advances without overlap                                            | Preserve the increment and install the latest observed base.                                                                                   |
-| Upstream overlaps task work                                                  | Repair in a fresh session with supplied task context and validate the resulting candidate.                                                     |
-| Upstream already contains the increment                                      | No empty commit; task becomes current and remains usable.                                                                                      |
-| Agent made incidental commits or staged only part of a file                  | Deliver current intended file content without publishing agent history.                                                                        |
-| Force-added ignored file, binary, deletion, symlink, executable bit          | Capture, review, transfer, and check identity agree.                                                                                           |
-| Two tasks promote from the same base                                         | One wins; the other must prepare against the new target before delivery.                                                                       |
-| Target changes during repair or checks                                       | Old result cannot be labeled current or authorize a stale promotion.                                                                           |
-| Same task promotes, receives another prompt, then promotes again             | Two incremental target commits and one continuous provider conversation.                                                                       |
-| Promotion followed by sibling reconciliation                                 | One coalesced refresh wave; no completion-event ping-pong.                                                                                     |
-| Sibling fetch discovers an external target update                            | Notify other tasks even though no Boxers promotion caused the update.                                                                          |
-| Repeated status/review requests during repair                                | Join/report the existing operation; do not restart its budget.                                                                                 |
-| Main agent is generating or a new prompt arrives during repair               | Repair waits for exclusive ownership; queued main-session input cannot create concurrent generation.                                           |
-| Repair completes or is canceled                                              | Preserve the original conversation/resume selection, persist the report, and release ownership only after confirmed termination.               |
-| User input arrives during reset/apply                                        | Input waits for a consistent workspace boundary; checkpoint survives interruption.                                                             |
-| Crash after reset but before application or metadata update                  | Detect unfinished replacement; never recapture and overwrite the sole checkpoint blindly.                                                      |
-| Push accepted but response/host record lost                                  | Recognize the attempted commit in target history; no duplicate increment.                                                                      |
-| Push accepted but Sandbox advancement fails                                  | Report accepted delivery and pending workspace convergence separately.                                                                         |
-| Setup, preview, or another process changes files                             | Invalidate stale identity; preserve residual work.                                                                                             |
-| Network unavailable, branch deleted/rewritten, or push policy rejects        | Clear failure/freshness state; no forced update or speculative history repair.                                                                 |
-| Stopped task receives target notifications                                   | Remain stopped and retain pending target state. Resume has no mandatory freshness gate; the next post-turn or explicit preparation catches up. |
-| New ordinary prompt arrives while the task is behind but no mutation owns it | Allow the turn without a mandatory fetch/reconciliation; preserve the pending target for post-turn preparation.                                |
-| Daemon restarts during pending work                                          | Recover from durable boundary records or stop clearly; no correctness dependency on queue memory.                                              |
-| Configuration, CLI, and fleet fixtures use the new contract                  | No integration mode, deprecated aliases, old-schema readers, or legacy delivery paths remain.                                                  |
+Owners: `commands.ts`, `task-view.ts`, `core/entrypoint.ts`,
+`daemon-client.ts`, CLI/status tests and documentation.
 
-## Risks and scope limits
+- Ordinary task status attempts a bounded host target fetch, renders installed
+  base/observed target/freshness, and requests background preparation. This must
+  not queue behind the exclusive operation doing repair. Reuse existing
+  observation transport where possible; routing everything through today's
+  `status --refresh` strong intent is insufficient.
+- Retain `--refresh` for distinct deeper runtime observation without synchronous
+  repair; removing this useful flag is unnecessary. Fetch failure displays last observation
+  and freshness failure, not false “current”. Cached list views show honestly
+  known state; do not add fleet-wide polling requirements.
+- Review/sync/check/promote retain existing preparation and wait through active
+  unsafe work before inspecting/mutating. Review does not require checks merely
+  for display. No general “join preparation at stage X” service.
+- Update README, architecture contract, help and parsing tests alongside behavior.
+  Delete obsolete local/PR assertions; preserve native launch/resume, setup,
+  preview, logs, auth and fleet-routing coverage.
 
-| Risk                                                               | Why it can make the work harder                                                                                    | Planned containment                                                                                                      |
-| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| Active mutation and repair ownership: medium                       | New user input must not create concurrent generation while Git replacement or repair owns the workspace.           | Reuse daemon input coordination for active operations; no provider-specific freshness gate before every turn.            |
-| Fresh repair context and ownership: medium                         | A fresh session lacks the main conversation, and an idle-state check alone does not exclude incoming user prompts. | Supply bounded task context and integration evidence, hold exclusive generation ownership, and preserve a repair report. |
-| Cancellation during Git replacement: high                          | Current workers are disposable process groups; interrupting reset/apply is not safely recomputable.                | Operation-specific checkpoint, narrow consistent mutation boundary, and bounded fail-closed recovery.                    |
-| Unknown push outcome: high consequence, bounded work               | Remote acceptance and host persistence cannot be one atomic transaction.                                           | Record attempted commit before push and resolve acceptance by fetching target history.                                   |
-| Shared seed and concurrent task observations: medium               | Task-local serialization does not protect shared checkout/ref mutation or delayed target notifications.            | Narrow project Git locking, serialized authoritative observations, and coalesced task work.                              |
-| Background writers: medium                                         | A provider Stop event does not establish filesystem quiescence for every child or preview process.                 | Coordinate known jobs and verify identities; preserve and report unexpected edits.                                       |
-| Configuration and fleet consumers: low to medium                   | Integration mode is embedded in strict manifests, setup, CLI, and projections.                                     | Update current schemas, consumers, and fixtures together; backward compatibility and migration are not required.         |
-| Protected branches and external rewrites: environmental constraint | Direct push may be forbidden, and history rewrites invalidate normal incremental assumptions.                      | Explain unsupported policy/state; no bypass, PR fallback, or complex rewrite recovery.                                   |
-| Unusual Git features: variable                                     | Submodules, sparse layouts, linked worktrees, and filters can invalidate simplistic tree capture.                  | Establish tested support; reject unsupported layouts before mutation rather than extending scope silently.               |
-| Continuously moving target: inherent                               | Another task or host may advance the target during preparation.                                                    | OID verification and non-forced push; bounded retries, never a promise of continuous global freshness.                   |
+Tests: status returns during repair with actual pending/running state; fetch during
+generation does not mutate the task; offline freshness is explicit; review uses
+the fetched target without requiring checks; resume has no freshness gate.
 
-## Settled implementation scope and verification
+## What might make this harder
 
-Backward compatibility is out of scope, and the bounded resolutions below are
-accepted implementation choices. Fresh repair sessions are also accepted: the
-requirement is sufficient task context and exclusive generation, not sharing the
-original conversation. Strict freshness before ordinary turns is deferred: use
-post-turn preparation, project target-change events, and explicit commands.
-No provider-input feasibility question remains as a prerequisite for this plan;
-the items below need implementation and verification.
+- **Cancellation/ownership is the main risk.** Killing a host worker does not
+  establish that Sandbox work stopped. Prove this boundary first; if a small
+  extension is insufficient, reassess that boundary rather than the whole daemon.
+- **Direct push requires repository permission.** PR-only protected branches are
+  outside this contract. Surface rejection; do not resurrect PR mode.
+- **Remote races remain normal.** Exact OIDs, small attempt records and non-forced
+  pushes handle them. Avoid continuous-freshness promises, distributed locks and
+  unlimited retries.
+- **Git correctness extends beyond text conflicts.** Retain committed, staged,
+  unstaged, binary, deleted and untracked-file coverage. Add demonstrated
+  regressions instead of a general Git recovery framework.
+- **Runtime behavior needs a live smoke test.** Consult current official Docker
+  documentation before changing Sandbox runtime behavior, as AGENTS.md requires.
+  Verify seed fetching, repair input exclusion, hook isolation and conversation
+  resume with both providers. Fake-runtime Git tests cannot prove these. A new
+  provider-session mechanism is not a prerequisite.
 
-| Item                       | What is already decided                                                                                                                   | What remains to establish                                                                                                                                                                                                                  |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Fresh repair session       | Keep the existing bounded, non-persistent repair invocation. Supply task context and exclude main-agent generation for the entire repair. | Verify hook isolation, normal resume selection, queued input, and cancellation/termination. No internal-turn API for the original conversation is required.                                                                                |
-| New ordinary turns         | No mandatory fetch/reconciliation before a prompt or resume. Working on the installed base until post-turn preparation is acceptable.     | Verify that input waits only for active mutation/repair ownership, and that pending target changes are reconciled after the turn or on explicit preparation. Strict pre-turn freshness may be considered later if needed.                  |
-| Interrupted reconciliation | Keep one operation-specific checkpoint, protect the replacement boundary, and detect interruption before recapture.                       | Implement and test the exact mutation/cancellation sequence. On an ambiguous crash, preserving the checkpoint and reporting restart/recovery required is sufficient; automatic reconstruction of every intermediate state is not required. |
-| Push response lost         | Persist the attempted commit and check remote ancestry before retrying delivery.                                                          | Implement the small delivery-attempt record and fault-injection tests. This is required correctness work, not an open architecture choice.                                                                                                 |
-| Repair effort              | One repair turn plus one check-driven corrective turn, using a bounded timeout; repeated observations do not reset the budget.            | Implement the limit internally and allow manual continuation after exhaustion. Each turn can contain many tool calls.                                                                                                                      |
-| Rapidly moving target      | Coalesce target events, stop at safe boundaries, and push without force.                                                                  | Stop a raced promotion with an actionable retry instead of adding an unbounded chase loop. This is an implementation policy, not a reason for distributed locking.                                                                         |
-| Setup and other writers    | Wait for Boxers-owned setup, recapture settled content, preserve unexpected edits, and never certify stale content.                       | Identify which existing jobs can write across a turn boundary and verify the candidate before mutation/delivery. Arbitrary external writers do not need a universal locking solution.                                                      |
-| Supported repository shape | One normal clone and ordinary Git content are the initial target.                                                                         | Verify seed access and exact-tree behavior with real Git and Docker. Explicitly reject unsupported submodule/sparse/worktree layouts before mutation; broaden support only when required.                                                  |
-| Cross-host propagation     | Same-host target-change events fan out immediately; every host fetches at its own post-turn and command-preparation boundaries.           | Reuse fleet invalidation only if straightforward. Immediate fleet-wide synchronization is not required for correctness.                                                                                                                    |
+Explicitly excluded: PTY redesign, hook replacement, task-completion states,
+global state/OID renames, a new preparation framework, fleet redesign, immediate
+cross-host events, migration support, pre-turn freshness gates, automatic expiry,
+and elaborate long-stale-work recovery.
 
-Fresh repair reuses the current execution mechanism, and automatic preparation
-continues to start from the existing Stop event. The smaller correctness
-resolutions are approved for implementation and have focused acceptance tests.
-Implement task-operation exclusion, not a provider-input refactor or strict
-pre-turn freshness. No new execution routes, general recovery framework, or
-compatibility design are needed.
+## Validation baseline and implementation discipline
 
-The accepted design does not require age-based task policies, automatic discard,
-recurring remote polling, distributed task locks, PR automation, terminal task
-completion, preservation of agent commit history, data migrations, deprecated
-aliases, mixed-version fleet support, or strict pre-turn freshness.
+During this assessment, `npm run check` passed with the existing control-regex
+warning in `native-promotion.test.ts`. Eight focused suites covering promotion,
+daemon, Sandbox, registry, setup, state, CLI and protocol passed 114 of 115 tests.
+The failure was preview-log availability immediately after preview start; its
+isolated rerun passed. Treat it as an existing intermittent baseline issue, not
+evidence that Git integration needs a rewrite. No live Docker test was run.
 
-Start with safe capture/reconciliation and the focused repair-isolation checks.
-Keeping fresh repair and post-turn preparation removes both same-conversation
-repair control and strict pre-turn freshness from scope. The remaining work is
-bounded Git correctness, operation coordination, and simplification of delivery.
+For each change, run focused regressions and `npm run check`; run the full suite
+and live smoke tests before declaring the integration contract complete. Changes
+1–2 establish safe direct promotion; 3–4 complete automatic freshness. No change
+requires unrelated lifecycle cleanup or application redesign.
+
+## Requirement evidence audit
+
+This separates deterministic implementation evidence from the outstanding live
+gate. Test descriptions below are search anchors in `test/v2/`; the latest full
+run above covers all listed suites. Passing simulated tests is not evidence of
+provider-native behavior on a real Sandbox.
+
+| Requirement                                                       | Current evidence                                                                                                                                                                       | Verification boundary                                                                    |
+| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Remote/base only; no local or PR delivery                         | `config.test.ts`, `cli.test.ts`, `initialize.test.ts`, updated registry/projection readers; application search finds no integration-mode or PR/force-push route                        | Host implementation and parsing verified                                                 |
+| Sanitized seed; host-owned credentials and Git delivery           | `registry.test.ts`: committed tracked content without real-worktree secrets/settings; `native-promotion.test.ts`: credential-bearing fetch failures excluded                           | Host Git and fake-Sandbox transport verified; live seed access outstanding               |
+| One commit with exact candidate tree/target parent; reusable task | `native-promotion.test.ts`: direct remote promotion and task reuse, exact working tree, preserved newer edits                                                                          | Real Git repositories and bare remote; provider resume still requires live verification  |
+| Reconciliation checkpoint survives interrupted replacement        | `native-promotion.test.ts`: interruption following reset retains original work and installed base; ordinary retry refused                                                              | Real Git script, simulated Sandbox                                                       |
+| Capture/check identity and invalidation                           | `native-promotion.test.ts`: force-staged ignored additions, changed workspace, check modifying files, binary/deleted/untracked content in exact promotion                              | Real Git tree identities verified                                                        |
+| Exclusive mutation, input and launch coordination                 | `daemon-worker.test.ts`: acknowledged ownership and cancellation; `daemon.test.ts`: initial/raw input, both launch forms, uncertainty markers and observer attach                      | Host IPC/PTY coordination tested; live in-Sandbox termination and hooks outstanding      |
+| Serialized shared seed; safe worker-loss handling                 | `registry.test.ts`: concurrent task workers, group SIGTERM cleanup and SIGKILL with surviving Git child; `lock.test.ts`: eight-process contention and interrupted reclamation          | Actual host processes; abrupt seed-owner loss fails closed, no automatic replay          |
+| Setup after target installation                                   | `native-promotion.test.ts`: installs target files before starting changed setup; `setup.test.ts` retained                                                                              | Deterministic ordering and existing setup behavior verified                              |
+| Fresh contextual bounded repair plus one correction               | `native-promotion.test.ts`: both provider arguments/context, nonzero/timeouts, correction exhaustion across requests/target changes, unrelated check failures                          | Simulated providers and real timeout; native history/hook isolation outstanding          |
+| Retry-safe delivery and accepted advancement                      | `native-promotion.test.ts`: rejected push, lost response, same-commit retry, sync without pushing, newer remote tip, missing terminal receipt and actual host-worker loss              | Real Git and host worker with simulated Sandbox advancement                              |
+| Stop and sibling target-change scheduling                         | `daemon.test.ts`: duplicate Stop, deferred setup/turn/intent, latest pending target; `native-promotion.test.ts`: real promotion through socket, daemon and separate sibling worker     | Same-host integration verified with fake Sandbox; stopped-sibling live check outstanding |
+| Responsive honest status, no pre-turn freshness gate              | `native-promotion.test.ts`: target fetch during generation, offline/timeout metadata, seed contention, blocked repair, observation races; `entrypoint.test.ts` and `task-view.test.ts` | Host observation/routing verified; no synchronous status repair introduced               |
+| Preserve existing architecture and command features               | Provider adapters, lifecycle recording/ingestion, conversation and setup implementation unchanged; full native-session, setup, auth, preview, fleet and routing suites pass            | No new runtime/session/scheduler, migration, task completion or expiry mechanism         |
+| Help, README, control-plane contract, plan and validation         | Updated documents/CLI fixtures; check, build, full tests and `git diff --check`                                                                                                        | Live smoke results and tested provider/runtime versions still required before completion |

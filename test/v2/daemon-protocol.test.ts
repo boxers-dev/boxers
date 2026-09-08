@@ -7,6 +7,27 @@ import {
 } from "../../src/v2/daemon-protocol.ts";
 
 describe("daemon wire protocol", () => {
+  it("validates explicit initial-turn ownership without inspecting provider arguments", () => {
+    expect(parseClientMessage('{"type":"attach","startsTurn":true}')).toMatchObject({
+      startsTurn: true,
+    });
+    expect(parseClientMessage('{"type":"start_session","startsTurn":"yes"}')).toBeUndefined();
+  });
+  it("validates nonexclusive task preparation hints", () => {
+    expect(parseClientMessage(encodeMessage({ type: "prepare_task", taskName: "task" }))).toEqual({
+      type: "prepare_task",
+      taskName: "task",
+    });
+    expect(parseClientMessage('{"type":"prepare_task","taskName":42}')).toBeUndefined();
+    expect(parseClientMessage('{"type":"prepare_task"}')).toBeUndefined();
+  });
+
+  it("accepts project target hints and rejects malformed project identities", () => {
+    expect(
+      parseClientMessage(encodeMessage({ type: "target_changed", projectId: "project" })),
+    ).toEqual({ type: "target_changed", projectId: "project" });
+    expect(parseClientMessage('{"type":"target_changed","projectId":2}')).toBeUndefined();
+  });
   it("round-trips a client message through encode and parse", () => {
     const encoded = encodeMessage({
       type: "attach",

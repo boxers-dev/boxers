@@ -68,19 +68,13 @@ function configRoot(text: string): Record<string, unknown> {
 function parseIntegration(root: Record<string, unknown>): ProjectConfig["integration"] {
   if (root.integration === undefined) return undefined;
   const integration = object(root.integration, "integration");
-  keys(integration, ["mode", "base", "remote"], "integration");
-  if (integration.mode !== "local" && integration.mode !== "remote")
-    throw new Error("integration.mode must be local or remote.");
+  keys(integration, ["base", "remote"], "integration");
   if (typeof integration.base !== "string" || !integration.base.trim())
     throw new Error("integration.base is required.");
-  if (integration.mode === "local") {
-    if (integration.remote !== undefined)
-      throw new Error("integration.remote applies only to remote integration.");
-    return { mode: "local", base: integration.base };
-  }
-  if (typeof integration.remote !== "string" || !integration.remote.trim())
-    throw new Error("Remote integration requires integration.remote.");
-  return { mode: "remote", base: integration.base, remote: integration.remote };
+  const remote = integration.remote ?? "origin";
+  if (typeof remote !== "string" || !remote.trim())
+    throw new Error("integration.remote must be a non-empty remote name or URL.");
+  return { base: integration.base, remote };
 }
 
 function parseCheck(root: Record<string, unknown>): ProjectConfig["check"] {

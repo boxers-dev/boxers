@@ -1,7 +1,6 @@
 export const MIN_SBX_VERSION = "0.37.0";
 
 export type Agent = "codex" | "claude";
-export type IntegrationMode = "local" | "remote";
 
 export type TaskPhase =
   | "creating"
@@ -24,7 +23,7 @@ export interface CheckDefinition {
 
 export interface ProjectConfig {
   version: 3;
-  integration?: { mode: "local"; base: string } | { mode: "remote"; base: string; remote: string };
+  integration?: { base: string; remote: string };
   setup?: { run: string; timeoutMs: number };
   check?: {
     setup?: string;
@@ -32,6 +31,16 @@ export interface ProjectConfig {
   };
   preview?: { run: string; ports: number[] };
   defaults?: { agent?: Agent; model?: string; effort?: string; fast?: boolean };
+}
+
+/** Host-side observation of the configured remote target, not an installed task base. */
+export interface ProjectTargetObservation {
+  remote: string;
+  base: string;
+  attemptedAt: string;
+  oid?: string;
+  observedAt?: string;
+  failure?: string;
 }
 
 export interface SetupStatus {
@@ -126,6 +135,8 @@ export interface OperationView {
   state: "queued" | "running" | "cancelling";
   startedAt?: string;
   detail?: string;
+  /** Live daemon acknowledgment, not inferred from a phase or persisted snapshot. */
+  workspaceMutation?: boolean;
 }
 
 export interface RecordedTaskOperation extends OperationView {
@@ -159,7 +170,8 @@ export interface TaskIssue {
     | "preview_failed"
     | "runtime_unavailable"
     | "lifecycle_capture_failed"
-    | "operation_failed";
+    | "operation_failed"
+    | "target_refresh_failed";
   source: "setup" | "reconciliation" | "checks" | "preview" | "runtime" | "daemon";
   message: string;
   owner: "agent" | "user" | "boxers" | "host";
@@ -169,6 +181,14 @@ export interface TaskIssue {
 
 export interface TaskView {
   agent: { state: AgentTurnState; label: string };
+  target?: {
+    branch: string;
+    state: "observed" | "unknown" | "unavailable";
+    installedOid?: string;
+    observedOid?: string;
+    observedAt?: string;
+    failure?: string;
+  };
   operations: OperationView[];
   setup: {
     state:
@@ -191,6 +211,7 @@ export interface TaskView {
   reconciliation: {
     state:
       | "not_needed"
+      | "unknown"
       | "awaiting_setup"
       | "queued"
       | "running"
@@ -254,6 +275,7 @@ export interface TaskState {
   lifecycleDiagnostic?: string | undefined;
   hasUnmergedChanges: Observation<boolean | "unknown">;
   baseOid?: string | undefined;
+  observedTargetOid?: string | undefined;
   candidateTreeOid?: string | undefined;
   lastDelivery?: Observation<DeliveryRecord> | undefined;
   setup?: SetupStatus | undefined;
@@ -287,7 +309,7 @@ export interface ProjectManifest {
   root: string;
   seedPath: string;
   source?: string | undefined;
-  integration: { mode: "local"; base: string } | { mode: "remote"; base: string; remote: string };
+  integration: { base: string; remote: string };
   createdAt: string;
 }
 
@@ -369,7 +391,7 @@ export interface RemoteProjectSnapshot {
   name: string;
   source?: string | undefined;
   base: string;
-  integration: IntegrationMode;
+  remote: string;
 }
 
 export type HostCheckStatus = "ok" | "warning" | "failed" | "unknown";

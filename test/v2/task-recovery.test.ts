@@ -30,7 +30,7 @@ it("archives missing runtimes, preserves metadata, and protects a live creator",
   writeFileSync(join(root, "tracked.txt"), "base\n");
   execFileSync("git", ["-C", root, "add", "tracked.txt"]);
   execFileSync("git", ["-C", root, "commit", "-q", "-m", "base"]);
-  const project = initProject({ integration: "local", base: "main", cwd: root });
+  const project = initProject({ remote: root, base: "main", cwd: root });
 
   const stale = createTaskManifest(project, "stale", "codex");
   updateTask(project, stale, { phase: "idle", agent: "codex" });

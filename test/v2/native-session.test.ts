@@ -57,10 +57,11 @@ describe("native agent task lifecycle", () => {
     writeFileSync(join(root, "base.txt"), "base\n");
     git(root, "add", ".");
     git(root, "commit", "-q", "-m", "base");
-    const project = initProject({ integration: "local", base: "main", cwd: root });
+    git(root, "remote", "add", "origin", root);
+    const project = initProject({ remote: "origin", base: "main", cwd: root });
     writeFileSync(
       join(root, ".boxers", "config.yml"),
-      "version: 3\nintegration: { mode: local, base: main }\ndefaults: { agent: codex, model: gpt-example, effort: high, fast: true }\n",
+      "version: 3\nintegration: { remote: origin, base: main }\ndefaults: { agent: codex, model: gpt-example, effort: high, fast: true }\n",
     );
     git(root, "add", ".boxers/config.yml");
     git(root, "commit", "-q", "-m", "boxers config");

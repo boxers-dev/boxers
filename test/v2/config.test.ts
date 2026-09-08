@@ -16,18 +16,21 @@ describe("project configuration", () => {
     expect(
       parseProjectConfig(`version: 3
 integration:
-  mode: remote
   base: main
   remote: origin
 `),
     ).toEqual({
       version: 3,
-      integration: { mode: "remote", base: "main", remote: "origin" },
+      integration: { base: "main", remote: "origin" },
     });
     expect(parseProjectConfig("version: 3\n")).toEqual({ version: 3 });
     expect(() =>
-      parseProjectConfig("version: 3\nintegration: { mode: local, base: main, remote: origin }\n"),
-    ).toThrow("applies only to remote");
+      parseProjectConfig("version: 3\nintegration: { mode: local, base: main }\n"),
+    ).toThrow("unknown key mode");
+    expect(parseProjectConfig("version: 3\nintegration: { base: develop }\n")).toEqual({
+      version: 3,
+      integration: { base: "develop", remote: "origin" },
+    });
   });
 
   it("parses task launch defaults", () => {

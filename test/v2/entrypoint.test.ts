@@ -26,7 +26,7 @@ describe("CLI daemon boundary", () => {
   it("keeps daemon lifecycle commands on the direct CLI path", () => {
     expect(isDaemonBackedTaskInvocation(["feature", "check"])).toBe(true);
     expect(isDaemonBackedTaskInvocation(["feature", "setup"])).toBe(true);
-    expect(isDaemonBackedTaskInvocation(["feature", "status", "--refresh"])).toBe(true);
+    expect(isDaemonBackedTaskInvocation(["feature", "status", "--refresh"])).toBe(false);
     expect(isDaemonBackedTaskInvocation(["daemon", "stop"])).toBe(false);
     expect(isDaemonBackedTaskInvocation(["daemon", "start"])).toBe(false);
     expect(isDaemonBackedTaskInvocation(["daemon", "stop", "--force"])).toBe(false);
@@ -35,11 +35,11 @@ describe("CLI daemon boundary", () => {
     expect(isDaemonBackedTaskInvocation(["server/task", "status", "--refresh"])).toBe(false);
   });
 
-  it("keeps plain recorded-state views off the daemon intent path", () => {
+  it("keeps cached lists and both status forms off the exclusive daemon intent path", () => {
     expect(isDaemonBackedTaskInvocation(["list"])).toBe(false);
     expect(isDaemonBackedTaskInvocation(["ls"])).toBe(false);
     expect(isDaemonBackedTaskInvocation(["task", "status"])).toBe(false);
-    expect(isDaemonBackedTaskInvocation(["task", "status", "--refresh"])).toBe(true);
+    expect(isDaemonBackedTaskInvocation(["task", "status", "--refresh"])).toBe(false);
   });
 
   it("lets doctor diagnose an unresponsive daemon without negotiating with it", async () => {

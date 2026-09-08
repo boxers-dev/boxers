@@ -7,6 +7,7 @@ export interface AttachRequest {
   rows: number;
   taskName?: string;
   bridgeToken?: string;
+  startsTurn?: boolean;
 }
 export interface StartSessionRequest {
   type: "start_session";
@@ -14,6 +15,7 @@ export interface StartSessionRequest {
   sessionId: string;
   taskName: string;
   bridgeToken: string;
+  startsTurn?: boolean;
   command: string;
   args: string[];
   cols: number;
@@ -82,8 +84,17 @@ export interface SetupCompletedRequest {
   taskName: string;
 }
 
+/** A hint only: the receiver reads the authoritative target from the seed. */
+export interface TargetChangedRequest {
+  type: "target_changed";
+  projectId: string;
+}
+export interface PrepareTaskRequest {
+  type: "prepare_task";
+  taskName: string;
+}
+
 export type TaskIntent =
-  | { kind: "refresh"; json: boolean }
   | { kind: "sync" }
   | { kind: "review"; color?: boolean }
   | { kind: "check" }
@@ -113,6 +124,8 @@ export type ClientMessage =
   | SubscribeRequest
   | StateChangedRequest
   | SetupCompletedRequest
+  | TargetChangedRequest
+  | PrepareTaskRequest
   | RunIntentRequest;
 
 export interface ReplayMessage {
@@ -269,6 +282,8 @@ const CLIENT_MESSAGE_TYPES = new Set([
   "subscribe",
   "state_changed",
   "setup_completed",
+  "target_changed",
+  "prepare_task",
   "run_intent",
 ]);
 const SERVER_MESSAGE_TYPES = new Set([
@@ -305,6 +320,12 @@ export function parseClientMessage(line: string): ClientMessage | undefined {
   const value = parseLine(line);
   if (!value || typeof value["type"] !== "string" || !CLIENT_MESSAGE_TYPES.has(value["type"]))
     return undefined;
+  if (
+    (value["type"] === "attach" || value["type"] === "start_session") &&
+    value["startsTurn"] !== undefined &&
+    typeof value["startsTurn"] !== "boolean"
+  )
+    return undefined;
   if (value["type"] === "run_intent") {
     const intent = value["intent"];
     if (
@@ -312,7 +333,7 @@ export function parseClientMessage(line: string): ClientMessage | undefined {
       typeof value["task"] !== "string" ||
       !intent ||
       typeof intent !== "object" ||
-      !["refresh", "sync", "review", "check", "setup", "promote", "preview", "discard"].includes(
+      !["sync", "review", "check", "setup", "promote", "preview", "discard"].includes(
         String((intent as Record<string, unknown>)["kind"]),
       )
     )
@@ -327,6 +348,9 @@ export function parseClientMessage(line: string): ClientMessage | undefined {
   }
   if (value["type"] === "setup_completed" && typeof value["taskName"] !== "string")
     return undefined;
+  if (value["type"] === "target_changed" && typeof value["projectId"] !== "string")
+    return undefined;
+  if (value["type"] === "prepare_task" && typeof value["taskName"] !== "string") return undefined;
   if (
     value["type"] === "subscribe" &&
     value["authoritativeOnly"] !== undefined &&

@@ -24,7 +24,7 @@ describe("task list", () => {
       writeFileSync(join(root, "tracked.txt"), "tracked\n");
       execFileSync("git", ["-C", root, "add", "tracked.txt"]);
       execFileSync("git", ["-C", root, "commit", "-q", "-m", "base"]);
-      const project = initProject({ integration: "local", base: "main", cwd: root });
+      const project = initProject({ remote: root, base: "main", cwd: root });
       const task = createTaskManifest(project, "cached-task", "codex");
       updateTask(project, task, {
         phase: "working",
@@ -94,7 +94,7 @@ describe("task list", () => {
       writeFileSync(join(root, "tracked.txt"), "tracked\n");
       execFileSync("git", ["-C", root, "add", "tracked.txt"]);
       execFileSync("git", ["-C", root, "commit", "-q", "-m", "base"]);
-      const project = initProject({ integration: "local", base: "main", cwd: root });
+      const project = initProject({ remote: root, base: "main", cwd: root });
       const task = createTaskManifest(project, "local-task", "codex");
       updateTask(project, task, { phase: "idle", agent: "codex" });
       const fleet = ensureFleet();
@@ -164,7 +164,7 @@ describe("task list", () => {
       writeFileSync(join(root, "tracked.txt"), "tracked\n");
       execFileSync("git", ["-C", root, "add", "tracked.txt"]);
       execFileSync("git", ["-C", root, "commit", "-q", "-m", "base"]);
-      const project = initProject({ integration: "local", base: "main", cwd: root });
+      const project = initProject({ remote: root, base: "main", cwd: root });
       const task = createTaskManifest(project, "leased-task", "codex");
       updateTask(project, task, {
         phase: "checking",

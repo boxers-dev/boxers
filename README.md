@@ -52,8 +52,11 @@ directory. Status and list use one structured view: agent activity, Boxers
 operations, setup, reconciliation, changes, checks, delivery, removal safety,
 specific issues, and concrete next commands are reported independently. A
 finished provider turn is shown as `Agent: Ready for input`, not as a generic
-failure or attention flag. Plain status and list read recorded state; use
-`status --refresh` when workspace facts are unknown or stale.
+failure or attention flag. Task status attempts a bounded host fetch and shows
+the installed base, latest observed target and any freshness failure. It requests
+background preparation from an already-running daemon without waiting for repair.
+Use `status --refresh` for deeper runtime and idle-workspace observation; it does
+not run reconciliation synchronously. List uses recorded Git observations.
 
 For example, the compact list and detailed status agree on the same facts:
 
@@ -79,12 +82,29 @@ boxers fix-parser promote
 
 - `review` shows the exact candidate diff without running checks.
 - `check` runs the checks selected during project setup.
-- `promote` verifies the candidate and integrates it. Local projects receive
-  a commit on the configured branch; remote projects receive a pushed task
-  branch ready for a pull request.
+- `promote` verifies the candidate and pushes one commit directly to the configured
+  remote/base branch (`origin` by default). It never forces the target or advances
+  your host checkout. The branch must permit direct pushes.
 
 `promote` runs required checks itself, so `review` and `check` are useful but
 not mandatory steps.
+
+Promotion keeps the task and its conversation available for follow-up work.
+Each later promotion delivers another increment as one commit. If a push was
+accepted but the Sandbox could not advance, Boxers records that acceptance;
+after a known completed failure, retrying finishes the workspace update without
+delivering the increment twice. If the Sandbox mutation outcome is unknown,
+Boxers blocks further generation and capture until it is inspected and resolved,
+or the task is explicitly discarded and recreated. The accepted remote commit
+is retained in either case.
+
+After agent turns, Boxers reconciles against the latest fetched target. A changed
+target also notifies sibling tasks on the same host: idle tasks refresh, busy
+tasks catch up after their turn or operation, and stopped Sandboxes stay stopped.
+New prompts do not require a freshness check, but wait through an active workspace
+replacement or conflict repair. Repair uses a fresh bounded turn, with at most one
+check-driven correction. Ambiguous or interrupted work remains available for
+inspection or explicit discard; Boxers does not silently delete it.
 
 Other useful task commands:
 

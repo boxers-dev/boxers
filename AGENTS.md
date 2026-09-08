@@ -5,7 +5,7 @@
 `boxers` is a TypeScript CLI that manages durable Codex and Claude tasks in
 Docker Sandboxes. Docker Sandboxes owns each isolated workspace and the agent's
 native session. Boxers owns host-side project/task metadata, optional
-checks, review snapshots, and promotion into a local branch or remote.
+checks, review snapshots, and promotion directly into a configured remote branch.
 
 There is one architecture: Sandbox-native tasks. Do not add a second execution
 or migration path.
@@ -15,7 +15,7 @@ The `boxers` executable starts in `src/index.ts`, delegates parsing to
 
 ## Boundaries
 
-- Project: a registered Git checkout plus its integration mode and sanitized
+- Project: a registered Git checkout plus its remote/base target and sanitized
   seed repository.
 - Task: a user-facing name mapped to one `boxers-<project>-<task>` Docker Sandbox.
 - Agent: Codex or Claude, launched through the Sandbox-native agent command.
@@ -25,8 +25,8 @@ The `boxers` executable starts in `src/index.ts`, delegates parsing to
 - Check: optional setup and configured checks execute in the Sandbox and stream
   output to the terminal and host-side logs.
 - Promotion: Boxers snapshots the exact Sandbox working tree, then host Git
-  creates and advances the reviewed commit. Agents do not receive host Git
-  credentials.
+  creates one commit and pushes it directly to the configured target. The task
+  and native conversation remain reusable. Agents do not receive host Git credentials.
 
 Sandboxes are created from an application-owned seed containing committed,
 tracked content only. The real checkout's untracked/ignored files, hooks,
@@ -58,13 +58,13 @@ Project commands:
 
 - `boxers doctor [--agent codex|claude] [--json]`
 - `boxers auth codex|claude`
-- `boxers init` with optional integration and feature switches
+- `boxers project init` with remote/base and optional feature switches
 
 Task commands:
 
 - `boxers <task> new --agent codex|claude [--prompt <text>] [-d]`
 - `boxers list [--json]`
-- `boxers <task> attach|inspect|review|check|merge|sync|stop|shell|rm`
+- `boxers <task> attach|status|review|check|promote|sync|setup|discard`
 - `boxers <task> preview [start|stop|restart|logs]`
 
 Keep `README.md`, the `src/cli.ts` usage text, parsing tests, and behavior in
@@ -100,6 +100,6 @@ streaming processes, and promotion behavior.
 - Preserve Codex trust/full-access arguments and Claude permission arguments;
   the Docker Sandbox is the security boundary.
 - Preserve provider-native resume behavior and the `sessionStartedAt` marker.
-- Never overwrite unrelated user work in the host checkout. Local promotion
-  requires the configured branch, expected HEAD, and a clean worktree; remote
-  promotion must remain fast-forward-only.
+- Never advance or overwrite the host checkout during promotion. Remote promotion
+  must remain fast-forward-only. Retain confirmed delivery even when advancing
+  the originating Sandbox fails; retry must not duplicate an accepted increment.

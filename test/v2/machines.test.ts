@@ -32,7 +32,7 @@ const snapshot: RemoteSnapshot = {
       name: "boxers",
       source: "github.com/owner/boxers",
       base: "main",
-      integration: "remote",
+      remote: "origin",
     },
   ],
   tasks: [

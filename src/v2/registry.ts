@@ -19,21 +19,23 @@ import {
   machineIdentityLockPath,
   machineIdentityPath,
   projectDir,
+  projectSeedLockPath,
+  projectTargetPath,
   projectsDir,
   readJson,
   taskDir,
   taskManifestLockPath,
 } from "./paths.ts";
 import { withPidFileLock } from "./lock.ts";
-import { command, requireSuccess } from "./process.ts";
+import { command, commandWithTreeTimeout, requireSuccess } from "./process.ts";
 import { recordTaskSnapshot } from "./state.ts";
-import { notifyDaemonStateChanged } from "./daemon-client.ts";
+import { notifyDaemonStateChanged, notifyDaemonTargetChanged } from "./daemon-client.ts";
 import { defaultRuntime, runtimeHandleForTask } from "./runtime/registry.ts";
 import type {
   Agent,
-  IntegrationMode,
   ObservationSource,
   ProjectManifest,
+  ProjectTargetObservation,
   TaskManifest,
   TaskSnapshot,
   MachineIdentity,
@@ -121,20 +123,26 @@ export function requireProject(cwd = process.cwd()): ProjectManifest {
   return project;
 }
 
-function sourceFor(project: ProjectManifest): string {
-  if (project.integration.mode === "local") return project.root;
-  const configured = command("git", [
-    "-C",
+function gitBeforeDeadline(root: string, args: readonly string[], deadline: number) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error("Remote target observation timed out (ETIMEDOUT).");
+  return command("git", ["-C", root, ...args], {
+    timeout: remaining,
+    killSignal: "SIGKILL",
+  });
+}
+
+function sourceFor(project: ProjectManifest, deadline: number): string {
+  const configured = gitBeforeDeadline(
     project.root,
-    "remote",
-    "get-url",
-    project.integration.remote,
-  ]);
+    ["remote", "get-url", project.integration.remote],
+    deadline,
+  );
   return configured.status === 0 ? configured.stdout.trim() : project.integration.remote;
 }
 
 function remoteUrl(project: ProjectManifest): string | undefined {
-  const preferred = project.integration.mode === "remote" ? project.integration.remote : "origin";
+  const preferred = project.integration.remote;
   const configured = command("git", ["-C", project.root, "remote", "get-url", preferred]);
   return configured.status === 0 && configured.stdout.trim() ? configured.stdout.trim() : undefined;
 }
@@ -170,18 +178,133 @@ export function projectCloneSource(project: ProjectManifest): string {
   return source;
 }
 
-export function refreshSeed(project: ProjectManifest): string {
+export function readProjectTarget(project: ProjectManifest): ProjectTargetObservation | undefined {
+  const path = projectTargetPath(project.id);
+  if (!existsSync(path)) return undefined;
+  const value = readJson<ProjectTargetObservation>(path);
+  if (!value || typeof value !== "object")
+    throw new Error(`Invalid target observation at ${path}.`);
+  if (value.remote !== project.integration.remote || value.base !== project.integration.base)
+    return undefined;
+  if (
+    typeof value.attemptedAt !== "string" ||
+    (value.oid !== undefined &&
+      (typeof value.oid !== "string" || !/^[a-f0-9]{40,64}$/.test(value.oid))) ||
+    (value.oid === undefined) !== (value.observedAt === undefined) ||
+    (value.observedAt !== undefined && typeof value.observedAt !== "string") ||
+    (value.failure !== undefined && typeof value.failure !== "string")
+  )
+    throw new Error(`Invalid target observation at ${path}.`);
+  return value;
+}
+
+function recordProjectTarget(project: ProjectManifest, oid: string): void {
+  const now = new Date().toISOString();
+  atomicWriteJson(projectTargetPath(project.id), {
+    ...project.integration,
+    oid,
+    observedAt: now,
+    attemptedAt: now,
+  } satisfies ProjectTargetObservation);
+}
+
+export function refreshSeed(project: ProjectManifest, timeoutMs = 60_000): string {
+  const deadline = Date.now() + timeoutMs;
+  const result = withPidFileLock(
+    projectSeedLockPath(project.id),
+    () => {
+      try {
+        const previous = readSeedTarget(project, deadline);
+        const target = refreshSeedUnsafe(project, deadline);
+        recordProjectTarget(project, target);
+        return { target, changed: previous !== target };
+      } catch (error) {
+        atomicWriteJson(projectTargetPath(project.id), {
+          ...readProjectTarget(project),
+          ...project.integration,
+          attemptedAt: new Date().toISOString(),
+          failure: error instanceof Error ? error.message : String(error),
+        } satisfies ProjectTargetObservation);
+        throw error;
+      } finally {
+        // A failed/timeout fetch can also write a credential-bearing source URL.
+        rmSync(join(project.seedPath, ".git", "FETCH_HEAD"), { force: true });
+      }
+    },
+    timeoutMs,
+    // A killed worker's Git/transport descendants may still own the seed.
+    { reclaimDeadOwner: false },
+  );
+  // Never notify while holding the seed transaction lock.
+  if (result.changed) notifyDaemonTargetChanged(project.id);
+  return result.target;
+}
+
+/** Read the published seed target without network access or workspace mutation. */
+export function readSeedTarget(project: ProjectManifest, deadline?: number): string | undefined {
+  const args = ["rev-parse", "refs/heads/" + project.integration.base];
+  const result =
+    deadline === undefined
+      ? command("git", ["-C", project.seedPath, ...args])
+      : gitBeforeDeadline(project.seedPath, args, deadline);
+  return result.status === 0 && /^[a-f0-9]{40,64}$/.test(result.stdout.trim())
+    ? result.stdout.trim()
+    : undefined;
+}
+
+/** Publish a confirmed push even when its subsequent network refresh is offline. */
+export function publishAcceptedTarget(
+  project: ProjectManifest,
+  expected: string,
+  accepted: string,
+): void {
+  const changed = withPidFileLock(
+    projectSeedLockPath(project.id),
+    () => {
+      // A sibling fetch may already have installed a later target. Never regress it.
+      if (readSeedTarget(project) !== expected) return false;
+      installSeedTarget(project, accepted);
+      recordProjectTarget(project, accepted);
+      return expected !== accepted;
+    },
+    60_000,
+    { reclaimDeadOwner: false },
+  );
+  if (changed) notifyDaemonTargetChanged(project.id);
+}
+
+function installSeedTarget(
+  project: ProjectManifest,
+  oid: string,
+  deadline = Date.now() + 60_000,
+): void {
+  requireSuccess(
+    gitBeforeDeadline(
+      project.seedPath,
+      ["checkout", "-q", "-B", project.integration.base, oid],
+      deadline,
+    ),
+    "Could not check out sanitized target",
+  );
+  requireSuccess(
+    gitBeforeDeadline(project.seedPath, ["reset", "--hard", "-q", oid], deadline),
+    "Could not reset sanitized seed",
+  );
+}
+
+function refreshSeedUnsafe(project: ProjectManifest, deadline: number): string {
   mkdirSync(project.seedPath, { recursive: true, mode: 0o700 });
   if (!existsSync(join(project.seedPath, ".git"))) {
     requireSuccess(
-      command("git", ["-C", project.seedPath, "init", "-q"]),
+      gitBeforeDeadline(project.seedPath, ["init", "-q"], deadline),
       "Could not initialize sanitized seed",
     );
   }
-  const source = sourceFor(project);
+  const source = sourceFor(project, deadline);
   const base = project.integration.base;
-  requireSuccess(
-    command("git", [
+  const fetched = commandWithTreeTimeout(
+    "git",
+    [
       "-C",
       project.seedPath,
       "fetch",
@@ -189,31 +312,32 @@ export function refreshSeed(project: ProjectManifest): string {
       "--force",
       source,
       `refs/heads/${base}:refs/boxers/target`,
-    ]),
-    `Could not refresh ${source} ${base}`,
+    ],
+    deadline - Date.now(),
+    { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" },
   );
+  // These errors are persisted and projected to fleet observers. Git stderr may
+  // contain credential-bearing URLs or helper output; never publish it here.
+  if (fetched.status !== 0)
+    throw new Error(
+      fetched.status === 124
+        ? "Could not refresh the remote target: fetch timed out (ETIMEDOUT). Retry when host Git connectivity is restored."
+        : `Could not refresh the remote target (Git exit ${fetched.status}). Check host Git connectivity, authentication and branch availability, then retry.`,
+    );
   const oid = requireSuccess(
-    command("git", ["-C", project.seedPath, "rev-parse", "refs/boxers/target^{commit}"]),
+    gitBeforeDeadline(project.seedPath, ["rev-parse", "refs/boxers/target^{commit}"], deadline),
     "Target is not a commit",
   );
-  requireSuccess(
-    command("git", ["-C", project.seedPath, "checkout", "-q", "-B", base, oid]),
-    "Could not check out sanitized target",
-  );
-  requireSuccess(
-    command("git", ["-C", project.seedPath, "reset", "--hard", "-q", oid]),
-    "Could not reset sanitized seed",
-  );
+  installSeedTarget(project, oid, deadline);
   // Fetch metadata can contain the source URL. It is not needed by clone mode.
-  command("git", ["-C", project.seedPath, "remote", "remove", "origin"]);
-  command("git", ["-C", project.seedPath, "config", "--unset-all", "credential.helper"]);
-  command("git", ["-C", project.seedPath, "config", "--unset-all", "core.hooksPath"]);
+  gitBeforeDeadline(project.seedPath, ["remote", "remove", "origin"], deadline);
+  gitBeforeDeadline(project.seedPath, ["config", "--unset-all", "credential.helper"], deadline);
+  gitBeforeDeadline(project.seedPath, ["config", "--unset-all", "core.hooksPath"], deadline);
   rmSync(join(project.seedPath, ".git", "FETCH_HEAD"), { force: true });
   return oid;
 }
 
 export interface InitProjectOptions {
-  integration: IntegrationMode;
   base: string;
   remote?: string;
   cwd?: string;
@@ -224,8 +348,8 @@ export function initProject(options: InitProjectOptions): ProjectManifest {
   const root = realpathSync(repositoryRoot(options.cwd));
   const existing = findProject(root);
   if (!options.base.trim()) throw new Error("--base requires a branch name.");
-  if (options.integration === "remote" && !options.remote?.trim())
-    throw new Error("Remote integration requires --remote <name-or-url>.");
+  const remote = options.remote ?? "origin";
+  if (!remote.trim()) throw new Error("--remote requires a remote name or URL.");
   const configPath = join(root, ".boxers", "config.yml");
   if (!existsSync(configPath)) {
     mkdirSync(join(root, ".boxers"), { recursive: true });
@@ -234,9 +358,7 @@ export function initProject(options: InitProjectOptions): ProjectManifest {
   const config = readProjectConfig(configPath);
   if (
     config.integration &&
-    (config.integration.mode !== options.integration ||
-      config.integration.base !== options.base ||
-      (config.integration.mode === "remote" && config.integration.remote !== options.remote))
+    (config.integration.base !== options.base || config.integration.remote !== remote)
   )
     throw new Error(
       ".boxers/config.yml integration settings do not match the requested project registration.",
@@ -245,10 +367,7 @@ export function initProject(options: InitProjectOptions): ProjectManifest {
     mkdirSync(join(projectDir(existing.id), "tasks"), { recursive: true, mode: 0o700 });
     let updated: ProjectManifest = {
       ...existing,
-      integration:
-        options.integration === "local"
-          ? { mode: "local", base: options.base }
-          : { mode: "remote", base: options.base, remote: options.remote as string },
+      integration: { base: options.base, remote },
     };
     refreshSeed(updated);
     delete updated.source;
@@ -264,10 +383,7 @@ export function initProject(options: InitProjectOptions): ProjectManifest {
     id,
     root,
     seedPath: join(dir, "seed"),
-    integration:
-      options.integration === "local"
-        ? { mode: "local", base: options.base }
-        : { mode: "remote", base: options.base, remote: options.remote as string },
+    integration: { base: options.base, remote },
     createdAt: new Date().toISOString(),
   };
   mkdirSync(join(dir, "tasks"), { recursive: true, mode: 0o700 });
