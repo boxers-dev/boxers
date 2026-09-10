@@ -51,6 +51,7 @@ import {
 } from "./daemon-worker.ts";
 import { processIsBoxersDaemon } from "./daemon-identity.ts";
 import { PtyControlParser } from "./pty-control.ts";
+import { TerminalInputParser, type TerminalInputChunk } from "./terminal-input.ts";
 import { debugValue, writeDaemonDebug } from "./daemon-debug.ts";
 import {
   archiveMissingTaskRegistrations,
@@ -101,6 +102,8 @@ interface Session {
   state: "running" | "exited";
   controlParser: PtyControlParser | undefined;
   uncommittedInput: boolean;
+  terminalInput: TerminalInputParser;
+  terminalInputTimer?: ReturnType<typeof setTimeout> | undefined;
 }
 
 export interface DaemonHandle {
@@ -216,6 +219,7 @@ function startSession(
     state: "running",
     controlParser: request.bridgeToken ? new PtyControlParser(request.bridgeToken) : undefined,
     uncommittedInput: request.startsTurn === true,
+    terminalInput: new TerminalInputParser(),
   };
   sessions.set(request.sessionId, session);
   proc.onData((chunk) => {
@@ -242,6 +246,7 @@ function startSession(
     const current = sessions.get(request.sessionId);
     if (!current) return;
     current.state = "exited";
+    if (current.terminalInputTimer) clearTimeout(current.terminalInputTimer);
     for (const viewer of current.viewers.keys())
       send(viewer, { type: "exited", sessionId: request.sessionId, code: exitCode });
     onEvent(request.sessionId, "exited");
@@ -307,7 +312,10 @@ export function runDaemon(
       (session) =>
         session.state === "running" &&
         session.taskName?.toLowerCase() === key &&
-        (session.uncommittedInput || session.pendingInput.length > 0 || session.inputFlushPending),
+        (session.uncommittedInput ||
+          session.terminalInput.pending ||
+          session.pendingInput.length > 0 ||
+          session.inputFlushPending),
     );
 
   const prepareAgentStart = async (taskName: string): Promise<string | undefined> => {
@@ -702,6 +710,23 @@ export function runDaemon(
     }
     session.pendingInput.push(input);
     if (!session.inputFlushTimer && !session.inputFlushPending) void flushSessionInput(session);
+  };
+
+  const forwardTerminalInput = (session: Session, chunks: TerminalInputChunk[]): void => {
+    if (session.state !== "running") return;
+    const data = chunks.map((chunk) => chunk.data).join("");
+    if (data) {
+      if (chunks.some((chunk) => chunk.userInput)) {
+        session.uncommittedInput = true;
+        if (session.taskName) void abortPostTurn(session.taskName);
+        writeSessionInput(session, data);
+      } else {
+        // Reports cannot submit a prompt and must reach the terminal even
+        // while a workspace operation is holding actual user input.
+        session.proc.write(data);
+      }
+    }
+    if (session.taskName) drainPending(session.taskName);
   };
 
   const runIntent = async (
@@ -1102,9 +1127,18 @@ export function runDaemon(
             });
             return;
           }
-          session.uncommittedInput = true;
-          if (session.taskName) void abortPostTurn(session.taskName);
-          writeSessionInput(session, Buffer.from(message.dataBase64, "base64").toString("utf8"));
+          if (session.terminalInputTimer) clearTimeout(session.terminalInputTimer);
+          forwardTerminalInput(
+            session,
+            session.terminalInput.push(Buffer.from(message.dataBase64, "base64").toString("utf8")),
+          );
+          if (session.terminalInput.pending) {
+            session.terminalInputTimer = setTimeout(() => {
+              session.terminalInputTimer = undefined;
+              forwardTerminalInput(session, session.terminalInput.flush());
+            }, 50);
+            session.terminalInputTimer.unref();
+          }
           return;
         }
         case "resize": {
@@ -1280,6 +1314,7 @@ export function runDaemon(
     peerObservers?.close();
     for (const session of sessions.values()) {
       if (session.inputFlushTimer) clearTimeout(session.inputFlushTimer);
+      if (session.terminalInputTimer) clearTimeout(session.terminalInputTimer);
       stopOwnedProvider(session);
     }
     for (const job of postTurnJobs.values()) job.abort.abort();

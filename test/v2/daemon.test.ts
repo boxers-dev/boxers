@@ -1028,6 +1028,62 @@ describe("daemon session lifecycle", () => {
     },
   );
 
+  it.each(["check", "review"] as const)(
+    "allows %s after terminal reports following a completed turn",
+    async (kind) => {
+      const state = useTemporaryState();
+      registerTask(state, "reports", "runtime-reports");
+      const token = "0123456789abcdef0123456789abcdef";
+      const frame = encodeLifecycleWakeFrame(token, 2);
+      let completed = false;
+      let executions = 0;
+      const socketPath = tempSocketPath();
+      daemon = runDaemon(socketPath, {
+        ingestLifecycle: async (_task, through) =>
+          through === 2 ? [{ sequence: 2, kind: "turn_finished" }] : [],
+        executePostTurn: async () => {
+          completed = true;
+          return {};
+        },
+        executeIntent: async () => {
+          executions++;
+          return 0;
+        },
+      });
+      const viewer = await connectClient(socketPath);
+      viewer.send({
+        type: "attach",
+        sessionId: "runtime-reports",
+        taskName: "reports",
+        bridgeToken: token,
+        command: process.execPath,
+        args: [
+          "-e",
+          `process.stdin.setRawMode(true);${ECHO_SCRIPT}process.stdout.write(${JSON.stringify(frame)});`,
+        ],
+        cols: 80,
+        rows: 24,
+      });
+      await waitUntil(() => completed);
+      const reports = "\x1b[O\x1b[I\x1b[12;80R\x1b]11;rgb:0000/0000/0000\x07";
+      viewer.send({
+        type: "input",
+        sessionId: "runtime-reports",
+        dataBase64: Buffer.from(reports).toString("base64"),
+      });
+      await viewer.next(
+        (message) =>
+          message.type === "output" &&
+          Buffer.from(message.dataBase64, "base64").toString().includes("echo:"),
+      );
+      viewer.send({ type: "run_intent", intentId: kind, task: "reports", intent: { kind } });
+      await expect(
+        viewer.next((message) => message.type === "intent_exited" || message.type === "error"),
+      ).resolves.toMatchObject({ type: "intent_exited", code: 0 });
+      expect(executions).toBe(1);
+    },
+  );
+
   it.each(["initial_prompt", "forwarded_input"] as const)(
     "refuses strong commands while %s awaits its lifecycle hook",
     async (mode) => {
@@ -1065,6 +1121,12 @@ describe("daemon session lifecycle", () => {
             Buffer.from(message.dataBase64, "base64").toString().includes("echo:"),
         );
       }
+      // Terminal reports must not acknowledge an actual pending prompt.
+      viewer.send({
+        type: "input",
+        sessionId: "runtime-input-race",
+        dataBase64: Buffer.from("\x1b[O").toString("base64"),
+      });
       viewer.send({
         type: "run_intent",
         intentId: "racing-sync",
