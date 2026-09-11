@@ -1,32 +1,58 @@
-import { spawnSync } from "node:child_process";
-import { managedInvocation } from "./core/launcher.ts";
-import { dispatch, UsageError } from "./cli.ts";
-import { error as printError } from "./core/ui.ts";
-import { isDaemonBackedTaskInvocation } from "./core/entrypoint.ts";
-import { runDaemonIntent } from "./v2/daemon-client.ts";
+import { dispatchHerdrPlugin } from "./herdr/plugin.ts";
+import { printDiagnostics } from "./herdr/doctor.ts";
+import { attachPane } from "./herdr/sandbox.ts";
+import { pluginStateDir, readPluginState } from "./herdr/state.ts";
+
+const VERSION = "0.1.0";
+
+const USAGE = `boxers — Docker Sandboxes runtime and Git promotion plugin for Herdr
+
+Install
+  npm run build
+  herdr plugin link <boxers-checkout>
+
+Diagnostics
+  boxers doctor [--json]
+
+Host wrapper
+  HERDR_AGENT=codex boxers attach <sandbox-id>
+  HERDR_AGENT=claude boxers attach <sandbox-id>
+
+Human-facing lifecycle, preview, review, and promotion commands are exposed as
+Herdr plugin actions. Promotion is available only from the interactive review pane.
+`;
+
+function attachBySandboxId(sandboxId: string | undefined): number {
+  if (!sandboxId) throw new Error("attach requires a sandbox ID.");
+  const task = readPluginState(pluginStateDir()).tasks.find((item) => item.sandboxId === sandboxId);
+  if (!task) throw new Error(`No Boxers mapping exists for sandbox ${sandboxId}.`);
+  process.env.BOXERS_TASK_ID = task.id;
+  process.env.BOXERS_SANDBOX_ID = task.sandboxId;
+  return attachPane(task.agent);
+}
+
+async function main(args: string[]): Promise<number> {
+  if (args[0] === "herdr-plugin") return dispatchHerdrPlugin(args.slice(1));
+  if (args[0] === "doctor") {
+    if (args.some((arg) => arg !== "doctor" && arg !== "--json"))
+      throw new Error("doctor accepts only --json.");
+    return printDiagnostics(args.includes("--json"));
+  }
+  if (args[0] === "attach") return attachBySandboxId(args[1] ?? process.env.BOXERS_SANDBOX_ID);
+  if (args.length === 0 || args[0] === "help" || args[0] === "--help" || args[0] === "-h") {
+    process.stdout.write(USAGE);
+    return 0;
+  }
+  if (args[0] === "--version" || args[0] === "-v") {
+    process.stdout.write(`${VERSION}\n`);
+    return 0;
+  }
+  throw new Error(`Unknown command ${args[0]}. Run boxers --help.`);
+}
 
 try {
-  const args = process.argv.slice(2);
-  const managed = managedInvocation(args);
-  process.exitCode = managed
-    ? (spawnSync(managed.command, managed.args, { stdio: "inherit" }).status ?? 1)
-    : isDaemonBackedTaskInvocation(args)
-      ? await runDaemonIntent(args)
-      : await dispatch(args);
+  process.exitCode = await main(process.argv.slice(2));
 } catch (err) {
-  if (err instanceof UsageError) {
-    printError(err.message);
-    process.exitCode = 2;
-  } else if (
-    err instanceof Error &&
-    (err as NodeJS.ErrnoException).code === "ENOENT" &&
-    typeof (err as NodeJS.ErrnoException).path === "string"
-  ) {
-    const cmd = (err as NodeJS.ErrnoException).path;
-    printError(`\`${cmd}\` is not installed or not on your PATH.`);
-    process.exitCode = 1;
-  } else {
-    printError(err instanceof Error ? err.message : String(err));
-    process.exitCode = 1;
-  }
+  process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
+  process.exitCode = 1;
 }

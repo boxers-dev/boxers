@@ -1,0 +1,111 @@
+id = "boxers.sandboxes"
+name = "Boxers"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Docker Sandboxes runtime and safe Git promotion for Herdr"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["npm", "ci"]
+
+[[build]]
+command = ["npm", "run", "build"]
+
+[[startup]]
+command = ["node", "dist/index.mjs", "herdr-plugin", "startup"]
+
+[[actions]]
+id = "new-default"
+title = "New default sandboxed agent"
+contexts = ["workspace", "pane"]
+command = ["node", "dist/index.mjs", "herdr-plugin", "launch", "default"]
+
+[[actions]]
+id = "new-codex"
+title = "New sandboxed Codex"
+contexts = ["workspace", "pane"]
+command = ["node", "dist/index.mjs", "herdr-plugin", "launch", "codex"]
+
+[[actions]]
+id = "new-claude"
+title = "New sandboxed Claude"
+contexts = ["workspace", "pane"]
+command = ["node", "dist/index.mjs", "herdr-plugin", "launch", "claude"]
+
+[[actions]]
+id = "review"
+title = "Review sandbox changes"
+contexts = ["workspace", "pane"]
+command = ["node", "dist/index.mjs", "herdr-plugin", "open-review"]
+
+[[actions]]
+id = "preview-start"
+title = "Start or open sandbox preview"
+contexts = ["workspace", "pane"]
+command = ["node", "dist/index.mjs", "herdr-plugin", "open-preview"]
+
+[[actions]]
+id = "preview-stop"
+title = "Stop sandbox preview"
+contexts = ["workspace", "pane"]
+command = ["node", "dist/index.mjs", "herdr-plugin", "preview", "stop"]
+
+[[actions]]
+id = "preview-show"
+title = "Open running sandbox preview"
+contexts = ["workspace", "pane"]
+command = ["node", "dist/index.mjs", "herdr-plugin", "open-preview", "show"]
+
+[[actions]]
+id = "preview-restart"
+title = "Restart sandbox preview"
+contexts = ["workspace", "pane"]
+command = ["node", "dist/index.mjs", "herdr-plugin", "open-preview", "restart"]
+
+[[actions]]
+id = "preview-logs"
+title = "Open sandbox preview logs"
+contexts = ["workspace", "pane"]
+command = ["node", "dist/index.mjs", "herdr-plugin", "open-preview", "logs"]
+
+[[actions]]
+id = "sandbox-start"
+title = "Start sandbox"
+contexts = ["workspace", "pane"]
+command = ["node", "dist/index.mjs", "herdr-plugin", "sandbox", "start"]
+
+[[actions]]
+id = "sandbox-stop"
+title = "Stop sandbox"
+contexts = ["workspace", "pane"]
+command = ["node", "dist/index.mjs", "herdr-plugin", "sandbox", "stop"]
+
+[[actions]]
+id = "sandbox-discard"
+title = "Discard sandbox"
+contexts = ["workspace", "pane"]
+command = ["node", "dist/index.mjs", "herdr-plugin", "sandbox", "discard"]
+
+[[panes]]
+id = "agent-codex"
+title = "Codex (sandboxed)"
+placement = "tab"
+command = ["node", "dist/index.mjs", "attach"]
+
+[[panes]]
+id = "agent-claude"
+title = "Claude (sandboxed)"
+placement = "tab"
+command = ["node", "dist/index.mjs", "attach"]
+
+[[panes]]
+id = "review"
+title = "Boxers review"
+placement = "zoomed"
+command = ["node", "dist/index.mjs", "herdr-plugin", "review-pane"]
+
+[[panes]]
+id = "preview"
+title = "Boxers preview"
+placement = "zoomed"
+command = ["node", "dist/index.mjs", "herdr-plugin", "preview-pane"]

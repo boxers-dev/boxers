@@ -1,355 +1,151 @@
-# boxers
+# Boxers
 
-Boxers gives every Codex and Claude task a durable, isolated Docker Sandbox.
-Each task retains its own workspace and the agent's native session, so the work
-continues even if you close the terminal or lose an SSH connection.
+Boxers is a lightweight Docker Sandboxes runtime and safe Git promotion plugin
+for [Herdr](https://herdr.dev/). Herdr owns panes, layouts, navigation, agent
+status, notifications, and connections. Boxers owns durable Docker Sandboxes,
+previews, immutable review snapshots, checks, and host-authenticated promotion.
 
-## Quick start
+Each agent works in a private clone. It can use Git freely, but it receives no
+upstream write credentials and its commits are not authoritative. A human
+promotes the exact tree shown in Boxers' interactive review pane.
 
-Boxers requires Node.js 20+, Git, and a
-[Docker Sandboxes host](https://docs.docker.com/ai/sandboxes/get-started/).
+## Requirements and installation
 
-```sh
-npm install -g @boxers-dev/boxers
-boxers init
-```
-
-`boxers init` prepares the machine, checks Docker Sandboxes, and guides you
-through agent authentication.
-
-In a Git repository:
+- Node.js 20 or newer and Git
+- Herdr 0.9 or newer
+- Docker Sandboxes (`sbx`) 0.37 or newer
+- Boxers and Docker Sandboxes installed on every Herdr server machine where an
+  agent will run
 
 ```sh
-boxers project init
-git add .boxers/config.yml
-git commit -m "Configure boxers"
-
-boxers fix-parser new
-```
-
-Project setup asks how completed work should be integrated, which agent to use,
-and whether the project needs previews or automated checks. After that, a task
-name followed by `new` opens the agent.
-
-Feeling lucky? Run `boxers new` (with the same options as a named task) and
-Boxers announces a fictional ring name like `mike-byteson` or `muhammad-cli`.
-Existing names are skipped; if the roster is full, a numbered rematch suffix
-keeps the name available. Use the announced name to attach or run other task commands.
-
-Press Ctrl-C to detach. The task and conversation keep running in the
-background; attach again whenever you want.
-
-## Tasks
-
-```sh
-boxers list
-boxers fix-parser status
-boxers fix-parser attach
-```
-
-Task names are unique on a machine, and task commands can be run from any
-directory. Status and list use one structured view: agent activity, Boxers
-operations, setup, reconciliation, changes, checks, delivery, removal safety,
-specific issues, and concrete next commands are reported independently. A
-finished provider turn is shown as `Agent: Ready for input`, not as a generic
-failure or attention flag. Task status attempts a bounded host fetch and shows
-the installed base, latest observed target and any freshness failure. It requests
-background preparation from an already-running daemon without waiting for repair.
-Use `status --refresh` for deeper runtime and idle-workspace observation; it does
-not run reconciliation synchronously. List uses recorded Git observations.
-
-For example, the compact list and detailed status agree on the same facts:
-
-```text
-MACHINE  PROJECT  TASK        AGENT            CHANGES  CHECKS  NEXT
-local    boxers   fix-parser  Ready for input  Unmerged Passed  review
-
-fix-parser
-
-Agent: Ready for input
-Changes: Unmerged changes can be promoted
-Checks: All checks passed for the current changes
-Removal: Cannot be discarded safely - unmerged changes remain
-```
-
-When the work is ready:
-
-```sh
-boxers fix-parser review
-boxers fix-parser check
-boxers fix-parser promote
-```
-
-- `review` shows the exact candidate diff without running checks.
-- `check` runs the checks selected during project setup.
-- `promote` verifies the candidate and pushes one commit directly to the configured
-  remote/base branch (`origin` by default). It never forces the target or advances
-  your host checkout. The branch must permit direct pushes.
-
-`review`, `check`, `sync`, `setup`, `promote`, and preview start/restart share
-workspace preparation: wait for existing setup, require an idle agent, refresh
-and reconcile the canonical target, and capture the candidate. Commands wait
-for setup introduced by the new target before consuming that candidate. Explicit
-`setup` reconciles first and then retries setup once. Promotion can reuse the
-exact reviewed tree and resumes an accepted delivery before preparing new work.
-
-`promote` runs required checks itself, so `review` and `check` are useful but
-not mandatory steps.
-
-Promotion keeps the task and its conversation available for follow-up work.
-Each later promotion delivers another increment as one commit. If a push was
-accepted but the Sandbox could not advance, Boxers records that acceptance;
-after a known completed failure, retrying finishes the workspace update without
-delivering the increment twice. If the Sandbox mutation outcome is unknown,
-Boxers blocks further generation and capture until it is inspected and resolved,
-or the task is explicitly discarded and recreated. The accepted remote commit
-is retained in either case.
-
-After agent turns, Boxers reconciles against the latest fetched target. A changed
-target also notifies sibling tasks on the same host: idle tasks refresh, busy
-tasks catch up after their turn or operation, and stopped Sandboxes stay stopped.
-New prompts do not require a freshness check, but wait through an active workspace
-replacement or conflict repair. Repair uses a fresh bounded turn, with at most one
-check-driven correction. Ambiguous or interrupted work remains available for
-inspection or explicit discard; Boxers does not silently delete it.
-
-Other useful task commands:
-
-```sh
-boxers fix-parser sync
-boxers fix-parser preview
-boxers fix-parser preview logs
-boxers fix-parser setup
-boxers fix-parser discard
-```
-
-`sync` reconciles a task with its configured base. Preview commands are
-available when preview support was enabled for the project. If task setup fails
-or times out, inspect the setup log shown by `status`, repair the cause in the
-existing agent session, and run `setup` to retry the configured command.
-
-```text
-Setup: Failed after 2 attempts
-Issues:
-  Setup failed after 2 attempts.
-  Log: ~/.local/state/boxers/.../setup.log
-Next:
-  boxers fix-parser setup    Diagnose the setup log, then rerun setup.
-```
-
-`discard` uses the recorded removal disposition: a causally current clean Git
-observation takes the fast path without setup, reconciliation, checks, or
-another Sandbox inspection. Only an agent that is generating or unmerged work
-blocks normal discard. Setup and other Boxers-owned background work are
-disposable; discard stops them before verifying an otherwise-unknown workspace.
-Unmerged work requires promotion or `--force`.
-After a verified delivery, status reports `Removal: Can be discarded safely`
-and offers `boxers fix-parser discard` without another workspace inspection.
-
-To see the available task environments:
-
-```sh
-boxers list templates
-```
-
-## Multiple machines
-
-Connect another Boxers machine over SSH:
-
-```sh
-boxers connect build-box
-boxers hosts
-boxers list
-```
-
-Give an already connected machine a new fleet-wide name without reconnecting it:
-
-```sh
-boxers hosts rename <machine> <new-name>
-```
-
-`<machine>` may be its current name, ID, or SSH endpoint. The new name is stored
-on the owning machine and propagated to the rest of the fleet. Use `local` to
-rename the machine running the command.
-
-`connect` distributes the exact local build to the remote user's account before
-enrollment, including development changes that share a published version number.
-It uses the same managed installation, service configuration, daemon replacement,
-and fleet release distribution as `update`. Both select the stable launcher at
-`~/.local/bin/boxers`. `--no-install` requires the remote to already report the
-exact build; a matching version number alone is insufficient.
-
-On the first connection, Boxers opens the normal interactive machine setup over SSH.
-That setup installs and authenticates Docker Sandboxes, initializes its network
-policy, offers agent authentication, and installs the daemon. Successful setup
-is recorded on the remote machine, so later connections skip it.
-
-The initial connection uses your normal interactive SSH authentication. During
-enrollment, each machine creates a dedicated Ed25519 key under its Boxers state
-directory and the machines authorize those keys reciprocally. Background
-reconnections always select the Boxers key explicitly, so they do not depend on
-a desktop keyring, a forwarded agent, or an unlocked personal key. The
-authorized key is forced through the Boxers command gateway and cannot be used
-for SSH forwarding or arbitrary shell commands.
-
-`list` includes tasks from connected machines. Prefix a remote task with its
-machine name:
-
-```sh
-boxers build-box/fix-parser attach
-boxers build-box/fix-parser review
-boxers build-box/fix-parser promote
-```
-
-To create a remote task, run `new` from the current project and prefix the task
-with the machine:
-
-```sh
-boxers build-box/fix-parser new
-```
-
-Boxers identifies an existing registration on `build-box` from the project's
-canonical Git clone source. If it is not registered there yet, Boxers reuses
-the current project's configured clone URL and base branch, then clones and
-initializes it under the remote machine's state directory at
-`$BOXERS_HOME/checkouts/my-project` (normally
-`~/.local/state/boxers/checkouts/my-project`). Existing registered projects are
-reused. The clone deliberately uses Git and Git credentials on the remote host;
-Boxers does not forward personal SSH keys from the initiating machine. It names
-the remote account before cloning and disables interactive Git credential
-prompts, so a passphrase request cannot be mistaken for a local one. If access
-is not configured, connect to that host and verify `git ls-remote <clone-url>`.
-For an SSH clone URL, the remote account's key must be usable non-interactively,
-for example through an SSH agent available to non-interactive sessions.
-
-To choose the checkout location when Boxers first provisions the project, pass
-an absolute remote path:
-
-```sh
-boxers build-box/fix-parser new --remote-path /srv/projects/my-project
-```
-
-Both SSH targets must be reachable from their reciprocal machine. Boxers uses
-standard SSH host aliases, so stable LAN DNS or an overlay network such as
-Tailscale can provide the addresses for laptops that move between networks.
-
-Update Boxers as one fleet:
-
-```sh
-boxers update
-```
-
-Boxers first checks npm for a newer official release and offers to install it
-on the local machine. It then distributes the exact active application build
-to every connected machine. Runtime dependencies are installed separately on
-each host, so native packages such as `node-pty` match that host's operating
-system, CPU architecture, and Node.js ABI. Connected hosts use npm for
-dependencies only when their required runtime layer is missing; the initiating
-machine also uses npm for the optional official-release check.
-
-The selected build is recorded as durable fleet state. An offline machine is
-reported as pending and updates automatically after reconnecting by fetching
-the cached application payload from an updated peer. A machine that still has
-the legacy gateway performs one final npm bootstrap before joining this flow.
-A newer `boxers update` supersedes an older pending rollout. Updating replaces
-the owning-host daemon in one bounded passage. This detaches viewers, stops
-daemon-owned providers and in-flight orchestration, and starts the new build;
-the next attach resumes provider-native history and interrupted recomputable
-work is observed or rerun. Boxers never downgrades a newer official release
-without an explicit fleet-wide confirmation.
-
-When Boxers is run from its own source checkout, `boxers connect` and
-`boxers update` build that checkout automatically and distribute the resulting
-development build. No publish or package step is required. Installed package
-launchers delegate ordinary commands to the active managed build; explicit
-source-checkout invocations remain available for development. Older published
-launchers without this delegation must be upgraded once, or invoked through
-`~/.local/bin/boxers` directly.
-
-The selected build is identified by its content hash. Daemon activation, client
-connections, and health reporting share the same version/build/protocol check.
-Project configuration stays with each project; both hosts use the same parser
-and task commands read configuration from the reconciled target commit.
-
-## Health and authentication
-
-```sh
-boxers status
+npm ci
+npm run build
+herdr plugin link /absolute/path/to/boxers
 boxers doctor
-boxers auth status
-boxers auth codex
-boxers auth claude
-boxers auth status --host gpu-builder --refresh
-boxers auth codex --host gpu-builder
-boxers auth codex --host gpu-builder --api-key
-boxers auth claude --host gpu-builder
-boxers project status
 ```
 
-`status` is the overview for this machine and connected hosts. `doctor`
-performs detailed live diagnostics. The `auth` commands manage reusable host
-proxy credentials; their status reports whether a credential is stored, not
-whether the provider currently accepts it. Authentication state belongs to the
-host that runs the Sandbox: remote API credentials are entered on that host
-through the restricted fleet connection and are never forwarded from the
-initiating machine.
+Boxers stores runtime state in `HERDR_PLUGIN_STATE_DIR`; it does not write
+durable state into the installed plugin checkout. Invoke **New sandboxed
+Codex** or **New sandboxed Claude** from a Herdr workspace or pane inside a Git
+repository. The resulting pane appears in Herdr's normal agent list as
+`Codex (sandboxed)` or `Claude (sandboxed)`.
 
-For Codex, sign in once per host with `boxers auth codex`. Docker stores and
-refreshes the ChatGPT OAuth credential on that host, and new tasks reuse it.
-New Codex tasks require this host credential before their Sandbox is created.
-Boxers checks Docker's configured route: ChatGPT OAuth uses the ChatGPT backend;
-API keys use the OpenAI API. An inconclusive network check does not trigger login.
+Docker's provider credential proxy can authenticate the model provider. Boxers
+removes `SSH_AUTH_SOCK` and every `HERDR_*` variable from all `sbx` processes,
+does not mount host Git credentials, and does not expose the Herdr control
+socket inside the sandbox.
 
-From your workstation, `boxers auth codex --host gpu-builder` sets up the same
-reusable login remotely. It uses your normal SSH account (as initial fleet setup
-does) and temporarily forwards localhost port 1455 for the browser callback.
-Open the printed URL in your workstation's browser. The token is stored on the
-remote host. Local port 1455 must be free. Managed task SSH keys remain restricted
-and cannot forward ports. `--api-key` continues to use the managed fleet connection.
+## Project configuration
 
-Existing task-local Codex credentials are stored in `/home/agent/.boxers/codex` inside
-the durable Sandbox, outside Docker's managed Codex auth files. Existing
-conversation history remains shared so attach resumes the same session. Surviving
-ChatGPT credentials are preserved automatically. Tasks without a bound host
-credential can still resume their existing task-local login. An inconclusive Codex account check
-reports an error instead of requesting a new login.
-A Docker proxy credential is checked with a non-generating provider request.
-An accepted credential continues silently, a definite authentication rejection
-asks you to renew the host login, and an inconclusive network check does not nag the user.
-After reauthentication, Boxers restarts only the daemon-owned provider process
-and resumes the existing provider-native conversation in the same Sandbox.
+Configuration is repository-owned at `.boxers/config.yml`. With no file,
+Boxers targets the current branch's upstream and uses Codex or Claude's Docker
+Sandbox defaults.
 
-Claude subscription login remains task-local, using `claude auth login --claudeai`.
-Docker snapshots global credentials at Sandbox creation; configuring a host login
-later does not automatically bind it to an older task. Keep those tasks and their
-history; newly created tasks use the host login.
+```yaml
+version: 1
 
-For lower-level troubleshooting:
+integration:
+  remote: origin
+  branch: main
 
-```sh
-boxers daemon status
-boxers daemon restart --host old-framework-ubuntu
-boxers debug daemon
-boxers debug shell fix-parser
+agent:
+  default: codex
+  model: gpt-5.4
+  effort: high
+
+sandbox:
+  template: docker.io/example/project-sandbox:v1
+
+setup:
+  run: npm ci
+  timeout: 15m
+
+checks:
+  typecheck:
+    run: npm run check
+    timeout: 10m
+  tests: npm test -- --run
+
+preview:
+  run: npm run dev -- --host 0.0.0.0
+  ports: [3000]
+  review: snapshot
+  setup: npm ci
 ```
 
-`daemon restart --host <machine>` uses the managed fleet SSH transport, so no
-separate interactive SSH login is required. Remote daemon control requires the
-fleet `admin` role. Add `--force` only when interrupting daemon-owned work on
-that host is acceptable.
+Only project commands (`setup.run`, each check's `run`, `preview.run`, and
+`preview.setup`) are evaluated by `bash -lc` inside the sandbox. IDs, paths,
+refs, ports, and all other user-controlled values are passed as distinct
+process arguments.
 
-## Safety model
+`preview.review` defaults to `snapshot`. Choose `live` only when materializing
+the reviewed tree is too expensive; the review pane labels that preview as
+live and still checks workspace staleness before promotion.
 
-Sandboxes are created from committed, tracked project files only. Untracked
-files, Git credentials, hooks, and remote metadata from the real checkout are
-not copied into a task. Promotion happens through Git on the host, where Boxers
-can verify the expected branch and avoid overwriting unrelated local work.
+## Preview, review, and promotion
+
+Herdr exposes actions to start, show, restart, stop, and inspect preview logs.
+A live preview runs as a detached sandbox-owned process from the mutable agent
+workspace. Its URL is visible and emitted as an OSC 8 terminal hyperlink.
+
+The **Review sandbox changes** action opens a Boxers terminal UI and captures
+the complete candidate without modifying the agent's index: tracked, staged,
+unstaged, deleted, untracked non-ignored, and already force-added ignored
+files. The candidate tree and an internal transport commit are retained in the
+sanitized host mirror. The UI can:
+
+- display the diff from the recorded target to that immutable tree;
+- run setup and checks in a detached worktree of that exact tree;
+- start a reviewed preview bound to that tree;
+- capture newer workspace changes as a new review; and
+- interactively confirm publication of the selected review.
+
+There is deliberately no direct **Promote** plugin action. Promotion requires
+typed confirmation in the review pane. If the workspace changed after capture,
+the UI requires the user to review the latest workspace or explicitly retain
+the older snapshot. Skipping configured checks is also an explicit, persisted
+decision.
+
+Promotion runs on the trusted host under a per-project lock. It verifies the
+remote, branch, target OID, configuration hash, candidate object graph, and
+check identities; creates one host-authored commit containing exactly the
+reviewed tree; journals that commit before pushing; and uses a non-force
+refspec. Target races stop delivery. Ambiguous failures are fetched and
+reconciled, and retries reuse the journaled commit rather than creating a
+duplicate. The user's checkout, index, branch, and files are never changed.
+
+After confirmed delivery, Boxers advances the sandbox with a mixed reset so
+changes made after the snapshot survive as the next increment. Confirmed
+delivery remains recorded if that advancement fails.
+
+## Mirrors and restart behavior
+
+Boxers creates clone-mode sandboxes from a sanitized mirror under plugin state,
+never from the user's checkout. The mirror contains only the configured
+committed target and excludes untracked and ignored files, hooks, credential
+helpers, and upstream remote metadata. Docker's local `sandbox-<name>` remote
+is retained solely to transport candidate objects back to the host.
+
+Normal Herdr detach and reattach keeps the wrapper and agent alive. After a full
+Herdr server restart, the plugin startup hook reconciles `sbx ls`, marks missing
+or stopped sandboxes, and reopens panes only for sandboxes that are still
+running. Provider-native attachment occurs through `sbx run --name` inside the
+same durable sandbox. Current Herdr plugin v1 cannot restore the exact previous
+split placement; the replacement opens as a plugin-owned tab. See the
+[feasibility report](docs/architecture/herdr-plugin-feasibility.md).
+
+Loopback preview URLs belong to the Herdr server machine. Until Herdr exposes a
+plugin-controlled port-forward API, previews on remote Herdr machines require a
+separately secured tunnel; Boxers does not misrepresent the remote URL as local.
 
 ## Development
 
 ```sh
-npm install
-npm run build
 npm run check
-npm test
+npm test -- --run
+npm run build
 ```
+
+The executable entrypoint is `src/index.ts`; the single implementation lives
+under `src/herdr/`. There is no Boxers PTY daemon, fleet, SSH transport,
+host-worktree manager, or parallel legacy task path.

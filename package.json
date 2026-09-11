@@ -1,7 +1,7 @@
 {
   "name": "@boxers-dev/boxers",
-  "version": "0.0.5",
-  "description": "Run a fleet of sandbox-native autonomous coding agents that pack a punch.",
+  "version": "0.1.0",
+  "description": "Docker Sandboxes runtime and safe Git promotion plugin for Herdr.",
   "keywords": [
     "agent",
     "claude-code",
@@ -9,6 +9,7 @@
     "codex",
     "coding-agent",
     "docker",
+    "herdr",
     "isolation",
     "sandbox",
     "workspace",
@@ -28,7 +29,10 @@
     "boxers": "dist/index.mjs"
   },
   "files": [
-    "dist"
+    "dist",
+    "herdr-plugin.toml",
+    "README.md",
+    "docs/architecture/herdr-plugin-feasibility.md"
   ],
   "type": "module",
   "main": "dist/index.mjs",
@@ -43,7 +47,6 @@
     "format": "oxfmt ."
   },
   "dependencies": {
-    "@lydell/node-pty": "1.2.0-beta.15",
     "yaml": "^2.8.1"
   },
   "devDependencies": {
